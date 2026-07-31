@@ -4,17 +4,17 @@ from typing import Any, ClassVar, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from .contracts import BaseRuntimeState
+from agent.contracts import BaseRuntimeState
 
 # `TraceEvent` and `utc_now` moved to `agent/contracts.py`: they are fully
 # domain-agnostic (an event/reason/payload/timestamp log entry has nothing
 # Travel-specific about it) and `BaseRuntimeState.execution_trace` needs
 # `TraceEvent` as its field type. Keeping them here would force
-# `agent/contracts.py` to import from `agent/state.py` for `TraceEvent`
-# while `agent/state.py` imports `BaseRuntimeState` from
-# `agent/contracts.py` -- a circular import. Every direct importer of
-# `TraceEvent`/`utc_now` from this module has been repointed to
-# `agent.contracts`; nothing is re-exported from here.
+# `agent/contracts.py` to import from this module for `TraceEvent` while
+# this module imports `BaseRuntimeState` from `agent/contracts.py` -- a
+# circular import. Every direct importer of `TraceEvent`/`utc_now` from
+# this module has been repointed to `agent.contracts`; nothing is
+# re-exported from here.
 
 
 class TravelPlan(BaseModel):

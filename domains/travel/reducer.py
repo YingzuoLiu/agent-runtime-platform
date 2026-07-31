@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict
 
-from .contracts import TraceEvent
+from agent.contracts import TraceEvent
 from .state import AgentState, StatePatch
 
 

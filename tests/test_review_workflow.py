@@ -1,7 +1,7 @@
 import asyncio
 
-from agent.review.evidence import ContextProjector, PlanEvidenceBuilder
-from agent.review.models import (
+from domains.travel.review.evidence import ContextProjector, PlanEvidenceBuilder
+from domains.travel.review.models import (
     CostLedgerStatus,
     EvidenceRef,
     EvidenceSourceType,
@@ -16,10 +16,10 @@ from agent.review.models import (
     TaskStatus,
     WorkflowStatus,
 )
-from agent.review.orchestrator import ReviewWorkflowConfig, WorkflowOrchestrator
-from agent.review.reviewers import BudgetChecker, PreferenceReviewer, RetryableReviewerError
-from agent.runtime import TravelAgentRuntime
-from agent.state import AgentState, TravelPlan
+from domains.travel.review.orchestrator import ReviewWorkflowConfig, WorkflowOrchestrator
+from domains.travel.review.reviewers import BudgetChecker, PreferenceReviewer, RetryableReviewerError
+from domains.travel.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState, TravelPlan
 from runtime_service.registry import build_default_registry
 
 

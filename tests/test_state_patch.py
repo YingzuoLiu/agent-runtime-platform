@@ -1,5 +1,5 @@
-from agent.reducer import apply_patch
-from agent.state import AgentState, StatePatch
+from domains.travel.reducer import apply_patch
+from domains.travel.state import AgentState, StatePatch
 
 
 def test_apply_patch_updates_budget_and_trace():

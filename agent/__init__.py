@@ -1,19 +1,16 @@
 from .contracts import BaseRuntimeState, RuntimeProtocol, RuntimeResponse, TraceEvent, utc_now
-from .state import AgentState, StatePatch, TravelPlan
 
-# `agent/__init__.py` imports only from `.contracts` (Core) and `.state`
-# (AgentState/StatePatch/TravelPlan are the current Travel state shape, not
-# yet moved to `domains/travel/`) -- it does not import `.runtime` at all.
-# `TravelAgentRuntime` lives in `agent/runtime.py`, a Travel-specific
-# implementation slated to move to `domains/travel/runtime.py` in Phase 1B;
-# re-exporting it here would make this Core package depend on a concrete
-# domain runtime. Callers that need it import it directly from
-# `agent.runtime` (or, after Phase 1B, `domains.travel.runtime`).
+# `agent/__init__.py` imports only from `.contracts`: the domain-agnostic
+# base state, response envelope, and runtime protocol. Phase 1B moved
+# Travel's concrete state (`AgentState`/`StatePatch`/`TravelPlan`) to
+# `domains/travel/state.py` and its runtime (`TravelAgentRuntime`) to
+# `domains/travel/runtime.py`. Neither is re-exported here, for the same
+# reason `TravelAgentRuntime` was never re-exported before the move:
+# re-exporting a concrete domain's types would make this Core package
+# depend on that domain. Callers import Travel symbols directly from
+# `domains.travel.state` / `domains.travel.runtime`.
 
 __all__ = [
-    "AgentState",
-    "StatePatch",
-    "TravelPlan",
     "BaseRuntimeState",
     "RuntimeProtocol",
     "RuntimeResponse",

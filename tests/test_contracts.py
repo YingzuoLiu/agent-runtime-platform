@@ -22,8 +22,8 @@ from pydantic import BaseModel
 from agent import RuntimeResponse as PackageRuntimeResponse
 from agent.contracts import BaseRuntimeState
 from agent.contracts import RuntimeResponse as GenericRuntimeResponse
-from agent.runtime import TravelAgentRuntime
-from agent.state import AgentState, TravelPlan
+from domains.travel.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState, TravelPlan
 from api.main import create_app
 from runtime_service import RunCreateRequest, RuntimeManager, SQLiteRunStore, build_default_registry
 

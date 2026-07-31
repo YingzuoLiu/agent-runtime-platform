@@ -1,6 +1,6 @@
-from agent.state import AgentState, TravelPlan
-from agent.tools.geocode_tool import GeoPoint
-from agent.validator import TravelValidator
+from domains.travel.state import AgentState, TravelPlan
+from domains.travel.tools.geocode_tool import GeoPoint
+from domains.travel.validator import TravelValidator
 
 """
 这个测试证明三件事：

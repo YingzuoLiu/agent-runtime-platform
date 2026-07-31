@@ -15,7 +15,7 @@ from datasets import Dataset
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent import AgentState  # noqa: E402
+from domains.travel.state import AgentState  # noqa: E402
 from rl.reward import reward_for_intent, INTENT_LABELS  # noqa: E402
 from rl.episodes import LABELLED_SCENARIOS, build_prompt  # noqa: E402
 

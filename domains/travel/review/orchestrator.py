@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from agent.contracts import utc_now
-from agent.state import AgentState
+
+from ..state import AgentState
 
 from .evidence import ContextProjector, PlanEvidenceBuilder
 from .models import (

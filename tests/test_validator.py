@@ -1,5 +1,5 @@
-from agent.state import AgentState, TravelPlan
-from agent.validator import TravelValidator
+from domains.travel.state import AgentState, TravelPlan
+from domains.travel.validator import TravelValidator
 
 
 def test_validator_catches_budget_violation():

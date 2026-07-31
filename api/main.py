@@ -11,8 +11,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agent import AgentState
-from agent.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState
+from domains.travel.runtime import TravelAgentRuntime
 from runtime_service import (
     AgentDescriptor,
     RunCreateRequest,
