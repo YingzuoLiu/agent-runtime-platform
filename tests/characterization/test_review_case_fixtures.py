@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.review.orchestrator import WorkflowOrchestrator
+from domains.travel.review.orchestrator import WorkflowOrchestrator
 from eval.review_runner import load_cases, state_from_case
 
 from canonicalize import canonicalize

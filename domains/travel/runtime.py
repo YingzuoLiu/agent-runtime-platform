@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
 
-from .contracts import RuntimeResponse
+from agent.contracts import RuntimeResponse
 from .reducer import apply_patch, append_trace
 from .review.models import ReplanAction, ReplanDirective, WorkflowReviewResult
 from .review.orchestrator import WorkflowOrchestrator
@@ -17,9 +17,9 @@ from .validator import TravelValidator
 # annotating a field with the abstract `BaseRuntimeState`, or shadowing
 # the Core name with a Travel-bound alias of the same name) is what keeps
 # `state`'s static type, JSON schema, and `model_dump()`/`model_dump_json()`
-# output all showing every `AgentState` field, while leaving
-# `agent.runtime.RuntimeResponse` identical to the unbound Core contract --
-# see `agent/contracts.py` and `tests/test_contracts.py`.
+# output all showing every `AgentState` field, while leaving this module's
+# `RuntimeResponse` identical to the unbound Core contract -- see
+# `agent/contracts.py` and `tests/test_contracts.py`.
 
 
 class TravelAgentRuntime:

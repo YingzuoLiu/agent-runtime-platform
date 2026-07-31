@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent.review.orchestrator import WorkflowOrchestrator
-from agent.state import AgentState, TravelPlan
+from domains.travel.review.orchestrator import WorkflowOrchestrator
+from domains.travel.state import AgentState, TravelPlan
 
 
 DEFAULT_CASES_PATH = Path(__file__).with_name("review_cases.json")

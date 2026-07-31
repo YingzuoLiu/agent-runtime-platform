@@ -8,9 +8,9 @@ from typing import List
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent import AgentState  # noqa: E402
-from agent.runtime import TravelAgentRuntime  # noqa: E402
-from agent.validator import TravelValidator  # noqa: E402
+from domains.travel.state import AgentState  # noqa: E402
+from domains.travel.runtime import TravelAgentRuntime  # noqa: E402
+from domains.travel.validator import TravelValidator  # noqa: E402
 
 @dataclass
 class Scenario:
@@ -102,7 +102,7 @@ def run_scenario(scenario, config):
     if config.disable_validator:
         class _AlwaysPass(TravelValidator):
             def validate(self, state):
-                from agent.validator import ValidationResult
+                from domains.travel.validator import ValidationResult
                 return ValidationResult(passed=True, errors=[])
         runtime.validator = _AlwaysPass()
     state = AgentState(thread_id=f"{scenario.name}_{config.name}")

@@ -2,8 +2,8 @@ import threading
 import time
 
 from agent.contracts import RuntimeResponse
-from agent.runtime import TravelAgentRuntime
-from agent.state import AgentState
+from domains.travel.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState
 from runtime_service import (
     AgentRegistry,
     RunCreateRequest,

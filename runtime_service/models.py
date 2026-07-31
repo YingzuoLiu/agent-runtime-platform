@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent.contracts import utc_now
-from agent.state import AgentState
+from domains.travel.state import AgentState
 
 
 class RunStatus(str, Enum):

@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent import AgentState
+from domains.travel.state import AgentState
 from rl.reward import reward_for_intent, INTENT_LABELS
 
 # Hand-labelled ground-truth intents for each scenario turn

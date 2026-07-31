@@ -19,7 +19,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements-dev.txt
-      - run: python -m compileall agent api runtime_service
-      - run: ruff check agent api runtime_service tests
+      - run: python -m compileall agent api runtime_service domains
+      - run: ruff check agent api runtime_service tests domains
       - run: mypy
       - run: pytest -q

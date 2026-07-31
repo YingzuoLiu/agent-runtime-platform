@@ -1,5 +1,5 @@
-from agent.state import AgentState
-from agent.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState
+from domains.travel.runtime import TravelAgentRuntime
 
 
 def test_runtime_partially_replans_after_budget_and_preference_change():

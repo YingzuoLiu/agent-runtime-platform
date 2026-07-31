@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from agent.runtime import TravelAgentRuntime
+from domains.travel.runtime import TravelAgentRuntime
 
 from .models import AgentDescriptor
 

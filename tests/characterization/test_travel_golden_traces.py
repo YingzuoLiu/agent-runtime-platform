@@ -20,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from agent.state import AgentState
-from agent.runtime import TravelAgentRuntime
+from domains.travel.state import AgentState
+from domains.travel.runtime import TravelAgentRuntime
 from eval.runner import SCENARIOS
 
 from canonicalize import canonicalize

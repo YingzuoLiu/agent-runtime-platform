@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.contracts import utc_now
-from agent.state import AgentState
+from domains.travel.state import AgentState
 from .models import RunEvent, RunRecord, RunStatus
 
 
