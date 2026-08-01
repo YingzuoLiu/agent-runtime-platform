@@ -12,7 +12,7 @@ ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["runtime_service/models.py", "agent/contracts.py", "domains/travel/state.py", "domains/travel/runtime.py"]
+files = ["runtime_service/models.py", "runtime_service/workflow_store.py", "agent/contracts.py", "domains/travel/state.py", "domains/travel/runtime.py"]
 follow_imports = "skip"
 ignore_missing_imports = true
 warn_unused_ignores = true
