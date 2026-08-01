@@ -137,6 +137,19 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 
 The sandbox intentionally does **not** accept Python source, shell commands, executable paths, or arbitrary module names.
 
+### Release-validation workflow
+
+A durable registered-tool workflow using shared runtime infrastructure, with fixed-order multi-step execution, per-step persistence, bounded retry, explicit interrupted-step recovery, cached completed results, and deterministic readiness validation.
+
+- a second, independent domain (`domains/release_validation/`) built on the same `SQLiteWorkflowStore` and `ToolSandbox` as the rest of `runtime_service`, with no relationship to Travel;
+- six registered tools always executed in a fixed order, each persisted through `SQLiteWorkflowStore`'s exclusive step-claim and attempt-token protection;
+- a deterministic validator that inspects tool *results*, not just tool-call success, so a release can be BLOCKED even when every tool call completed;
+- explicit FAILED/BLOCKED separation: exhausted retries or an unexpected exception are FAILED, a business readiness check that did not pass is BLOCKED.
+
+See [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md) for the retry classification, execution/step identity hashing, and interrupted-recovery semantics.
+
+This is fixed-order tool execution, not planner- or LLM-driven tool selection, and it bypasses `RuntimeManager`/`AgentRegistry`/the HTTP API entirely -- see [Agent integration boundary](#agent-integration-boundary) below for what that does and does not mean. All release manifests, artifacts, and compatibility data are synthetic fixtures for this repository.
+
 ## Quick start
 
 ```bash
@@ -253,9 +266,9 @@ See [`docs/cloud-runtime.md`](docs/cloud-runtime.md) for the detailed execution 
 
 ## Agent integration boundary
 
-The sandbox is currently exposed as an independent control-plane API. `TravelAgentRuntime` does not yet invoke tools from an LLM or planner-driven tool loop.
+The sandbox is exposed as an independent control-plane API, and it is also used directly by the fixed-order release-validation workflow (see above). Neither of those is a planner- or LLM-driven tool loop: the release-validation workflow always calls its six tools in the same hardcoded order, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop at all.
 
-This keeps the current threat model narrow and testable: external clients may request only registered tools through the API. A later Agent tool-calling integration must add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
+This keeps the current threat model narrow and testable: external clients may request only registered tools through the API, and the release-validation workflow only ever selects from its own fixed tool sequence. A later Agent tool-calling integration -- dynamic, planner-selected tool calls driven by Travel or another domain -- must still add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
 
 ## Cancellation semantics
 
@@ -311,14 +324,15 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - no worker lease or heartbeat;
 - no authentication, tenant isolation, or quotas;
 - no external secret manager integration;
-- no tool-call idempotency ledger yet;
+- no tool-call idempotency for the ad-hoc `/tools/{tool}/execute` API; the release-validation workflow has one, scoped to its own `SQLiteWorkflowStore` attempt-token claims;
 - process sandbox does not isolate host networking or the full host filesystem;
 - POSIX resource limits are weaker on Windows;
 - no arbitrary user-code execution endpoint;
-- sandbox is not yet integrated into the Agent decision loop;
+- the sandbox is used by the fixed-order release-validation workflow, but not yet by the Travel runtime, and nowhere by a planner- or LLM-driven dynamic tool loop;
 - no OpenTelemetry backend or evaluation dashboard;
 - no real flight, hotel, payment, or booking API.
 - no real LLM preference analyzer by default; the semantic analyzer is an injectable boundary;
-- Schedule/Geography reviewers and workflow-task persistence are not part of the first slice.
+- Schedule/Geography reviewers and workflow-task persistence are not part of the first slice;
+- the release-validation workflow has a fixed step order (no dependency graph or scheduler), no selective replay or input-change invalidation, no dynamic/LLM-driven tool selection, and no `RuntimeManager`/`AgentRegistry`/HTTP integration -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
 
 > An evidence-driven Agent Runtime prototype that connects behavioral evaluation with structured state, deterministic validation, durable execution lifecycle, checkpoint recovery, cancellation safety, idempotent submission, event observability, and policy-enforced registered-tool sandboxing.

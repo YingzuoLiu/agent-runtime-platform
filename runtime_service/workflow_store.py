@@ -695,6 +695,24 @@ class SQLiteWorkflowStore:
 
     # ---- events ----
 
+    def append_event(
+        self, run_id: str, event_type: str, payload: dict[str, Any] | None = None
+    ) -> WorkflowEvent:
+        """Append a domain-level annotation event, e.g. a cache-reuse note.
+
+        Every state-transition method above (`mark_running`,
+        `finalize_*`, `claim_step`, `complete_step`, `fail_step`,
+        `recover_interrupted_step`) already appends its own event
+        atomically with its own state change; this is for a caller that
+        needs to record something *without* an accompanying state
+        transition (a read-only outcome like "this step's cached result
+        was reused"). `run_id` must already have a `workflow_executions`
+        row -- the same `ON DELETE CASCADE` foreign key as every other
+        event insert applies here too.
+        """
+        with self._lock, self._connect() as connection:
+            return self._append_event_with_connection(connection, run_id, event_type, payload)
+
     def list_events(self, run_id: str, *, after_sequence: int = 0) -> list[WorkflowEvent]:
         with self._connect() as connection:
             rows = connection.execute(
