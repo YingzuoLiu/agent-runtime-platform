@@ -22,7 +22,7 @@ class GeoPoint:
 
 class NominatimGeocodeTool:
     """
-    A tiny external grounding tool for the travel-agent-runtime demo.
+    A tiny external grounding tool for the Travel reference domain.
 
     This is intentionally not a production map stack. It is used to verify
     whether a destination or POI can be resolved into real-world coordinates.
@@ -31,7 +31,7 @@ class NominatimGeocodeTool:
     def __init__(
         self,
         base_url: str = "https://nominatim.openstreetmap.org/search",
-        user_agent: str = "travel-agent-runtime-demo/0.1 (https://github.com/YingzuoLiu/travel-agent-runtime-demo)",
+        user_agent: str = "agent-runtime-platform/1.0 (https://github.com/YingzuoLiu/agent-runtime-platform)",
         min_interval_seconds: float = 1.1,
         timeout_seconds: float = 10.0,
     ):
