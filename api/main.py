@@ -90,7 +90,7 @@ def create_app(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
             "plus policy-enforced sandboxed tool execution."
         ),
-        version="0.6.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
 
@@ -154,17 +154,25 @@ def create_app(
         """Backward-compatible synchronous endpoint backed by the durable thread store."""
         store: SQLiteRunStore = request.app.state.run_store
         runtime = TravelAgentRuntime(retry_limit=2)
-        state_value = (
-            payload.state
-            or store.load_thread_state(
+        if payload.state is not None and payload.state.thread_id != payload.thread_id:
+            raise HTTPException(
+                status_code=422,
+                detail="state.thread_id must match request.thread_id",
+            )
+        try:
+            persisted_state = store.load_thread_state(
                 payload.thread_id,
                 domain_id=AgentState.domain_id,
                 schema_version=AgentState.schema_version,
             )
-            or AgentState(thread_id=payload.thread_id)
-        )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        state_value = payload.state or persisted_state or AgentState(thread_id=payload.thread_id)
         result = runtime.handle_user_message(state_value, payload.user_message)
-        store.save_thread_state(result.state)
+        try:
+            store.save_thread_state(result.state)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return AgentMessageResponse(
             assistant_message=result.message,
             updated_state=result.state,

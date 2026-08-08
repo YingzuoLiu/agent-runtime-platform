@@ -2,7 +2,12 @@ import threading
 import time
 
 from agent.contracts import RuntimeResponse
-from domains.release_validation.models import ReleaseManifest, ReleaseValidationInput
+from domains.release_validation.models import (
+    ReleaseManifest,
+    ReleaseValidationInput,
+    ReleaseValidationInputV1,
+    SelectiveReplayRequest,
+)
 from domains.release_validation.runtime import (
     MAX_ATTEMPTS,
     STEP_SEQUENCE,
@@ -225,7 +230,7 @@ def test_running_run_is_recovered_after_restart(tmp_path):
 def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_path):
     database_path = tmp_path / "runtime.db"
     manifest = release_manifest()
-    runtime_input = ReleaseValidationInput(manifest=manifest)
+    runtime_input = ReleaseValidationInputV1(manifest=manifest)
     run = RunRecord(
         run_id="run_release_recovery",
         thread_id="release-recovery-thread",
@@ -280,6 +285,89 @@ def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_pa
     event_types = [event.event_type for event in manager.store.list_events(run.run_id)]
     assert "run.recovered" in event_types
     assert "run.failed" not in event_types
+
+
+def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    manifest = _canonicalize_manifest(release_manifest())
+    workflow_store = SQLiteWorkflowStore(database_path)
+    source_workflow = ReleaseValidationWorkflow(
+        workflow_store,
+        ToolSandbox(build_release_validation_tool_registry()),
+    )
+    source_workflow.run("source", manifest)
+    replay = SelectiveReplayRequest(
+        source_run_id="source",
+        step_ids=["run_unit_tests"],
+    )
+    runtime_input = ReleaseValidationInput(manifest=manifest, replay=replay)
+    target = RunRecord(
+        run_id="run_replay_recovery",
+        thread_id="replay-recovery-thread",
+        agent_id="release-validation",
+        agent_version="1.1.0",
+        domain_id="release-validation",
+        schema_version="1",
+        status=RunStatus.RUNNING,
+        input=runtime_input.model_dump(mode="json"),
+        attempt=1,
+    )
+    SQLiteRunStore(database_path).create_run(target)
+    workflow_store.create_or_get_execution(
+        target.run_id,
+        WORKFLOW_TYPE,
+        _stable_hash(
+            {
+                "manifest": manifest.model_dump(mode="json"),
+                "replay": replay.model_dump(mode="json"),
+            }
+        ),
+    )
+    workflow_store.mark_running(target.run_id)
+    by_id = {step.step_id: step for step in STEP_SEQUENCE}
+    for step_id in ("load_manifest", "inspect_artifacts"):
+        step = by_id[step_id]
+        arguments = step.build_arguments(manifest, {})
+        workflow_store.reuse_completed_step(
+            "source",
+            target.run_id,
+            step_id,
+            step.tool_name,
+            _stable_hash(arguments),
+        )
+    interrupted = by_id["run_unit_tests"]
+    workflow_store.claim_step(
+        target.run_id,
+        interrupted.step_id,
+        interrupted.tool_name,
+        _stable_hash(interrupted.build_arguments(manifest, {})),
+        max_attempts=MAX_ATTEMPTS,
+    )
+
+    reopened_workflow_store = SQLiteWorkflowStore(database_path)
+    reopened_workflow = ReleaseValidationWorkflow(
+        reopened_workflow_store,
+        ToolSandbox(build_release_validation_tool_registry()),
+    )
+    manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        build_default_registry(release_validation_workflow=reopened_workflow),
+    )
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, target.run_id)
+    finally:
+        manager.stop()
+
+    assert result.status == RunStatus.COMPLETED
+    assert result.agent_version == "1.1.0"
+    assert result.state.result.replay.source_run_id == "source"
+    target_steps = {
+        step.step_id: step for step in reopened_workflow_store.list_steps(target.run_id)
+    }
+    assert target_steps["run_unit_tests"].attempt_count == 2
+    assert target_steps["load_manifest"].attempt_count == 0
+    assert target_steps["inspect_artifacts"].attempt_count == 0
 
 
 def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):

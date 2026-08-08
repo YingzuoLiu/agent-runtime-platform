@@ -8,7 +8,7 @@ A runnable reference implementation of five related layers:
 4. an optional **evidence-review workflow** with typed handoff, partial results, and
    validator-gated local replanning.
 5. a second **release-validation domain** using the same durable run lifecycle and
-   unified HTTP API while retaining its own fixed-order tool workflow.
+   unified HTTP API with an explicit DAG and selective replay.
 
 The project is offline-first. It does not require an LLM key, Redis, PostgreSQL, or Kubernetes to demonstrate the runtime mechanics.
 
@@ -69,7 +69,7 @@ RuntimeManager ---- AgentRegistry     ToolSandbox ---- ToolRegistry
   |      `- typed patch/replan/review/validation
   |
   `--> ManagedReleaseValidationRuntime
-         `- fixed-order durable registered-tool workflow
+         `- durable DAG + selective replay
 ```
 
 Both Agent API paths read and write the same durable `thread_states` store. Tool executions may optionally attach their start and finish events to a durable `run_id`.
@@ -118,6 +118,7 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 - cooperative cancellation with an atomic completion guard;
 - idempotent run submission through `client_request_id`;
 - polling and Server-Sent Events APIs;
+- immutable replay child runs with typed source/step lineage;
 - Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest.
 
 ### Registered-tool sandbox
@@ -138,16 +139,19 @@ The sandbox intentionally does **not** accept Python source, shell commands, exe
 
 ### Release-validation workflow
 
-A durable registered-tool workflow using shared runtime infrastructure, with fixed-order multi-step execution, per-step persistence, bounded retry, explicit interrupted-step recovery, cached completed results, and deterministic readiness validation.
+A durable registered-tool workflow using shared runtime infrastructure, with an explicit validated DAG, per-step persistence, selective replay, bounded retry, explicit interrupted-step recovery, cached completed results, and deterministic readiness validation.
 
 - a second, independent domain (`domains/release_validation/`) built on the same `SQLiteWorkflowStore` and `ToolSandbox` as the rest of `runtime_service`, with no relationship to Travel;
-- six registered tools always executed in a fixed order, each persisted through `SQLiteWorkflowStore`'s exclusive step-claim and attempt-token protection;
+- five independent root nodes feeding one evidence fan-in node, scheduled serially in deterministic topological order;
+- replay child runs that rerun requested nodes and descendants while copying only source evidence whose node, tool, and input signatures still match;
+- copied evidence recorded with zero target attempts and append-only replay events, without mutating the terminal source run;
+- every executed node persisted through `SQLiteWorkflowStore`'s exclusive step-claim and attempt-token protection;
 - a deterministic validator that inspects tool *results*, not just tool-call success, so a release can be BLOCKED even when every tool call completed;
 - explicit FAILED/BLOCKED separation: exhausted retries or an unexpected exception are FAILED, a business readiness check that did not pass is BLOCKED.
 
-See [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md) for the retry classification, execution/step identity hashing, and interrupted-recovery semantics.
+See [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md) for graph validation, replay invalidation, identity hashing, retry classification, and interrupted-recovery semantics.
 
-This is fixed-order tool execution, not planner- or LLM-driven tool selection. A typed adapter exposes it through `AgentRegistry`, `RuntimeManager`, and the shared `/runs` API, while `SQLiteWorkflowStore` continues to own step-level attempts and evidence. All release manifests, artifacts, and compatibility data are synthetic fixtures for this repository.
+This is a static code-defined DAG, not planner- or LLM-driven tool selection. A typed adapter exposes it through `AgentRegistry`, `RuntimeManager`, and the shared `/runs` API, while `SQLiteWorkflowStore` owns step-level attempts and evidence. Scheduling remains serial; no parallel-execution claim is made. All release manifests, artifacts, and compatibility data are synthetic fixtures for this repository.
 
 ## Quick start
 
@@ -218,8 +222,31 @@ curl -X POST http://127.0.0.1:8000/runs \
   -d '{
     "thread_id": "release-2.4.0",
     "agent_id": "release-validation",
-    "agent_version": "1.0.0",
+    "agent_version": "1.1.0",
     "input": {"manifest": {"...": "typed synthetic manifest fields"}}
+  }'
+```
+
+`release-validation:1.0.0` remains registered with its Phase 3A fixed-order
+input contract so persisted runs keep their pinned recovery behavior.
+`release-validation:1.1.0` is the Phase 3B DAG/replay contract used below.
+
+Selective replay also uses `POST /runs`, creating a new immutable child run:
+
+```bash
+curl -X POST http://127.0.0.1:8000/runs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_id": "release-replay-2.4.0",
+    "agent_id": "release-validation",
+    "agent_version": "1.1.0",
+    "input": {
+      "manifest": {"...": "typed synthetic manifest fields"},
+      "replay": {
+        "source_run_id": "run_source",
+        "step_ids": ["run_unit_tests"]
+      }
+    }
   }'
 ```
 
@@ -283,9 +310,9 @@ See [`docs/cloud-runtime.md`](docs/cloud-runtime.md) for the detailed execution 
 
 ## Agent integration boundary
 
-The sandbox is exposed as an independent control-plane API, and it is also used by the fixed-order release-validation workflow through its managed runtime adapter. Neither path is a planner- or LLM-driven tool loop: release validation always calls its six tools in the same hardcoded order, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop.
+The sandbox is exposed as an independent control-plane API, and it is also used by the static release-validation DAG through its managed runtime adapter. Neither path is a planner- or LLM-driven tool loop: every DAG node has a code-defined registered tool, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop.
 
-This keeps the current threat model narrow and testable: external clients may request only registered tools through the API, and the release-validation workflow only ever selects from its own fixed tool sequence. A later Agent tool-calling integration -- dynamic, planner-selected tool calls driven by Travel or another domain -- must still add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
+This keeps the current threat model narrow and testable: external clients may request only registered tools through the API, and release validation only executes tools declared by its static graph. A later Agent tool-calling integration -- dynamic, planner-selected tool calls driven by Travel or another domain -- must still add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
 
 ## Cancellation semantics
 
@@ -293,7 +320,7 @@ Cancellation is cooperative: code already executing inside an Agent step is not 
 
 ## Restart recovery
 
-At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again. The execution context marks startup-recovered work so the fixed-order release-validation adapter explicitly recovers a persisted `running` step instead of misclassifying it as a new concurrent execution.
+At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again. The execution context marks startup-recovered work so the release-validation adapter explicitly recovers a persisted `running` DAG node instead of misclassifying it as a new concurrent execution. Replay children use the same rule; completed copied/executed nodes remain cached.
 
 Terminal `failed` records are not recoverable and remain terminal under idempotent resubmission.
 
@@ -314,6 +341,7 @@ The suite covers:
 - idempotent run submission;
 - domain-specific input rejection before queueing and multi-domain state round-trips;
 - release-validation execution through the shared run, event, and checkpoint APIs;
+- DAG validation, deterministic topology, descendant expansion, source immutability, and input-safe selective replay;
 - tool allowlisting and argument-schema rejection;
 - subprocess timeout termination;
 - parent-secret environment scrubbing;
@@ -349,11 +377,11 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - process sandbox does not isolate host networking or the full host filesystem;
 - POSIX resource limits are weaker on Windows;
 - no arbitrary user-code execution endpoint;
-- the sandbox is used by the fixed-order release-validation workflow, but not yet by the Travel runtime, and nowhere by a planner- or LLM-driven dynamic tool loop;
+- the sandbox is used by the static release-validation DAG, but not yet by the Travel runtime, and nowhere by a planner- or LLM-driven dynamic tool loop;
 - no OpenTelemetry backend or evaluation dashboard;
 - no real flight, hotel, payment, or booking API.
 - no real LLM preference analyzer by default; the semantic analyzer is an injectable boundary;
 - Schedule/Geography reviewers and workflow-task persistence are not part of the first slice;
-- the release-validation workflow has a fixed step order (no dependency graph or scheduler), no selective replay or input-change invalidation, and no dynamic/LLM-driven tool selection -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
+- the release-validation DAG is static and serial: there is no parallel scheduler, conditional branching, client-defined graph, or dynamic/LLM-driven tool selection -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
 
 > An evidence-driven Agent Runtime prototype that connects behavioral evaluation with structured state, deterministic validation, durable execution lifecycle, checkpoint recovery, cancellation safety, idempotent submission, event observability, and policy-enforced registered-tool sandboxing.

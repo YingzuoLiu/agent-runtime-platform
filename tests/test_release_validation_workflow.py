@@ -1,18 +1,26 @@
 import inspect
 import json
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 import pytest
 
-from domains.release_validation.models import BuildArtifact, ReleaseManifest
+from domains.release_validation.models import (
+    BuildArtifact,
+    ReleaseManifest,
+    SelectiveReplayRequest,
+)
 from domains.release_validation import runtime as release_validation_runtime
 from domains.release_validation.runtime import (
     MAX_ATTEMPTS,
+    RELEASE_VALIDATION_DAG,
     STEP_SEQUENCE,
     ExecutionInputMismatchError,
     ReleaseValidationWorkflow,
+    SelectiveReplayError,
     StepAlreadyRunningError,
     StepAttemptsExhaustedError,
+    StepDefinitionMismatchError,
     StepPermanentFailureError,
     WorkflowExecutionFailedError,
     _canonicalize_manifest,
@@ -29,6 +37,18 @@ def _manifest_hash_for_test(manifest: ReleaseManifest) -> str:
     tests that manually seed the store agree with the workflow on what
     hash a given manifest produces."""
     return _stable_hash(_canonicalize_manifest(manifest).model_dump(mode="json"))
+
+
+def _replay_hash_for_test(
+    manifest: ReleaseManifest,
+    replay: SelectiveReplayRequest,
+) -> str:
+    return _stable_hash(
+        {
+            "manifest": _canonicalize_manifest(manifest).model_dump(mode="json"),
+            "replay": replay.model_dump(mode="json"),
+        }
+    )
 
 
 def make_valid_manifest(**overrides: Any) -> ReleaseManifest:
@@ -112,6 +132,241 @@ def test_happy_path_reaches_ready_through_all_six_tools(workflow):
     assert execution.status == WorkflowStatus.READY
 
 
+def test_release_validation_graph_has_five_roots_and_one_fan_in_node():
+    assert RELEASE_VALIDATION_DAG.topological_order == tuple(
+        step.step_id for step in STEP_SEQUENCE
+    )
+    assert RELEASE_VALIDATION_DAG.dependencies_for("generate_evidence") == frozenset(
+        {
+            "load_manifest",
+            "inspect_artifacts",
+            "run_unit_tests",
+            "run_compatibility",
+            "inspect_deployment",
+        }
+    )
+
+
+def test_selective_replay_reruns_requested_node_and_descendants_only(workflow):
+    manifest = make_valid_manifest()
+    workflow.run("source", manifest)
+    source_steps_before = {
+        step.step_id: step.model_dump() for step in workflow.store.list_steps("source")
+    }
+    spy_sandbox = ScriptedFaultSandbox(workflow.sandbox)
+    workflow.sandbox = spy_sandbox
+
+    result = workflow.run(
+        "target",
+        manifest,
+        replay=SelectiveReplayRequest(
+            source_run_id="source",
+            step_ids=["run_unit_tests"],
+        ),
+    )
+
+    assert result.status == ReleaseValidationStatus.READY
+    assert spy_sandbox.call_log == ["run_unit_test_check", "generate_release_evidence"]
+    assert result.replay is not None
+    assert result.replay.requested_step_ids == ["run_unit_tests"]
+    assert result.replay.replayed_step_ids == ["run_unit_tests", "generate_evidence"]
+    assert result.replay.reused_step_ids == [
+        "load_manifest",
+        "inspect_artifacts",
+        "run_compatibility",
+        "inspect_deployment",
+    ]
+    assert result.replay.automatically_invalidated_step_ids == []
+    target_steps = {step.step_id: step for step in workflow.store.list_steps("target")}
+    assert target_steps["run_unit_tests"].attempt_count == 1
+    assert target_steps["generate_evidence"].attempt_count == 1
+    assert all(
+        target_steps[step_id].attempt_count == 0
+        for step_id in result.replay.reused_step_ids
+    )
+    assert {
+        step.step_id: step.model_dump() for step in workflow.store.list_steps("source")
+    } == source_steps_before
+
+
+def test_selective_replay_accepts_pre3b_source_result_without_replay_field(workflow):
+    manifest = make_valid_manifest()
+    workflow.run("source", manifest)
+    with sqlite3.connect(workflow.store.database_path) as connection:
+        connection.execute(
+            "UPDATE workflow_executions SET result_json = ? WHERE run_id = ?",
+            (
+                json.dumps({"run_id": "source", "status": "ready", "findings": []}),
+                "source",
+            ),
+        )
+
+    result = workflow.run(
+        "target",
+        manifest,
+        replay=SelectiveReplayRequest(
+            source_run_id="source",
+            step_ids=["generate_evidence"],
+        ),
+    )
+
+    assert result.status == ReleaseValidationStatus.READY
+    assert result.replay is not None
+    assert result.replay.replayed_step_ids == ["generate_evidence"]
+    assert len(result.replay.reused_step_ids) == 5
+
+
+def test_selective_replay_expands_when_unselected_step_input_changed(workflow):
+    source_manifest = make_valid_manifest()
+    workflow.run("source", source_manifest)
+    spy_sandbox = ScriptedFaultSandbox(workflow.sandbox)
+    workflow.sandbox = spy_sandbox
+    changed_manifest = make_valid_manifest(tested_python_versions=["3.11"])
+
+    result = workflow.run(
+        "target",
+        changed_manifest,
+        replay=SelectiveReplayRequest(
+            source_run_id="source",
+            step_ids=["inspect_artifacts"],
+        ),
+    )
+
+    assert result.status == ReleaseValidationStatus.BLOCKED
+    assert spy_sandbox.call_log == [
+        "inspect_build_artifacts",
+        "run_compatibility_check",
+        "generate_release_evidence",
+    ]
+    assert result.replay is not None
+    assert result.replay.automatically_invalidated_step_ids == ["run_compatibility"]
+    assert result.replay.replayed_step_ids == [
+        "inspect_artifacts",
+        "run_compatibility",
+        "generate_evidence",
+    ]
+    assert result.replay.reused_step_ids == [
+        "load_manifest",
+        "run_unit_tests",
+        "inspect_deployment",
+    ]
+    assert [finding.rule_id for finding in result.findings] == ["python_versions_covered"]
+
+
+def test_selective_replay_can_remediate_blocked_source_without_mutating_it(workflow):
+    blocked = workflow.run("source", make_valid_manifest(tests_passed=False))
+    assert blocked.status == ReleaseValidationStatus.BLOCKED
+
+    replayed = workflow.run(
+        "target",
+        make_valid_manifest(tests_passed=True),
+        replay=SelectiveReplayRequest(
+            source_run_id="source",
+            step_ids=["run_unit_tests"],
+        ),
+    )
+
+    assert replayed.status == ReleaseValidationStatus.READY
+    assert replayed.replay is not None
+    assert replayed.replay.replayed_step_ids == ["run_unit_tests", "generate_evidence"]
+    assert workflow.store.get_execution("source").status == WorkflowStatus.BLOCKED
+    persisted_source = workflow.store.get_execution("source")
+    assert persisted_source is not None and persisted_source.result_json is not None
+    assert ReleaseValidationStatus.BLOCKED.value in persisted_source.result_json
+
+
+def test_selective_replay_resumes_copied_and_running_target_steps_after_restart(workflow):
+    manifest = _canonicalize_manifest(make_valid_manifest())
+    workflow.run("source", manifest)
+    replay = SelectiveReplayRequest(
+        source_run_id="source",
+        step_ids=["run_unit_tests"],
+    )
+    workflow.store.create_or_get_execution(
+        "target",
+        "release_validation",
+        _replay_hash_for_test(manifest, replay),
+    )
+    workflow.store.mark_running("target")
+    by_id = {step.step_id: step for step in STEP_SEQUENCE}
+    for step_id in ("load_manifest", "inspect_artifacts"):
+        step = by_id[step_id]
+        arguments = step.build_arguments(manifest, {})
+        workflow.store.reuse_completed_step(
+            "source",
+            "target",
+            step_id,
+            step.tool_name,
+            _stable_hash(arguments),
+        )
+    interrupted = by_id["run_unit_tests"]
+    interrupted_arguments = interrupted.build_arguments(manifest, {})
+    workflow.store.claim_step(
+        "target",
+        interrupted.step_id,
+        interrupted.tool_name,
+        _stable_hash(interrupted_arguments),
+        max_attempts=MAX_ATTEMPTS,
+    )
+
+    result = workflow.run(
+        "target",
+        manifest,
+        replay=replay,
+        resume_interrupted=True,
+    )
+
+    assert result.status == ReleaseValidationStatus.READY
+    assert result.replay is not None
+    assert result.replay.replayed_step_ids == ["run_unit_tests", "generate_evidence"]
+    assert result.replay.reused_step_ids == [
+        "load_manifest",
+        "inspect_artifacts",
+        "run_compatibility",
+        "inspect_deployment",
+    ]
+    target_steps = {step.step_id: step for step in workflow.store.list_steps("target")}
+    assert target_steps["run_unit_tests"].attempt_count == 2
+    assert [event.event_type for event in workflow.store.list_events("target")].count(
+        "step.replay_reused"
+    ) == 4
+
+
+def test_selective_replay_rejects_unknown_step_and_finalizes_target_failed(workflow):
+    manifest = make_valid_manifest()
+    workflow.run("source", manifest)
+
+    with pytest.raises(SelectiveReplayError, match="unknown workflow node ids"):
+        workflow.run(
+            "target",
+            manifest,
+            replay=SelectiveReplayRequest(
+                source_run_id="source",
+                step_ids=["does_not_exist"],
+            ),
+        )
+
+    assert workflow.store.get_execution("target").status == WorkflowStatus.FAILED
+
+
+def test_selective_replay_requires_terminal_non_failed_source(workflow):
+    manifest = make_valid_manifest()
+    workflow.store.create_or_get_execution(
+        "source", "release_validation", _manifest_hash_for_test(manifest)
+    )
+    workflow.store.mark_running("source")
+
+    with pytest.raises(SelectiveReplayError, match="must be READY or BLOCKED"):
+        workflow.run(
+            "target",
+            manifest,
+            replay=SelectiveReplayRequest(
+                source_run_id="source",
+                step_ids=["run_unit_tests"],
+            ),
+        )
+
+
 def test_second_run_with_same_manifest_hits_cache_and_skips_sandbox(workflow):
     manifest = make_valid_manifest()
     workflow.run("run-1", manifest)
@@ -129,6 +384,36 @@ def test_execution_input_mismatch_on_different_manifest_same_run_id(workflow):
 
     with pytest.raises(ExecutionInputMismatchError):
         workflow.run("run-1", make_valid_manifest(release_version="9.9.9"))
+
+
+def test_workflow_rejects_cached_row_from_different_registered_tool(workflow):
+    manifest = _canonicalize_manifest(make_valid_manifest())
+    workflow.store.create_or_get_execution(
+        "run-1",
+        "release_validation",
+        _manifest_hash_for_test(manifest),
+    )
+    workflow.store.mark_running("run-1")
+    first_step = STEP_SEQUENCE[0]
+    arguments = first_step.build_arguments(manifest, {})
+    wrong_tool_claim = workflow.store.claim_step(
+        "run-1",
+        first_step.step_id,
+        "wrong_tool_same_arguments",
+        _stable_hash(arguments),
+        max_attempts=MAX_ATTEMPTS,
+    )
+    workflow.store.complete_step(
+        "run-1",
+        first_step.step_id,
+        wrong_tool_claim.attempt_token,
+        result_json="{}",
+    )
+
+    with pytest.raises(StepDefinitionMismatchError, match="wrong_tool_same_arguments"):
+        workflow.run("run-1", manifest)
+
+    assert workflow.store.get_execution("run-1").status == WorkflowStatus.FAILED
 
 
 def test_timed_out_is_transient_and_retries_within_one_run_call(workflow):

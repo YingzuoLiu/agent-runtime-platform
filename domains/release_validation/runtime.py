@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.contracts import RuntimeExecutionContext, RuntimeResponse, TraceEvent
+from runtime_service.dag import WorkflowDag, WorkflowGraphError, WorkflowNode
 from runtime_service.sandbox import ToolExecutionResult, ToolExecutionStatus, ToolSandbox
 from runtime_service.workflow_store import (
     ClaimOutcome,
     ExecutionOutcome,
     SQLiteWorkflowStore,
+    StepReuseOutcome,
     WorkflowExecutionRecord,
     WorkflowStatus,
 )
@@ -21,6 +23,9 @@ from .models import (
     ReleaseValidationResult,
     ReleaseValidationState,
     ReleaseValidationStatus,
+    ReleaseValidationInputV1,
+    SelectiveReplayRequest,
+    SelectiveReplaySummary,
     ValidationFinding,
 )
 
@@ -65,10 +70,9 @@ def _default_is_transient_failure(execution: ToolExecutionResult) -> bool:
 class ExecutionInputMismatchError(Exception):
     """`run_id` was already used with a manifest that hashes differently.
 
-    Not implicitly resolved: the caller must pick a new `run_id` or
-    confirm which manifest is authoritative. There is no automatic
-    invalidation/replay here -- that is explicitly out of scope for this
-    phase.
+    Not implicitly resolved in place: terminal and in-progress executions
+    are immutable with respect to their own input. Selective replay creates
+    a different target `run_id` and references the old run as its source.
     """
 
 
@@ -94,6 +98,10 @@ class WorkflowExecutionFailedError(Exception):
         )
 
 
+class SelectiveReplayError(Exception):
+    """A selective replay request has invalid source or graph semantics."""
+
+
 class StepAlreadyRunningError(Exception):
     """A step is already `running` and `resume_interrupted` was not set.
 
@@ -115,6 +123,10 @@ class StepInputMismatchError(Exception):
     hash catching it, which is treated as an unexpected internal
     inconsistency (workflow FAILED), not a normal blocked/in-progress case.
     """
+
+
+class StepDefinitionMismatchError(Exception):
+    """A persisted step id belongs to a different registered tool."""
 
 
 class StepAttemptsExhaustedError(Exception):
@@ -155,6 +167,7 @@ class StepDefinition:
     step_id: str
     tool_name: str
     build_arguments: Callable[[ReleaseManifest, Dict[str, Dict[str, Any]]], Dict[str, Any]]
+    dependencies: tuple[str, ...] = ()
 
 
 def _manifest_arguments(manifest: ReleaseManifest, _results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -206,16 +219,37 @@ def _evidence_arguments(manifest: ReleaseManifest, _results: Dict[str, Dict[str,
     }
 
 
-# Fixed order. No dependency graph, no scheduler: each step's arguments
-# are built from the manifest alone (none currently need an earlier
-# step's result), and steps always run in this exact sequence.
-STEP_SEQUENCE: List[StepDefinition] = [
+# The five evidence-producing checks are independent roots. The final
+# evidence node is a fan-in over every root. Execution is intentionally
+# serial for this phase, but readiness is decided from this explicit graph
+# rather than from adjacency in a hardcoded list.
+STEP_DEFINITIONS: List[StepDefinition] = [
     StepDefinition("load_manifest", "load_release_manifest", _manifest_arguments),
     StepDefinition("inspect_artifacts", "inspect_build_artifacts", _artifacts_arguments),
     StepDefinition("run_unit_tests", "run_unit_test_check", _unit_test_arguments),
     StepDefinition("run_compatibility", "run_compatibility_check", _compatibility_arguments),
     StepDefinition("inspect_deployment", "inspect_deployment_configuration", _deployment_arguments),
-    StepDefinition("generate_evidence", "generate_release_evidence", _evidence_arguments),
+    StepDefinition(
+        "generate_evidence",
+        "generate_release_evidence",
+        _evidence_arguments,
+        dependencies=(
+            "load_manifest",
+            "inspect_artifacts",
+            "run_unit_tests",
+            "run_compatibility",
+            "inspect_deployment",
+        ),
+    ),
+]
+RELEASE_VALIDATION_DAG = WorkflowDag(
+    WorkflowNode(step.step_id, step.dependencies) for step in STEP_DEFINITIONS
+)
+_STEP_BY_ID = {step.step_id: step for step in STEP_DEFINITIONS}
+# Backward-compatible public view used by existing callers and tests. It is
+# now derived from the validated DAG's deterministic topological order.
+STEP_SEQUENCE: List[StepDefinition] = [
+    _STEP_BY_ID[step_id] for step_id in RELEASE_VALIDATION_DAG.topological_order
 ]
 
 
@@ -290,7 +324,7 @@ def validate_release_readiness(step_results: Dict[str, Dict[str, Any]]) -> List[
 
 
 class ReleaseValidationWorkflow:
-    """Fixed-order, multi-step registered-tool workflow.
+    """Dependency-aware, serial registered-tool workflow.
 
     Uses `SQLiteWorkflowStore` and `ToolSandbox` directly. The workflow
     itself has no manager or HTTP concerns; `ManagedReleaseValidationRuntime`
@@ -314,10 +348,18 @@ class ReleaseValidationWorkflow:
         manifest: ReleaseManifest,
         *,
         resume_interrupted: bool = False,
+        replay: SelectiveReplayRequest | None = None,
+        legacy_fixed_order: bool = False,
     ) -> ReleaseValidationResult:
         manifest = _canonicalize_manifest(manifest)
-        manifest_hash = _stable_hash(manifest.model_dump(mode="json"))
-        claim = self.store.create_or_get_execution(run_id, WORKFLOW_TYPE, manifest_hash)
+        identity_payload = manifest.model_dump(mode="json")
+        if replay is not None:
+            identity_payload = {
+                "manifest": identity_payload,
+                "replay": replay.model_dump(mode="json"),
+            }
+        execution_hash = _stable_hash(identity_payload)
+        claim = self.store.create_or_get_execution(run_id, WORKFLOW_TYPE, execution_hash)
         if claim.outcome == ExecutionOutcome.WORKFLOW_TYPE_MISMATCH:
             raise WorkflowTypeMismatchError(
                 f"run_id {run_id!r} was previously used for workflow_type "
@@ -342,23 +384,102 @@ class ReleaseValidationWorkflow:
         # own ALREADY_RUNNING/interrupted-recovery handling covers it.
 
         try:
+            if legacy_fixed_order and replay is not None:
+                raise SelectiveReplayError(
+                    "release-validation:1.0.0 does not support selective replay"
+                )
             step_results: Dict[str, Dict[str, Any]] = {}
-            for step in STEP_SEQUENCE:
+            invalidated_step_ids: set[str] = set()
+            replayed_step_ids: set[str] = set()
+            reused_step_ids: set[str] = set()
+            automatically_invalidated_step_ids: set[str] = set()
+            if replay is not None:
+                self._validate_replay_request(run_id, replay)
+                try:
+                    invalidated_step_ids.update(
+                        RELEASE_VALIDATION_DAG.descendants(replay.step_ids)
+                    )
+                except WorkflowGraphError as exc:
+                    raise SelectiveReplayError(str(exc)) from exc
+
+            scheduled_steps = STEP_DEFINITIONS if legacy_fixed_order else STEP_SEQUENCE
+            for step in scheduled_steps:
+                if not legacy_fixed_order:
+                    missing_dependencies = (
+                        RELEASE_VALIDATION_DAG.dependencies_for(step.step_id)
+                        - step_results.keys()
+                    )
+                    if missing_dependencies:
+                        raise RuntimeError(
+                            f"scheduler selected {step.step_id!r} before dependencies "
+                            f"{sorted(missing_dependencies)!r} completed"
+                        )
+                arguments = step.build_arguments(manifest, step_results)
+
+                if replay is not None and step.step_id not in invalidated_step_ids:
+                    reuse = self.store.reuse_completed_step(
+                        replay.source_run_id,
+                        run_id,
+                        step.step_id,
+                        step.tool_name,
+                        _stable_hash(arguments),
+                    )
+                    if reuse.outcome in {StepReuseOutcome.COPIED, StepReuseOutcome.EXISTING}:
+                        assert reuse.step is not None and reuse.step.result_json is not None
+                        step_results[step.step_id] = json.loads(reuse.step.result_json)
+                        reused_step_ids.add(step.step_id)
+                        continue
+
+                    automatically_invalidated_step_ids.add(step.step_id)
+                    invalidated_step_ids.update(
+                        RELEASE_VALIDATION_DAG.descendants([step.step_id])
+                    )
+
                 step_results[step.step_id] = self._run_step(
-                    run_id, step, manifest, step_results, resume_interrupted=resume_interrupted
+                    run_id,
+                    step,
+                    arguments,
+                    resume_interrupted=resume_interrupted,
+                )
+                if replay is not None:
+                    replayed_step_ids.add(step.step_id)
+
+            replay_summary = None
+            if replay is not None:
+                ordered_ids = RELEASE_VALIDATION_DAG.topological_order
+                replay_summary = SelectiveReplaySummary(
+                    source_run_id=replay.source_run_id,
+                    requested_step_ids=list(replay.step_ids),
+                    replayed_step_ids=[
+                        step_id for step_id in ordered_ids if step_id in replayed_step_ids
+                    ],
+                    reused_step_ids=[
+                        step_id for step_id in ordered_ids if step_id in reused_step_ids
+                    ],
+                    automatically_invalidated_step_ids=[
+                        step_id
+                        for step_id in ordered_ids
+                        if step_id in automatically_invalidated_step_ids
+                    ],
                 )
 
             findings = validate_release_readiness(step_results)
             if findings:
                 candidate = ReleaseValidationResult(
-                    run_id=run_id, status=ReleaseValidationStatus.BLOCKED, findings=findings
+                    run_id=run_id,
+                    status=ReleaseValidationStatus.BLOCKED,
+                    findings=findings,
+                    replay=replay_summary,
                 )
                 record = self.store.finalize_blocked(
                     run_id, candidate.model_dump_json(), error_code="readiness_requirements_unmet"
                 )
             else:
                 candidate = ReleaseValidationResult(
-                    run_id=run_id, status=ReleaseValidationStatus.READY, findings=[]
+                    run_id=run_id,
+                    status=ReleaseValidationStatus.READY,
+                    findings=[],
+                    replay=replay_summary,
                 )
                 record = self.store.finalize_ready(run_id, candidate.model_dump_json())
 
@@ -386,6 +507,29 @@ class ReleaseValidationWorkflow:
                     f"{record.status.value!r}, not FAILED as expected"
                 ) from exc
             raise
+
+    def _validate_replay_request(
+        self,
+        target_run_id: str,
+        replay: SelectiveReplayRequest,
+    ) -> None:
+        if replay.source_run_id == target_run_id:
+            raise SelectiveReplayError("selective replay must create a new target run_id")
+        source = self.store.get_execution(replay.source_run_id)
+        if source is None:
+            raise SelectiveReplayError(
+                f"selective replay source not found: {replay.source_run_id!r}"
+            )
+        if source.workflow_type != WORKFLOW_TYPE:
+            raise SelectiveReplayError(
+                f"selective replay source {replay.source_run_id!r} has workflow_type "
+                f"{source.workflow_type!r}, not {WORKFLOW_TYPE!r}"
+            )
+        if source.status not in {WorkflowStatus.READY, WorkflowStatus.BLOCKED}:
+            raise SelectiveReplayError(
+                f"selective replay source {replay.source_run_id!r} must be READY or BLOCKED, "
+                f"not {source.status.value!r}"
+            )
 
     def _settle_finalize(
         self,
@@ -438,12 +582,10 @@ class ReleaseValidationWorkflow:
         self,
         run_id: str,
         step: StepDefinition,
-        manifest: ReleaseManifest,
-        step_results: Dict[str, Dict[str, Any]],
+        arguments: Dict[str, Any],
         *,
         resume_interrupted: bool,
     ) -> Dict[str, Any]:
-        arguments = step.build_arguments(manifest, step_results)
         step_hash = _stable_hash(arguments)
 
         for _ in range(_STEP_LOOP_GUARD):
@@ -469,6 +611,13 @@ class ReleaseValidationWorkflow:
                 raise StepInputMismatchError(
                     f"step {run_id}/{step.step_id} was previously claimed with "
                     "different arguments"
+                )
+
+            if claim.outcome == ClaimOutcome.DEFINITION_MISMATCH:
+                assert claim.step is not None
+                raise StepDefinitionMismatchError(
+                    f"step {run_id}/{step.step_id} was previously claimed by tool "
+                    f"{claim.step.tool_name!r}, not {step.tool_name!r}"
                 )
 
             if claim.outcome == ClaimOutcome.ATTEMPTS_EXHAUSTED:
@@ -519,15 +668,21 @@ def _step_error_code(status: ToolExecutionStatus, error: str | None) -> str:
 
 
 class ManagedReleaseValidationRuntime:
-    """Adapter that exposes the fixed workflow through ``RuntimeManager``.
+    """Adapter that exposes the DAG workflow through ``RuntimeManager``.
 
-    The workflow remains fixed-order. This adapter adds lifecycle integration,
-    typed input/state validation and a domain checkpoint; it does not add a DAG,
-    selective replay, planner-selected tools or dynamic execution policy.
+    The workflow remains statically defined and serial. This adapter adds
+    lifecycle integration, typed input/state validation and a domain checkpoint.
+    The DAG and replay targets are deterministic inputs, never planner-selected.
     """
 
-    def __init__(self, workflow: ReleaseValidationWorkflow):
+    def __init__(
+        self,
+        workflow: ReleaseValidationWorkflow,
+        *,
+        legacy_fixed_order: bool = False,
+    ):
         self.workflow = workflow
+        self.legacy_fixed_order = legacy_fixed_order
 
     def initial_state(self, thread_id: str) -> ReleaseValidationState:
         return ReleaseValidationState(thread_id=thread_id)
@@ -535,15 +690,22 @@ class ManagedReleaseValidationRuntime:
     def execute(
         self,
         state: ReleaseValidationState,
-        runtime_input: ReleaseValidationInput,
+        runtime_input: ReleaseValidationInputV1 | ReleaseValidationInput,
         context: RuntimeExecutionContext,
     ) -> RuntimeResponse[ReleaseValidationState]:
+        replay = (
+            runtime_input.replay
+            if isinstance(runtime_input, ReleaseValidationInput)
+            else None
+        )
         result = self.workflow.run(
             context.run_id,
             runtime_input.manifest,
             resume_interrupted=(
                 runtime_input.resume_interrupted or context.recovered_after_restart
             ),
+            replay=replay,
+            legacy_fixed_order=self.legacy_fixed_order,
         )
         updated_state = state.model_copy(
             update={
@@ -558,6 +720,14 @@ class ManagedReleaseValidationRuntime:
                         payload={
                             "run_id": context.run_id,
                             "finding_count": len(result.findings),
+                            "replay_source_run_id": (
+                                result.replay.source_run_id if result.replay is not None else None
+                            ),
+                            "replayed_step_count": (
+                                len(result.replay.replayed_step_ids)
+                                if result.replay is not None
+                                else 0
+                            ),
                         },
                     ),
                 ],
