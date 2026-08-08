@@ -109,6 +109,7 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 
 - asynchronous `POST /runs` API;
 - typed, registry-discovered input and state schemas for multiple domains;
+- strict domain-state validation that rejects unknown or cross-domain fields;
 - durable `run_id` lifecycle;
 - exact Agent-version pinning;
 - worker-based execution;
@@ -292,7 +293,9 @@ Cancellation is cooperative: code already executing inside an Agent step is not 
 
 ## Restart recovery
 
-At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again.
+At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again. The execution context marks startup-recovered work so the fixed-order release-validation adapter explicitly recovers a persisted `running` step instead of misclassifying it as a new concurrent execution.
+
+Terminal `failed` records are not recoverable and remain terminal under idempotent resubmission.
 
 This is safe for the deterministic demo. Booking and payment tools would additionally require per-tool-call idempotency records.
 

@@ -2,6 +2,16 @@ import threading
 import time
 
 from agent.contracts import RuntimeResponse
+from domains.release_validation.models import ReleaseManifest, ReleaseValidationInput
+from domains.release_validation.runtime import (
+    MAX_ATTEMPTS,
+    STEP_SEQUENCE,
+    WORKFLOW_TYPE,
+    ReleaseValidationWorkflow,
+    _canonicalize_manifest,
+    _stable_hash,
+)
+from domains.release_validation.tools import build_release_validation_tool_registry
 from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
 from domains.travel.state import AgentState
 from runtime_service import (
@@ -13,6 +23,8 @@ from runtime_service import (
     SQLiteRunStore,
     build_default_registry,
 )
+from runtime_service.sandbox import ToolSandbox
+from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStatus
 
 
 def wait_for_terminal(manager: RuntimeManager, run_id: str, timeout: float = 10.0):
@@ -38,6 +50,39 @@ class BlockingRuntime(TravelAgentRuntime):
         return super().handle_user_message(state, user_message)
 
 
+class CountingBlockingRuntime(TravelAgentRuntime):
+    def __init__(
+        self,
+        first_started: threading.Event,
+        second_started: threading.Event,
+        release: threading.Event,
+        call_count: list[int],
+        count_lock: threading.Lock,
+    ):
+        super().__init__()
+        self.first_started = first_started
+        self.second_started = second_started
+        self.release = release
+        self.call_count = call_count
+        self.count_lock = count_lock
+
+    def handle_user_message(
+        self,
+        state: AgentState,
+        user_message: str,
+    ) -> RuntimeResponse[AgentState]:
+        with self.count_lock:
+            self.call_count[0] += 1
+            current_count = self.call_count[0]
+        if current_count == 1:
+            self.first_started.set()
+        else:
+            self.second_started.set()
+        if not self.release.wait(timeout=10):
+            raise TimeoutError("test release event was not set")
+        return super().handle_user_message(state, user_message)
+
+
 def blocking_registry(started: threading.Event, release: threading.Event) -> AgentRegistry:
     registry = AgentRegistry()
     registry.register(
@@ -49,6 +94,31 @@ def blocking_registry(started: threading.Event, release: threading.Event) -> Age
         state_model=AgentState,
     )
     return registry
+
+
+def release_manifest() -> ReleaseManifest:
+    return ReleaseManifest(
+        release_id="rel-manager-recovery",
+        application_name="aurora-notes",
+        release_version="2.4.0",
+        required_artifacts=["aurora-notes-server", "aurora-notes-cli"],
+        available_artifacts=[
+            {"name": "aurora-notes-server", "checksum": "a" * 64},
+            {"name": "aurora-notes-cli", "checksum": "b" * 64},
+        ],
+        required_test_suite="aurora-notes-full-suite",
+        executed_test_suite="aurora-notes-full-suite",
+        tests_passed=True,
+        required_python_versions=["3.11", "3.12"],
+        tested_python_versions=["3.11", "3.12"],
+        deployment_environment="staging",
+        configuration_requirements=["DATABASE_URL", "FEATURE_FLAGS_ENDPOINT"],
+        actual_configuration_keys=[
+            "DATABASE_URL",
+            "FEATURE_FLAGS_ENDPOINT",
+            "LOG_LEVEL",
+        ],
+    )
 
 
 def test_manager_persists_state_and_events(tmp_path):
@@ -150,6 +220,66 @@ def test_running_run_is_recovered_after_restart(tmp_path):
         assert manager.store.load_thread_state("recovery-thread") is not None
     finally:
         manager.stop()
+
+
+def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    manifest = release_manifest()
+    runtime_input = ReleaseValidationInput(manifest=manifest)
+    run = RunRecord(
+        run_id="run_release_recovery",
+        thread_id="release-recovery-thread",
+        agent_id="release-validation",
+        agent_version="1.0.0",
+        domain_id="release-validation",
+        schema_version="1",
+        status=RunStatus.RUNNING,
+        input=runtime_input.model_dump(mode="json"),
+        attempt=1,
+    )
+    SQLiteRunStore(database_path).create_run(run)
+
+    workflow_store = SQLiteWorkflowStore(database_path)
+    canonical_manifest = _canonicalize_manifest(manifest)
+    manifest_hash = _stable_hash(canonical_manifest.model_dump(mode="json"))
+    workflow_store.create_or_get_execution(run.run_id, WORKFLOW_TYPE, manifest_hash)
+    workflow_store.mark_running(run.run_id)
+    first_step = STEP_SEQUENCE[0]
+    step_hash = _stable_hash(first_step.build_arguments(canonical_manifest, {}))
+    workflow_store.claim_step(
+        run.run_id,
+        first_step.step_id,
+        first_step.tool_name,
+        step_hash,
+        max_attempts=MAX_ATTEMPTS,
+    )
+
+    reopened_workflow_store = SQLiteWorkflowStore(database_path)
+    reopened_workflow = ReleaseValidationWorkflow(
+        reopened_workflow_store,
+        ToolSandbox(build_release_validation_tool_registry()),
+    )
+    registry = build_default_registry(release_validation_workflow=reopened_workflow)
+    manager = RuntimeManager(SQLiteRunStore(database_path), registry)
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, run.run_id)
+    finally:
+        manager.stop()
+
+    assert result.status == RunStatus.COMPLETED
+    assert result.run_id == run.run_id
+    assert result.attempt == 2
+    assert result.input is not None
+    assert result.input["resume_interrupted"] is False
+    execution = reopened_workflow_store.get_execution(run.run_id)
+    assert execution is not None
+    assert execution.status == WorkflowStatus.READY
+    steps = {step.step_id: step for step in reopened_workflow_store.list_steps(run.run_id)}
+    assert steps[first_step.step_id].attempt_count == 2
+    event_types = [event.event_type for event in manager.store.list_events(run.run_id)]
+    assert "run.recovered" in event_types
+    assert "run.failed" not in event_types
 
 
 def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
@@ -423,6 +553,55 @@ def test_two_workers_complete_independent_runs(tmp_path):
         manager.stop()
 
 
+def test_submit_before_start_is_enqueued_once_with_two_workers(tmp_path):
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    call_count = [0]
+    count_lock = threading.Lock()
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "0.3.0",
+        lambda: CountingBlockingRuntime(
+            first_started,
+            second_started,
+            release,
+            call_count,
+            count_lock,
+        ),
+        description="Counting blocking test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    manager = RuntimeManager(
+        SQLiteRunStore(tmp_path / "runtime.db"),
+        registry,
+        worker_count=2,
+    )
+    submitted = manager.submit(
+        RunCreateRequest(
+            thread_id="submit-before-start",
+            user_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        )
+    )
+
+    manager.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert not second_started.wait(timeout=0.25)
+        release.set()
+        result = wait_for_terminal(manager, submitted.run_id)
+    finally:
+        release.set()
+        manager.stop()
+
+    assert result.status == RunStatus.COMPLETED
+    assert call_count == [1]
+    event_types = [event.event_type for event in manager.store.list_events(submitted.run_id)]
+    assert event_types.count("run.started") == 1
+
+
 def test_idempotent_submit_returns_existing_run(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
     manager = RuntimeManager(store, build_default_registry())
@@ -431,6 +610,43 @@ def test_idempotent_submit_returns_existing_run(tmp_path):
     second = manager.submit(request)
     assert first.run_id == second.run_id
     assert len(store.list_events(first.run_id)) == 1
+
+
+def test_restart_and_idempotent_submit_do_not_revive_failed_run(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    failed = RunRecord(
+        run_id="run_failed_terminal",
+        thread_id="failed-terminal-thread",
+        agent_id="travel-agent",
+        agent_version="0.3.0",
+        status=RunStatus.FAILED,
+        input={"user_message": "Plan a five-day trip to Tokyo."},
+        client_request_id="failed-request-123",
+        attempt=1,
+        error="RuntimeError: persisted failure",
+    )
+    store.create_run(failed)
+    store.append_event(failed.run_id, "run.failed", {"error": failed.error})
+
+    manager = RuntimeManager(SQLiteRunStore(database_path), build_default_registry())
+    manager.start()
+    try:
+        duplicate = manager.submit(
+            RunCreateRequest(
+                thread_id="failed-terminal-thread",
+                user_message="Plan a five-day trip to Tokyo.",
+                client_request_id="failed-request-123",
+            )
+        )
+    finally:
+        manager.stop()
+
+    assert duplicate.run_id == failed.run_id
+    assert duplicate.status == RunStatus.FAILED
+    assert duplicate.attempt == 1
+    event_types = [event.event_type for event in manager.store.list_events(failed.run_id)]
+    assert event_types == ["run.failed"]
 
 
 def test_store_survives_new_store_instance(tmp_path):

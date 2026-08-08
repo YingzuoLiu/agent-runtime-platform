@@ -100,12 +100,15 @@ have judged.
 `ALREADY_RUNNING` from `claim_step` is the normal outcome for a
 genuinely still-in-progress step. By default, `run()` raises
 `StepAlreadyRunningError` and finalizes nothing -- the execution stays
-`RUNNING` for a later call to resolve. Recovery only happens when the
-caller passes `resume_interrupted=True`, which calls
+`RUNNING` for a later call to resolve. Recovery only happens when a direct
+caller passes `resume_interrupted=True`, or when `RuntimeManager` marks a
+durable run as recovered during startup and the managed adapter supplies
+the same explicit recovery intent. That recovery calls
 `SQLiteWorkflowStore.recover_interrupted_step` (RUNNING -> FAILED with
 `error_code="interrupted"`) and then re-claims, producing a brand-new
 `attempt_token`. There is no lease, no heartbeat, and no automatic
-detection of a dead process -- the caller must decide.
+detection of a dead process inside `ReleaseValidationWorkflow`; either the
+direct caller or the outer durable manager must decide.
 
 ## Validator: why a tool succeeding is not the same as ready
 
@@ -144,7 +147,8 @@ verdict could be reached."
   manager. This separation does not make the workflow planner-driven.
 - The workflow is submitted through the shared `/runs` endpoint; there is no
   release-specific execution endpoint.
-- Interrupted-step recovery is explicit (`resume_interrupted=True`), not
-  automatic crash detection.
+- Interrupted-step recovery is explicit (`resume_interrupted=True` for a
+  direct caller, or a startup-recovery context from `RuntimeManager`), not
+  automatic crash detection inside the workflow.
 - There is no selective replay: an input mismatch is rejected outright,
   never partially reused.

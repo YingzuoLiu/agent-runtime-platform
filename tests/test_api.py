@@ -3,6 +3,7 @@ import time
 from fastapi.testclient import TestClient
 
 from api.main import create_app
+from runtime_service import SQLiteRunStore
 
 
 def valid_release_manifest() -> dict:
@@ -285,6 +286,38 @@ def test_unified_api_rejects_domain_invalid_input_before_queueing(tmp_path):
         )
 
     assert response.status_code == 422
+
+
+def test_unified_api_rejects_release_state_for_travel_agent(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "thread_id": "wrong-domain-state",
+                "client_request_id": "wrong-domain-state-request",
+                "agent_id": "travel-agent",
+                "agent_version": "0.3.0",
+                "input": {"user_message": "Plan a five-day trip to Tokyo."},
+                "state": {
+                    "thread_id": "wrong-domain-state",
+                    "execution_trace": [],
+                    "manifest": valid_release_manifest(),
+                    "result": None,
+                    "current_stage": "initialized",
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in response.json()["detail"]
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            "wrong-domain-state-request"
+        )
+        is None
+    )
 
 
 def test_same_thread_id_cannot_silently_cross_domain_checkpoint_boundary(tmp_path):

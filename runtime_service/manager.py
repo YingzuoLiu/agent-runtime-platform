@@ -22,7 +22,7 @@ class RuntimeManager:
         self.registry = registry
         self.store.bind_state_registry(registry)
         self.worker_count = worker_count
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._queue: queue.Queue[tuple[str, bool] | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._started = False
         self._lock = threading.Lock()
@@ -47,7 +47,7 @@ class RuntimeManager:
                     run.error = None
                     self.store.update_run(run)
                     self.store.append_event(run.run_id, "run.recovered", {"reason": "runtime_restart"})
-                self._queue.put(run.run_id)
+                self._queue.put((run.run_id, True))
 
     def stop(self) -> None:
         with self._lock:
@@ -67,45 +67,47 @@ class RuntimeManager:
         state = registration.parse_state(request.state) if request.state is not None else None
         if state is not None and state.thread_id != request.thread_id:
             raise ValueError("state.thread_id must match request.thread_id")
-        if request.client_request_id:
-            existing = self.store.get_run_by_client_request_id(request.client_request_id)
-            if existing is not None:
+        with self._lock:
+            if request.client_request_id:
+                existing = self.store.get_run_by_client_request_id(request.client_request_id)
+                if existing is not None:
+                    return existing
+            run = RunRecord(
+                run_id=f"run_{uuid4().hex}",
+                thread_id=request.thread_id,
+                agent_id=request.agent_id,
+                agent_version=request.agent_version,
+                domain_id=registration.domain_id,
+                schema_version=registration.schema_version,
+                status=RunStatus.QUEUED,
+                input=runtime_input.model_dump(mode="json"),
+                state=state,
+                client_request_id=request.client_request_id,
+            )
+            try:
+                self.store.create_run(run)
+            except sqlite3.IntegrityError:
+                if not request.client_request_id:
+                    raise
+                existing = self.store.get_run_by_client_request_id(request.client_request_id)
+                if existing is None:
+                    raise
                 return existing
-        run = RunRecord(
-            run_id=f"run_{uuid4().hex}",
-            thread_id=request.thread_id,
-            agent_id=request.agent_id,
-            agent_version=request.agent_version,
-            domain_id=registration.domain_id,
-            schema_version=registration.schema_version,
-            status=RunStatus.QUEUED,
-            input=runtime_input.model_dump(mode="json"),
-            state=state,
-            client_request_id=request.client_request_id,
-        )
-        try:
-            self.store.create_run(run)
-        except sqlite3.IntegrityError:
-            if not request.client_request_id:
-                raise
-            existing = self.store.get_run_by_client_request_id(request.client_request_id)
-            if existing is None:
-                raise
-            return existing
-        self.store.append_event(
-            run.run_id,
-            "run.queued",
-            {
-                "agent_id": run.agent_id,
-                "agent_version": run.agent_version,
-                "domain_id": run.domain_id,
-                "schema_version": run.schema_version,
-                "thread_id": run.thread_id,
-                "client_request_id": run.client_request_id,
-            },
-        )
-        self._queue.put(run.run_id)
-        return run
+            self.store.append_event(
+                run.run_id,
+                "run.queued",
+                {
+                    "agent_id": run.agent_id,
+                    "agent_version": run.agent_version,
+                    "domain_id": run.domain_id,
+                    "schema_version": run.schema_version,
+                    "thread_id": run.thread_id,
+                    "client_request_id": run.client_request_id,
+                },
+            )
+            if self._started:
+                self._queue.put((run.run_id, False))
+            return run
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self.store.get_run(run_id)
@@ -124,15 +126,24 @@ class RuntimeManager:
 
     def _worker_loop(self) -> None:
         while True:
-            run_id = self._queue.get()
+            queue_item = self._queue.get()
             try:
-                if run_id is None:
+                if queue_item is None:
                     return
-                self._execute_run(run_id)
+                run_id, recovered_after_restart = queue_item
+                self._execute_run(
+                    run_id,
+                    recovered_after_restart=recovered_after_restart,
+                )
             finally:
                 self._queue.task_done()
 
-    def _execute_run(self, run_id: str) -> None:
+    def _execute_run(
+        self,
+        run_id: str,
+        *,
+        recovered_after_restart: bool = False,
+    ) -> None:
         run = self._require_run(run_id)
         if run.status.is_terminal:
             return
@@ -171,7 +182,11 @@ class RuntimeManager:
             result = runtime.execute(
                 state,
                 runtime_input,
-                RuntimeExecutionContext(run_id=run.run_id, thread_id=run.thread_id),
+                RuntimeExecutionContext(
+                    run_id=run.run_id,
+                    thread_id=run.thread_id,
+                    recovered_after_restart=recovered_after_restart,
+                ),
             )
             run.state = result.state
             run.output_message = result.message

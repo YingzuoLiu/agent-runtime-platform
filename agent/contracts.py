@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, Generic, List, Protocol, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def utc_now() -> str:
@@ -41,6 +41,8 @@ class BaseRuntimeState(BaseModel):
     columns instead. Concrete subclasses (e.g. `AgentState`) set
     both as real class attributes.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     domain_id: ClassVar[str]
     schema_version: ClassVar[str]
@@ -79,6 +81,7 @@ class RuntimeExecutionContext(BaseModel):
 
     run_id: str
     thread_id: str
+    recovered_after_restart: bool = False
 
 
 class RuntimeProtocol(Protocol[StateT]):

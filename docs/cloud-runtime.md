@@ -187,7 +187,7 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 
 ## Restart recovery
 
-On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again.
+On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again. Startup-recovered queue items carry a domain-neutral execution-context marker; the release-validation adapter maps that marker to explicit interrupted-step recovery, while normal submissions do not receive it. Terminal `failed` runs remain excluded from recovery.
 
 The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, shared thread state, submission idempotency, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
 

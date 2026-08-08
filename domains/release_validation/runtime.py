@@ -541,7 +541,9 @@ class ManagedReleaseValidationRuntime:
         result = self.workflow.run(
             context.run_id,
             runtime_input.manifest,
-            resume_interrupted=runtime_input.resume_interrupted,
+            resume_interrupted=(
+                runtime_input.resume_interrupted or context.recovered_after_restart
+            ),
         )
         updated_state = state.model_copy(
             update={
