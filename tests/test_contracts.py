@@ -29,6 +29,7 @@ from runtime_service import (
     ApiKeyCredential,
     RunCreateRequest,
     RuntimeManager,
+    RuntimeRole,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
@@ -45,6 +46,7 @@ CONTRACT_AUTHENTICATOR = StaticApiKeyAuthenticator(
             api_key=CONTRACT_API_KEY,
             tenant_id="tenant-contract",
             subject_id="contract-tester",
+            role=RuntimeRole.OPERATOR,
         )
     ]
 )

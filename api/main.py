@@ -20,12 +20,16 @@ from runtime_service import (
     AgentDescriptor,
     AuthenticationError,
     Authenticator,
+    AuthorizationError,
+    Authorizer,
     Principal,
     ReferencedRunNotFoundError,
+    RoleAuthorizer,
     RunCreateRequest,
     RunEvent,
     RunRecord,
     RuntimeManager,
+    RuntimePermission,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     ToolDescriptor,
@@ -60,6 +64,7 @@ def create_app(
     database_path: str | Path | None = None,
     worker_count: int | None = None,
     authenticator: Authenticator | None = None,
+    authorizer: Authorizer | None = None,
 ) -> FastAPI:
     database_value = database_path
     if database_value is None:
@@ -71,6 +76,7 @@ def create_app(
         if authenticator is not None
         else StaticApiKeyAuthenticator.from_environment()
     )
+    resolved_authorizer = authorizer if authorizer is not None else RoleAuthorizer()
     tool_registry = build_default_tool_registry()
     bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -97,6 +103,7 @@ def create_app(
         app.state.tool_registry = tool_registry
         app.state.tool_sandbox = ToolSandbox(tool_registry)
         app.state.authenticator = resolved_authenticator
+        app.state.authorizer = resolved_authorizer
         yield
         manager.stop()
 
@@ -106,7 +113,7 @@ def create_app(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
             "plus policy-enforced sandboxed tool execution."
         ),
-        version="0.8.0",
+        version="0.9.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -131,6 +138,18 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             ) from exc
 
+    def require_permission(
+        principal: Principal,
+        permission: RuntimePermission,
+    ) -> None:
+        try:
+            resolved_authorizer.authorize(principal, permission)
+        except AuthorizationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Operation not permitted",
+            ) from exc
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -145,6 +164,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> list[AgentDescriptor]:
+        require_permission(principal, RuntimePermission.AGENTS_READ)
         return request.app.state.agent_registry.list_agents()
 
     @app.get("/tools", response_model=list[ToolDescriptor])
@@ -152,6 +172,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> list[ToolDescriptor]:
+        require_permission(principal, RuntimePermission.TOOLS_READ)
         return request.app.state.tool_registry.list_tools()
 
     @app.post("/tools/{tool_name}/execute", response_model=ToolExecutionResult)
@@ -162,12 +183,13 @@ def create_app(
         principal: Principal = Depends(require_principal),
     ) -> ToolExecutionResult:
         store: SQLiteRunStore = request.app.state.run_store
+        if (
+            payload.run_id is not None
+            and store.get_run_for_tenant(payload.run_id, principal.tenant_id) is None
+        ):
+            raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.TOOLS_EXECUTE)
         if payload.run_id is not None:
-            if (
-                store.get_run_for_tenant(payload.run_id, principal.tenant_id)
-                is None
-            ):
-                raise HTTPException(status_code=404, detail="Run not found")
             store.append_event(
                 payload.run_id,
                 "sandbox.execution_started",
@@ -197,6 +219,7 @@ def create_app(
         principal: Principal = Depends(require_principal),
     ) -> AgentMessageResponse:
         """Backward-compatible synchronous endpoint backed by the durable thread store."""
+        require_permission(principal, RuntimePermission.AGENT_MESSAGE_EXECUTE)
         store: SQLiteRunStore = request.app.state.run_store
         runtime = TravelAgentRuntime(retry_limit=2)
         if payload.state is not None and payload.state.thread_id != payload.thread_id:
@@ -231,6 +254,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
+        require_permission(principal, RuntimePermission.RUNS_CREATE)
         try:
             return get_manager(request).submit(
                 payload,
@@ -253,6 +277,7 @@ def create_app(
         )
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUNS_READ)
         return run
 
     @app.post("/runs/{run_id}/cancel", response_model=RunRecord)
@@ -261,6 +286,15 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
+        if (
+            get_manager(request).get_run(
+                run_id,
+                tenant_context=principal.tenant_context,
+            )
+            is None
+        ):
+            raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUNS_CANCEL)
         try:
             return get_manager(request).request_cancel(
                 run_id,
@@ -284,6 +318,7 @@ def create_app(
             is None
         ):
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
         return request.app.state.run_store.list_events_for_tenant(
             run_id,
             principal.tenant_id,
@@ -303,6 +338,7 @@ def create_app(
             is None
         ):
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
 
         async def event_stream():
             sequence = after_sequence
@@ -336,6 +372,7 @@ def create_app(
         domain_id: str = Query(default="travel"),
         schema_version: str = Query(default="1"),
     ) -> dict:
+        require_permission(principal, RuntimePermission.THREAD_STATE_READ)
         try:
             state_value = request.app.state.run_store.load_thread_state(
                 thread_id,

@@ -39,6 +39,7 @@ The later engineering work extends that same objective across additional boundar
 - idempotent submission prevents network retries from silently duplicating work;
 - API-key authentication derives a trusted tenant context before control-plane work begins;
 - tenant-qualified persistence prevents runs, events, checkpoints, and replay evidence from crossing tenant boundaries;
+- a typed default-deny role policy separates read-only observation from runtime mutation;
 - tool allowlists and schema validation prevent unapproved execution;
 - subprocess timeouts, resource limits, and `tini` prevent runaway work from leaking resources.
 
@@ -50,7 +51,10 @@ The engineering layer is therefore not a replacement for the evaluation work. It
 Client
   |
   v
-Bearer API key -> Principal / TenantContext
+Bearer API key -> Principal / TenantContext / RuntimeRole
+  |
+  v
+RoleAuthorizer -> typed permission
   |
   v
 FastAPI control API
@@ -116,6 +120,7 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 - typed, registry-discovered input and state schemas for multiple domains;
 - fail-closed Bearer API-key authentication with typed `Principal` and `TenantContext`;
 - tenant-scoped runs, idempotency keys, events, checkpoints, and replay references;
+- Viewer/Operator authorization through a centralized typed, default-deny policy;
 - strict domain-state validation that rejects unknown or cross-domain fields;
 - durable `run_id` lifecycle;
 - exact Agent-version pinning;
@@ -168,12 +173,14 @@ source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 pytest -q
 export RUNTIME_API_KEY="replace-with-a-random-local-key"
-export RUNTIME_API_KEYS_JSON='[{"credential_id":"local-demo","api_key":"replace-with-a-random-local-key","tenant_id":"tenant-demo","subject_id":"local-user"}]'
+export RUNTIME_API_KEYS_JSON='[{"credential_id":"local-demo","api_key":"replace-with-a-random-local-key","tenant_id":"tenant-demo","subject_id":"local-user","role":"operator"}]'
 uvicorn api.main:app --reload
 ```
 
-`RUNTIME_API_KEYS_JSON` configures the local Phase 4A credential provider. If it is absent or
-empty, every protected endpoint fails closed with `401`; only `/health` and `/ready` remain
+`RUNTIME_API_KEYS_JSON` configures the local credential provider. Every record must declare
+`role` as `viewer` or `operator`; a missing or unknown role makes configuration loading fail
+without retaining the plaintext key in the validation exception chain. If the variable is absent
+or empty, every protected endpoint fails closed with `401`; only `/health` and `/ready` remain
 public. Plaintext keys are hashed when loaded and are not retained by the authenticator. This
 local provider is deliberately separate from the later external secret-provider slice.
 
@@ -303,15 +310,28 @@ rank_trip_options
 ## Security boundary
 
 Every control-plane endpoint except `/health` and `/ready` authenticates a Bearer API key before
-request execution. The local credential provider maps the key to an immutable `Principal` and
-`TenantContext`; `tenant_id` is not accepted from request bodies. Cross-tenant run, cancellation,
-event, stream, checkpoint, tool-linkage, and replay-source lookups return the same `404` shape as
-an unknown resource. SQLite uniqueness and checkpoint keys are tenant-qualified, so tenants may
-reuse the same `thread_id` and `client_request_id` without sharing state.
+request execution. The local credential provider maps the key to an immutable `Principal`,
+`TenantContext`, and configured `RuntimeRole`; neither `tenant_id` nor `role` is accepted from
+request bodies. `RoleAuthorizer` then checks one typed permission at the operation boundary and
+denies permissions that are not explicitly granted.
 
-This is authentication and tenant isolation, not full authorization. RBAC, per-Agent/per-tool
-grants, quotas, key rotation, and an external/AWS-backed secret provider remain later Phase 4
-slices.
+| Operation | Viewer | Operator |
+| --- | ---: | ---: |
+| List agents and tools | yes | yes |
+| Read run, events/SSE, and thread state | yes | yes |
+| Create or replay a run | no | yes |
+| Cancel a run | no | yes |
+| Execute a tool | no | yes |
+| Call the synchronous compatibility endpoint | no | yes |
+
+Same-tenant permission failures return `403`. Cross-tenant run, cancellation, event, stream,
+checkpoint, tool-linkage, and replay-source lookups retain the same `404` shape as an unknown
+resource. SQLite uniqueness and checkpoint keys are tenant-qualified, so tenants may reuse the
+same `thread_id` and `client_request_id` without sharing state.
+
+This is deliberately small static RBAC, not a general policy platform. Per-Agent/per-tool grants,
+custom roles, user/role persistence, quotas, key rotation, and an external/AWS-backed secret
+provider remain later slices.
 
 The execution backend is a **registered-tool process sandbox**, not a general untrusted-code service.
 
@@ -370,6 +390,7 @@ The suite covers:
 - restart recovery and two-worker execution;
 - idempotent run submission;
 - fail-closed API-key authentication and typed principal/tenant derivation;
+- Viewer/Operator permission checks, role-spoof rejection, and mutation-free `403` failures;
 - tenant isolation across runs, idempotency, events, SSE, checkpoints, tool linkage, and replay sources;
 - additive migration of pre-tenant SQLite records into the reserved `legacy` tenant;
 - domain-specific input rejection before queueing and multi-domain state round-trips;
@@ -408,7 +429,7 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - SQLite instead of PostgreSQL;
 - local queue instead of distributed workers;
 - no worker lease or heartbeat;
-- no RBAC, per-Agent/per-tool grants, or quotas;
+- only two static roles; no custom roles, per-Agent/per-tool grants, or quotas;
 - local static API-key configuration only; no rotation workflow or external secret manager integration;
 - no tool-call idempotency for the ad-hoc `/tools/{tool}/execute` API; the release-validation workflow has one, scoped to its own `SQLiteWorkflowStore` attempt-token claims;
 - process sandbox does not isolate host networking or the full host filesystem;

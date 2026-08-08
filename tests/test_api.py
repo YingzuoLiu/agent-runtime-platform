@@ -4,11 +4,19 @@ import pytest
 from fastapi.testclient import TestClient as FastAPITestClient
 
 from api.main import create_app as create_runtime_app
-from runtime_service import ApiKeyCredential, SQLiteRunStore, StaticApiKeyAuthenticator
+from runtime_service import (
+    ApiKeyCredential,
+    AuthorizationError,
+    RuntimePermission,
+    RuntimeRole,
+    SQLiteRunStore,
+    StaticApiKeyAuthenticator,
+)
 from runtime_service.workflow_store import SQLiteWorkflowStore
 
 
 TENANT_A_KEY = "test-key-tenant-a"
+TENANT_A_VIEWER_KEY = "test-key-tenant-a-viewer"
 TENANT_B_KEY = "test-key-tenant-b"
 TENANT_A_ID = "tenant-a"
 TENANT_B_ID = "tenant-b"
@@ -19,12 +27,21 @@ TEST_AUTHENTICATOR = StaticApiKeyAuthenticator(
             api_key=TENANT_A_KEY,
             tenant_id=TENANT_A_ID,
             subject_id="subject-a",
+            role=RuntimeRole.OPERATOR,
+        ),
+        ApiKeyCredential(
+            credential_id="credential-a-viewer",
+            api_key=TENANT_A_VIEWER_KEY,
+            tenant_id=TENANT_A_ID,
+            subject_id="subject-a-viewer",
+            role=RuntimeRole.VIEWER,
         ),
         ApiKeyCredential(
             credential_id="credential-b",
             api_key=TENANT_B_KEY,
             tenant_id=TENANT_B_ID,
             subject_id="subject-b",
+            role=RuntimeRole.OPERATOR,
         ),
     ]
 )
@@ -43,6 +60,15 @@ class TestClient(FastAPITestClient):
         headers = dict(kwargs.pop("headers", {}))
         headers.update(authorization_headers(api_key))
         super().__init__(app, headers=headers, **kwargs)
+
+
+class DenyPermissionAuthorizer:
+    def __init__(self, denied_permission: RuntimePermission) -> None:
+        self._denied_permission = denied_permission
+
+    def authorize(self, _principal, permission: RuntimePermission) -> None:
+        if permission == self._denied_permission:
+            raise AuthorizationError("Operation not permitted")
 
 
 def valid_release_manifest() -> dict:
@@ -792,3 +818,265 @@ def test_selective_replay_source_cannot_cross_tenant_boundary(tmp_path):
         )
         is None
     )
+
+
+def test_viewer_can_read_discovery_run_events_stream_and_thread_state(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    viewer_headers = authorization_headers(TENANT_A_VIEWER_KEY)
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            json={
+                "thread_id": "viewer-readable-thread",
+                "user_message": "I want a 5-day Tokyo trip under 7000 SGD.",
+            },
+        )
+        completed = wait_for_run(client, submitted.json()["run_id"])
+        run_id = completed["run_id"]
+
+        assert client.get("/agents", headers=viewer_headers).status_code == 200
+        assert client.get("/tools", headers=viewer_headers).status_code == 200
+        assert client.get(f"/runs/{run_id}", headers=viewer_headers).status_code == 200
+        assert (
+            client.get(f"/runs/{run_id}/events", headers=viewer_headers).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/runs/{run_id}/events/stream",
+                headers=viewer_headers,
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/threads/viewer-readable-thread/state",
+                headers=viewer_headers,
+            ).status_code
+            == 200
+        )
+
+
+def test_viewer_cannot_mutate_via_run_tool_or_legacy_endpoints(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    viewer_headers = {
+        **authorization_headers(TENANT_A_VIEWER_KEY),
+        "X-Runtime-Role": "operator",
+    }
+    with TestClient(app) as client:
+        create_run = client.post(
+            "/runs",
+            headers=viewer_headers,
+            json={
+                "thread_id": "viewer-create-denied",
+                "client_request_id": "viewer-create-denied-request",
+                "user_message": "Plan Tokyo",
+            },
+        )
+        execute_tool = client.post(
+            "/tools/route_cost_summary/execute",
+            headers=viewer_headers,
+            json={"arguments": {}},
+        )
+        legacy_message = client.post(
+            "/agent/message",
+            headers=viewer_headers,
+            json={
+                "thread_id": "viewer-message-denied",
+                "user_message": "Plan Tokyo",
+            },
+        )
+
+    for response in (create_run, execute_tool, legacy_message):
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Operation not permitted"}
+        assert "www-authenticate" not in response.headers
+
+    store = SQLiteRunStore(database_path)
+    assert (
+        store.get_run_by_client_request_id(
+            TENANT_A_ID,
+            "viewer-create-denied-request",
+        )
+        is None
+    )
+    assert (
+        store.load_thread_state(
+            "viewer-message-denied",
+            tenant_id=TENANT_A_ID,
+        )
+        is None
+    )
+
+
+def test_viewer_cannot_cancel_or_link_tool_to_same_tenant_run(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    viewer_headers = authorization_headers(TENANT_A_VIEWER_KEY)
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            json={
+                "thread_id": "viewer-action-denied",
+                "user_message": "Plan Tokyo",
+            },
+        )
+        completed = wait_for_run(client, submitted.json()["run_id"])
+        run_id = completed["run_id"]
+        events_before = client.get(f"/runs/{run_id}/events").json()
+
+        cancel = client.post(
+            f"/runs/{run_id}/cancel",
+            headers=viewer_headers,
+        )
+        linked_tool = client.post(
+            "/tools/route_cost_summary/execute",
+            headers=viewer_headers,
+            json={"run_id": run_id, "arguments": {}},
+        )
+        events_after = client.get(f"/runs/{run_id}/events").json()
+
+    assert cancel.status_code == 403
+    assert linked_tool.status_code == 403
+    assert events_after == events_before
+
+
+def test_viewer_cannot_replay_a_same_tenant_run(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        source = client.post(
+            "/runs",
+            json={
+                "thread_id": "viewer-replay-source",
+                "agent_id": "release-validation",
+                "agent_version": "1.1.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        source_result = wait_for_run(client, source.json()["run_id"], timeout=10.0)
+        replay = client.post(
+            "/runs",
+            headers=authorization_headers(TENANT_A_VIEWER_KEY),
+            json={
+                "thread_id": "viewer-replay-target",
+                "client_request_id": "viewer-replay-denied",
+                "agent_id": "release-validation",
+                "agent_version": "1.1.0",
+                "input": {
+                    "manifest": valid_release_manifest(),
+                    "replay": {
+                        "source_run_id": source_result["run_id"],
+                        "step_ids": ["run_unit_tests"],
+                    },
+                },
+            },
+        )
+
+    assert replay.status_code == 403
+    assert replay.json() == {"detail": "Operation not permitted"}
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
+            "viewer-replay-denied",
+        )
+        is None
+    )
+
+
+def test_request_body_cannot_elevate_viewer_role(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            headers=authorization_headers(TENANT_A_VIEWER_KEY),
+            json={
+                "role": "operator",
+                "thread_id": "viewer-role-spoof",
+                "client_request_id": "viewer-role-spoof-request",
+                "user_message": "Plan Tokyo",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in str(response.json())
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
+            "viewer-role-spoof-request",
+        )
+        is None
+    )
+
+
+def test_cross_tenant_resource_is_hidden_before_viewer_action_denial(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    tenant_b_headers = authorization_headers(TENANT_B_KEY)
+    tenant_a_viewer_headers = authorization_headers(TENANT_A_VIEWER_KEY)
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            headers=tenant_b_headers,
+            json={
+                "thread_id": "tenant-b-hidden-from-viewer",
+                "user_message": "Plan Tokyo",
+            },
+        )
+        run_id = submitted.json()["run_id"]
+
+        cancel = client.post(
+            f"/runs/{run_id}/cancel",
+            headers=tenant_a_viewer_headers,
+        )
+        linked_tool = client.post(
+            "/tools/route_cost_summary/execute",
+            headers=tenant_a_viewer_headers,
+            json={"run_id": run_id, "arguments": {}},
+        )
+
+    assert cancel.status_code == 404
+    assert linked_tool.status_code == 404
+    assert cancel.json() == {"detail": "Run not found"}
+    assert linked_tool.json() == {"detail": "Run not found"}
+
+
+@pytest.mark.parametrize(
+    ("path_template", "denied_permission"),
+    [
+        ("/runs/{run_id}", RuntimePermission.RUNS_READ),
+        ("/runs/{run_id}/events", RuntimePermission.RUN_EVENTS_READ),
+        ("/runs/{run_id}/events/stream", RuntimePermission.RUN_EVENTS_READ),
+    ],
+)
+def test_run_is_hidden_before_read_permission_denial(
+    tmp_path,
+    path_template,
+    denied_permission,
+):
+    app = create_app(
+        database_path=tmp_path / "runtime.db",
+        authorizer=DenyPermissionAuthorizer(denied_permission),
+    )
+    with TestClient(app) as client:
+        tenant_a_run = client.post(
+            "/runs",
+            json={"thread_id": "tenant-a-read-denial", "user_message": "Plan Tokyo"},
+        )
+        tenant_b_run = client.post(
+            "/runs",
+            headers=authorization_headers(TENANT_B_KEY),
+            json={"thread_id": "tenant-b-hidden-read", "user_message": "Plan Tokyo"},
+        )
+
+        same_tenant = client.get(
+            path_template.format(run_id=tenant_a_run.json()["run_id"]),
+        )
+        cross_tenant = client.get(
+            path_template.format(run_id=tenant_b_run.json()["run_id"]),
+        )
+
+    assert same_tenant.status_code == 403
+    assert same_tenant.json() == {"detail": "Operation not permitted"}
+    assert cross_tenant.status_code == 404
+    assert cross_tenant.json() == {"detail": "Run not found"}

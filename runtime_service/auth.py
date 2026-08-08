@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 from collections.abc import Iterable
+from enum import Enum
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
@@ -13,8 +14,34 @@ class AuthenticationError(ValueError):
     """The supplied credential did not authenticate a principal."""
 
 
+class AuthorizationError(PermissionError):
+    """The authenticated principal is not allowed to perform an operation."""
+
+
+class RuntimeRole(str, Enum):
+    VIEWER = "viewer"
+    OPERATOR = "operator"
+
+
+class RuntimePermission(str, Enum):
+    AGENTS_READ = "agents:read"
+    TOOLS_READ = "tools:read"
+    TOOLS_EXECUTE = "tools:execute"
+    AGENT_MESSAGE_EXECUTE = "agent-message:execute"
+    RUNS_CREATE = "runs:create"
+    RUNS_READ = "runs:read"
+    RUNS_CANCEL = "runs:cancel"
+    RUN_EVENTS_READ = "run-events:read"
+    THREAD_STATE_READ = "thread-state:read"
+
+
 class Authenticator(Protocol):
     def authenticate(self, api_key: str | None) -> "Principal":
+        ...
+
+
+class Authorizer(Protocol):
+    def authorize(self, principal: "Principal", permission: RuntimePermission) -> None:
         ...
 
 
@@ -28,13 +55,14 @@ class TenantContext(BaseModel):
 
 
 class Principal(BaseModel):
-    """Authenticated caller identity with no authorization policy attached yet."""
+    """Authenticated caller identity and trusted configured runtime role."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     subject_id: str = Field(min_length=1, max_length=200)
     tenant_id: str = Field(min_length=1, max_length=200)
     credential_id: str = Field(min_length=1, max_length=200)
+    role: RuntimeRole
     authentication_method: Literal["api_key"] = "api_key"
 
     @property
@@ -51,6 +79,38 @@ class ApiKeyCredential(BaseModel):
     api_key: SecretStr = Field(min_length=1)
     tenant_id: str = Field(min_length=1, max_length=200)
     subject_id: str = Field(min_length=1, max_length=200)
+    role: RuntimeRole
+
+
+class RoleAuthorizer:
+    """Small default-deny policy for the local Viewer/Operator roles."""
+
+    _VIEWER_PERMISSIONS = frozenset(
+        {
+            RuntimePermission.AGENTS_READ,
+            RuntimePermission.TOOLS_READ,
+            RuntimePermission.RUNS_READ,
+            RuntimePermission.RUN_EVENTS_READ,
+            RuntimePermission.THREAD_STATE_READ,
+        }
+    )
+    _OPERATOR_PERMISSIONS = _VIEWER_PERMISSIONS | frozenset(
+        {
+            RuntimePermission.TOOLS_EXECUTE,
+            RuntimePermission.AGENT_MESSAGE_EXECUTE,
+            RuntimePermission.RUNS_CREATE,
+            RuntimePermission.RUNS_CANCEL,
+        }
+    )
+    _PERMISSIONS_BY_ROLE = {
+        RuntimeRole.VIEWER: _VIEWER_PERMISSIONS,
+        RuntimeRole.OPERATOR: _OPERATOR_PERMISSIONS,
+    }
+
+    def authorize(self, principal: Principal, permission: RuntimePermission) -> None:
+        allowed_permissions = self._PERMISSIONS_BY_ROLE.get(principal.role, frozenset())
+        if permission not in allowed_permissions:
+            raise AuthorizationError("Operation not permitted")
 
 
 class StaticApiKeyAuthenticator:
@@ -72,6 +132,7 @@ class StaticApiKeyAuthenticator:
                 subject_id=credential.subject_id,
                 tenant_id=credential.tenant_id,
                 credential_id=credential.credential_id,
+                role=credential.role,
             )
 
     @classmethod
