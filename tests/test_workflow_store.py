@@ -340,6 +340,70 @@ def test_completed_step_different_hash_returns_input_mismatch(tmp_path):
     assert store.get_step("run-1", "load_manifest").input_hash == HASH_A
 
 
+@pytest.mark.parametrize(
+    "persisted_status",
+    [ToolCallStatus.COMPLETED, ToolCallStatus.RUNNING, ToolCallStatus.FAILED],
+)
+def test_existing_step_different_tool_returns_definition_mismatch_without_mutation(
+    tmp_path,
+    persisted_status,
+):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    store.create_or_get_execution("run-1", "release_validation", HASH_A)
+    claimed = store.claim_step(
+        "run-1", "load_manifest", "old_registered_tool", HASH_A, max_attempts=3
+    )
+    if persisted_status == ToolCallStatus.COMPLETED:
+        store.complete_step("run-1", "load_manifest", claimed.attempt_token, result_json="{}")
+    elif persisted_status == ToolCallStatus.FAILED:
+        store.fail_step("run-1", "load_manifest", claimed.attempt_token, error_code="boom")
+    before_events = list(store.list_events("run-1"))
+
+    mismatched = store.claim_step(
+        "run-1", "load_manifest", "new_registered_tool", HASH_A, max_attempts=3
+    )
+
+    assert mismatched.outcome == ClaimOutcome.DEFINITION_MISMATCH
+    persisted = store.get_step("run-1", "load_manifest")
+    assert persisted is not None
+    assert persisted.tool_name == "old_registered_tool"
+    assert persisted.status == persisted_status
+    assert persisted.attempt_count == 1
+    assert store.list_events("run-1") == before_events
+
+
+@pytest.mark.parametrize(
+    "persisted_status",
+    [ToolCallStatus.COMPLETED, ToolCallStatus.RUNNING, ToolCallStatus.FAILED],
+)
+def test_existing_step_different_input_returns_mismatch_for_every_status(
+    tmp_path,
+    persisted_status,
+):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    store.create_or_get_execution("run-1", "release_validation", HASH_A)
+    claimed = store.claim_step(
+        "run-1", "load_manifest", "registered_tool", HASH_A, max_attempts=3
+    )
+    if persisted_status == ToolCallStatus.COMPLETED:
+        store.complete_step("run-1", "load_manifest", claimed.attempt_token, result_json="{}")
+    elif persisted_status == ToolCallStatus.FAILED:
+        store.fail_step("run-1", "load_manifest", claimed.attempt_token, error_code="boom")
+    before_events = list(store.list_events("run-1"))
+
+    mismatched = store.claim_step(
+        "run-1", "load_manifest", "registered_tool", HASH_B, max_attempts=3
+    )
+
+    assert mismatched.outcome == ClaimOutcome.INPUT_MISMATCH
+    persisted = store.get_step("run-1", "load_manifest")
+    assert persisted is not None
+    assert persisted.input_hash == HASH_A
+    assert persisted.status == persisted_status
+    assert persisted.attempt_count == 1
+    assert store.list_events("run-1") == before_events
+
+
 def test_state_transitions_always_pair_with_an_event(tmp_path):
     store = SQLiteWorkflowStore(tmp_path / "workflow.db")
     store.create_or_get_execution("run-1", "release_validation", HASH_A)
@@ -445,7 +509,13 @@ def test_finalized_event_captures_attempt_count_at_the_time_not_later(tmp_path):
 
 @pytest.mark.parametrize(
     "make_no_op_outcome",
-    ["already_running", "cached", "input_mismatch", "attempts_exhausted"],
+    [
+        "already_running",
+        "cached",
+        "input_mismatch",
+        "definition_mismatch",
+        "attempts_exhausted",
+    ],
 )
 def test_no_op_claim_outcomes_do_not_append_events(tmp_path, make_no_op_outcome):
     store = SQLiteWorkflowStore(tmp_path / "workflow.db")
@@ -465,6 +535,11 @@ def test_no_op_claim_outcomes_do_not_append_events(tmp_path, make_no_op_outcome)
         store.complete_step("run-1", "step_x", claimed.attempt_token, result_json="{}")
         before = len(store.list_events("run-1"))
         result = store.claim_step("run-1", "step_x", "some_tool", HASH_B, max_attempts=3)
+    elif make_no_op_outcome == "definition_mismatch":
+        claimed = store.claim_step("run-1", "step_x", "old_tool", HASH_A, max_attempts=3)
+        store.complete_step("run-1", "step_x", claimed.attempt_token, result_json="{}")
+        before = len(store.list_events("run-1"))
+        result = store.claim_step("run-1", "step_x", "new_tool", HASH_A, max_attempts=3)
     else:
         claimed = store.claim_step("run-1", "step_x", "some_tool", HASH_A, max_attempts=1)
         store.fail_step("run-1", "step_x", claimed.attempt_token, error_code="boom")

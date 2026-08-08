@@ -222,10 +222,14 @@ curl -X POST http://127.0.0.1:8000/runs \
   -d '{
     "thread_id": "release-2.4.0",
     "agent_id": "release-validation",
-    "agent_version": "1.0.0",
+    "agent_version": "1.1.0",
     "input": {"manifest": {"...": "typed synthetic manifest fields"}}
   }'
 ```
+
+`release-validation:1.0.0` remains registered with its Phase 3A fixed-order
+input contract so persisted runs keep their pinned recovery behavior.
+`release-validation:1.1.0` is the Phase 3B DAG/replay contract used below.
 
 Selective replay also uses `POST /runs`, creating a new immutable child run:
 
@@ -235,7 +239,7 @@ curl -X POST http://127.0.0.1:8000/runs \
   -d '{
     "thread_id": "release-replay-2.4.0",
     "agent_id": "release-validation",
-    "agent_version": "1.0.0",
+    "agent_version": "1.1.0",
     "input": {
       "manifest": {"...": "typed synthetic manifest fields"},
       "replay": {

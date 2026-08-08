@@ -8,6 +8,10 @@ All manifests, artifacts, test results, and compatibility data are synthetic
 fixtures. This is not a real release pipeline and does not represent any
 organization's systems or process.
 
+The registry retains `release-validation:1.0.0` with its Phase 3A input model
+and fixed-order execution path for durable-run recovery. Phase 3B is exposed as
+`release-validation:1.1.0`; its input schema adds the replay directive below.
+
 ## Execution model
 
 `ReleaseValidationWorkflow` executes a validated DAG in deterministic
@@ -46,7 +50,9 @@ replay never mutates an existing run in place.
 Each node persists one `tool_calls` row keyed by `(run_id, step_id)`. Its
 signature includes the registered `tool_name` and a stable SHA-256 hash of the
 canonical JSON arguments. Attempt tokens protect completion/failure writes
-from stale workers.
+from stale workers. Every existing-row status (`COMPLETED`, `RUNNING`, or
+`FAILED`) checks both signature components before cache reuse, recovery, or
+retry; a changed tool definition is an explicit failure, never a cache hit.
 
 ## Selective replay
 
@@ -58,7 +64,7 @@ source run:
 {
   "thread_id": "release-replay-2.4.0",
   "agent_id": "release-validation",
-  "agent_version": "1.0.0",
+  "agent_version": "1.1.0",
   "input": {
     "manifest": {"...": "typed synthetic manifest fields"},
     "replay": {

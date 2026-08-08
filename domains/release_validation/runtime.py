@@ -23,6 +23,7 @@ from .models import (
     ReleaseValidationResult,
     ReleaseValidationState,
     ReleaseValidationStatus,
+    ReleaseValidationInputV1,
     SelectiveReplayRequest,
     SelectiveReplaySummary,
     ValidationFinding,
@@ -122,6 +123,10 @@ class StepInputMismatchError(Exception):
     hash catching it, which is treated as an unexpected internal
     inconsistency (workflow FAILED), not a normal blocked/in-progress case.
     """
+
+
+class StepDefinitionMismatchError(Exception):
+    """A persisted step id belongs to a different registered tool."""
 
 
 class StepAttemptsExhaustedError(Exception):
@@ -344,6 +349,7 @@ class ReleaseValidationWorkflow:
         *,
         resume_interrupted: bool = False,
         replay: SelectiveReplayRequest | None = None,
+        legacy_fixed_order: bool = False,
     ) -> ReleaseValidationResult:
         manifest = _canonicalize_manifest(manifest)
         identity_payload = manifest.model_dump(mode="json")
@@ -378,6 +384,10 @@ class ReleaseValidationWorkflow:
         # own ALREADY_RUNNING/interrupted-recovery handling covers it.
 
         try:
+            if legacy_fixed_order and replay is not None:
+                raise SelectiveReplayError(
+                    "release-validation:1.0.0 does not support selective replay"
+                )
             step_results: Dict[str, Dict[str, Any]] = {}
             invalidated_step_ids: set[str] = set()
             replayed_step_ids: set[str] = set()
@@ -392,15 +402,18 @@ class ReleaseValidationWorkflow:
                 except WorkflowGraphError as exc:
                     raise SelectiveReplayError(str(exc)) from exc
 
-            for step in STEP_SEQUENCE:
-                missing_dependencies = (
-                    RELEASE_VALIDATION_DAG.dependencies_for(step.step_id) - step_results.keys()
-                )
-                if missing_dependencies:
-                    raise RuntimeError(
-                        f"scheduler selected {step.step_id!r} before dependencies "
-                        f"{sorted(missing_dependencies)!r} completed"
+            scheduled_steps = STEP_DEFINITIONS if legacy_fixed_order else STEP_SEQUENCE
+            for step in scheduled_steps:
+                if not legacy_fixed_order:
+                    missing_dependencies = (
+                        RELEASE_VALIDATION_DAG.dependencies_for(step.step_id)
+                        - step_results.keys()
                     )
+                    if missing_dependencies:
+                        raise RuntimeError(
+                            f"scheduler selected {step.step_id!r} before dependencies "
+                            f"{sorted(missing_dependencies)!r} completed"
+                        )
                 arguments = step.build_arguments(manifest, step_results)
 
                 if replay is not None and step.step_id not in invalidated_step_ids:
@@ -600,6 +613,13 @@ class ReleaseValidationWorkflow:
                     "different arguments"
                 )
 
+            if claim.outcome == ClaimOutcome.DEFINITION_MISMATCH:
+                assert claim.step is not None
+                raise StepDefinitionMismatchError(
+                    f"step {run_id}/{step.step_id} was previously claimed by tool "
+                    f"{claim.step.tool_name!r}, not {step.tool_name!r}"
+                )
+
             if claim.outcome == ClaimOutcome.ATTEMPTS_EXHAUSTED:
                 raise StepAttemptsExhaustedError(
                     f"step {run_id}/{step.step_id} exhausted {MAX_ATTEMPTS} attempts"
@@ -655,8 +675,14 @@ class ManagedReleaseValidationRuntime:
     The DAG and replay targets are deterministic inputs, never planner-selected.
     """
 
-    def __init__(self, workflow: ReleaseValidationWorkflow):
+    def __init__(
+        self,
+        workflow: ReleaseValidationWorkflow,
+        *,
+        legacy_fixed_order: bool = False,
+    ):
         self.workflow = workflow
+        self.legacy_fixed_order = legacy_fixed_order
 
     def initial_state(self, thread_id: str) -> ReleaseValidationState:
         return ReleaseValidationState(thread_id=thread_id)
@@ -664,16 +690,22 @@ class ManagedReleaseValidationRuntime:
     def execute(
         self,
         state: ReleaseValidationState,
-        runtime_input: ReleaseValidationInput,
+        runtime_input: ReleaseValidationInputV1 | ReleaseValidationInput,
         context: RuntimeExecutionContext,
     ) -> RuntimeResponse[ReleaseValidationState]:
+        replay = (
+            runtime_input.replay
+            if isinstance(runtime_input, ReleaseValidationInput)
+            else None
+        )
         result = self.workflow.run(
             context.run_id,
             runtime_input.manifest,
             resume_interrupted=(
                 runtime_input.resume_interrupted or context.recovered_after_restart
             ),
-            replay=runtime_input.replay,
+            replay=replay,
+            legacy_fixed_order=self.legacy_fixed_order,
         )
         updated_state = state.model_copy(
             update={

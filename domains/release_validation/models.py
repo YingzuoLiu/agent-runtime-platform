@@ -101,13 +101,18 @@ class ReleaseValidationResult(BaseModel):
     replay: SelectiveReplaySummary | None = None
 
 
-class ReleaseValidationInput(BaseModel):
-    """Typed input for one managed release-validation run."""
+class ReleaseValidationInputV1(BaseModel):
+    """Pinned Phase 3A input contract retained for version 1.0.0."""
 
     model_config = ConfigDict(extra="forbid")
 
     manifest: ReleaseManifest
     resume_interrupted: bool = False
+
+
+class ReleaseValidationInput(ReleaseValidationInputV1):
+    """Phase 3B input contract for DAG execution and selective replay."""
+
     replay: SelectiveReplayRequest | None = None
 
 

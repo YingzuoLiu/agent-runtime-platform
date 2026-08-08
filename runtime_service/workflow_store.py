@@ -37,6 +37,7 @@ class ClaimOutcome(str, Enum):
     CACHED = "cached"
     ALREADY_RUNNING = "already_running"
     INPUT_MISMATCH = "input_mismatch"
+    DEFINITION_MISMATCH = "definition_mismatch"
     ATTEMPTS_EXHAUSTED = "attempts_exhausted"
 
 
@@ -547,10 +548,15 @@ class SQLiteWorkflowStore:
 
             record = self._row_to_step(row)
 
+            if record.tool_name != tool_name:
+                connection.rollback()
+                return ClaimResult(outcome=ClaimOutcome.DEFINITION_MISMATCH, step=record)
+            if record.input_hash != input_hash:
+                connection.rollback()
+                return ClaimResult(outcome=ClaimOutcome.INPUT_MISMATCH, step=record)
+
             if record.status == ToolCallStatus.COMPLETED:
                 connection.rollback()
-                if record.input_hash != input_hash:
-                    return ClaimResult(outcome=ClaimOutcome.INPUT_MISMATCH, step=record)
                 return ClaimResult(outcome=ClaimOutcome.CACHED, step=record)
 
             if record.status == ToolCallStatus.RUNNING:
@@ -558,10 +564,8 @@ class SQLiteWorkflowStore:
                 return ClaimResult(outcome=ClaimOutcome.ALREADY_RUNNING, step=record)
 
             # Only FAILED remains: eligible for a fresh attempt unless the
-            # input changed underneath it or attempts are exhausted.
-            if record.input_hash != input_hash:
-                connection.rollback()
-                return ClaimResult(outcome=ClaimOutcome.INPUT_MISMATCH, step=record)
+            # attempt budget is exhausted. Tool and input identity were
+            # already checked above for every persisted status.
             if record.attempt_count >= max_attempts:
                 connection.rollback()
                 return ClaimResult(outcome=ClaimOutcome.ATTEMPTS_EXHAUSTED, step=record)
@@ -626,9 +630,20 @@ class SQLiteWorkflowStore:
                     f"Unexpected IntegrityError claiming {run_id}/{step_id} with no "
                     "competing row found; expected a concurrent UNIQUE(run_id, step_id) claim"
                 ) from None
+            competing = SQLiteWorkflowStore._row_to_step(row)
+            if competing.tool_name != tool_name:
+                return ClaimResult(
+                    outcome=ClaimOutcome.DEFINITION_MISMATCH,
+                    step=competing,
+                )
+            if competing.input_hash != input_hash:
+                return ClaimResult(
+                    outcome=ClaimOutcome.INPUT_MISMATCH,
+                    step=competing,
+                )
             return ClaimResult(
                 outcome=ClaimOutcome.ALREADY_RUNNING,
-                step=SQLiteWorkflowStore._row_to_step(row),
+                step=competing,
             )
 
         SQLiteWorkflowStore._append_event_with_connection(

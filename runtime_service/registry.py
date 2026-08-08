@@ -138,6 +138,7 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
     if release_validation_workflow is not None:
         from domains.release_validation.models import (
             ReleaseValidationInput,
+            ReleaseValidationInputV1,
             ReleaseValidationState,
         )
         from domains.release_validation.runtime import ManagedReleaseValidationRuntime
@@ -145,6 +146,20 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
         registry.register(
             "release-validation",
             "1.0.0",
+            lambda: ManagedReleaseValidationRuntime(
+                release_validation_workflow,
+                legacy_fixed_order=True,
+            ),
+            description=(
+                "Legacy fixed-order durable release validation with registered tools and "
+                "deterministic readiness findings."
+            ),
+            input_model=ReleaseValidationInputV1,
+            state_model=ReleaseValidationState,
+        )
+        registry.register(
+            "release-validation",
+            "1.1.0",
             lambda: ManagedReleaseValidationRuntime(release_validation_workflow),
             description=(
                 "DAG-based durable release validation with selective replay, registered "

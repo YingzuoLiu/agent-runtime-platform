@@ -1,5 +1,6 @@
 import inspect
 import json
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -19,6 +20,7 @@ from domains.release_validation.runtime import (
     SelectiveReplayError,
     StepAlreadyRunningError,
     StepAttemptsExhaustedError,
+    StepDefinitionMismatchError,
     StepPermanentFailureError,
     WorkflowExecutionFailedError,
     _canonicalize_manifest,
@@ -185,6 +187,33 @@ def test_selective_replay_reruns_requested_node_and_descendants_only(workflow):
     assert {
         step.step_id: step.model_dump() for step in workflow.store.list_steps("source")
     } == source_steps_before
+
+
+def test_selective_replay_accepts_pre3b_source_result_without_replay_field(workflow):
+    manifest = make_valid_manifest()
+    workflow.run("source", manifest)
+    with sqlite3.connect(workflow.store.database_path) as connection:
+        connection.execute(
+            "UPDATE workflow_executions SET result_json = ? WHERE run_id = ?",
+            (
+                json.dumps({"run_id": "source", "status": "ready", "findings": []}),
+                "source",
+            ),
+        )
+
+    result = workflow.run(
+        "target",
+        manifest,
+        replay=SelectiveReplayRequest(
+            source_run_id="source",
+            step_ids=["generate_evidence"],
+        ),
+    )
+
+    assert result.status == ReleaseValidationStatus.READY
+    assert result.replay is not None
+    assert result.replay.replayed_step_ids == ["generate_evidence"]
+    assert len(result.replay.reused_step_ids) == 5
 
 
 def test_selective_replay_expands_when_unselected_step_input_changed(workflow):
@@ -355,6 +384,36 @@ def test_execution_input_mismatch_on_different_manifest_same_run_id(workflow):
 
     with pytest.raises(ExecutionInputMismatchError):
         workflow.run("run-1", make_valid_manifest(release_version="9.9.9"))
+
+
+def test_workflow_rejects_cached_row_from_different_registered_tool(workflow):
+    manifest = _canonicalize_manifest(make_valid_manifest())
+    workflow.store.create_or_get_execution(
+        "run-1",
+        "release_validation",
+        _manifest_hash_for_test(manifest),
+    )
+    workflow.store.mark_running("run-1")
+    first_step = STEP_SEQUENCE[0]
+    arguments = first_step.build_arguments(manifest, {})
+    wrong_tool_claim = workflow.store.claim_step(
+        "run-1",
+        first_step.step_id,
+        "wrong_tool_same_arguments",
+        _stable_hash(arguments),
+        max_attempts=MAX_ATTEMPTS,
+    )
+    workflow.store.complete_step(
+        "run-1",
+        first_step.step_id,
+        wrong_tool_claim.attempt_token,
+        result_json="{}",
+    )
+
+    with pytest.raises(StepDefinitionMismatchError, match="wrong_tool_same_arguments"):
+        workflow.run("run-1", manifest)
+
+    assert workflow.store.get_execution("run-1").status == WorkflowStatus.FAILED
 
 
 def test_timed_out_is_transient_and_retries_within_one_run_call(workflow):

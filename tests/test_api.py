@@ -216,7 +216,10 @@ def test_agents_expose_typed_multi_domain_contracts(tmp_path):
     assert response.status_code == 200
     agents = {(item["agent_id"], item["version"]): item for item in response.json()}
     assert agents[("travel-agent", "0.3.0")]["domain_id"] == "travel"
-    release = agents[("release-validation", "1.0.0")]
+    legacy_release = agents[("release-validation", "1.0.0")]
+    assert legacy_release["domain_id"] == "release-validation"
+    assert "replay" not in legacy_release["input_schema"]["properties"]
+    release = agents[("release-validation", "1.1.0")]
     assert release["domain_id"] == "release-validation"
     assert release["schema_version"] == "1"
     assert "manifest" in release["input_schema"]["properties"]
@@ -231,7 +234,7 @@ def test_release_validation_runs_through_unified_lifecycle_api(tmp_path):
             json={
                 "thread_id": "release-api-thread",
                 "agent_id": "release-validation",
-                "agent_version": "1.0.0",
+                "agent_version": "1.1.0",
                 "input": {"manifest": valid_release_manifest()},
             },
         )
@@ -262,7 +265,7 @@ def test_release_validation_selective_replay_uses_unified_runs_api(tmp_path):
             json={
                 "thread_id": "release-replay-source",
                 "agent_id": "release-validation",
-                "agent_version": "1.0.0",
+                "agent_version": "1.1.0",
                 "input": {"manifest": valid_release_manifest()},
             },
         )
@@ -272,7 +275,7 @@ def test_release_validation_selective_replay_uses_unified_runs_api(tmp_path):
             json={
                 "thread_id": "release-replay-target",
                 "agent_id": "release-validation",
-                "agent_version": "1.0.0",
+                "agent_version": "1.1.0",
                 "input": {
                     "manifest": valid_release_manifest(),
                     "replay": {
@@ -308,7 +311,7 @@ def test_release_validation_replay_contract_rejects_duplicate_steps_before_queue
                 "thread_id": "duplicate-replay-steps",
                 "client_request_id": "duplicate-replay-steps-request",
                 "agent_id": "release-validation",
-                "agent_version": "1.0.0",
+                "agent_version": "1.1.0",
                 "input": {
                     "manifest": valid_release_manifest(),
                     "replay": {
@@ -323,6 +326,37 @@ def test_release_validation_replay_contract_rejects_duplicate_steps_before_queue
     assert (
         SQLiteRunStore(database_path).get_run_by_client_request_id(
             "duplicate-replay-steps-request"
+        )
+        is None
+    )
+
+
+def test_release_validation_v1_contract_rejects_phase3b_replay_before_queueing(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "thread_id": "legacy-replay-contract",
+                "client_request_id": "legacy-replay-contract-request",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {
+                    "manifest": valid_release_manifest(),
+                    "replay": {
+                        "source_run_id": "run_source",
+                        "step_ids": ["run_unit_tests"],
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in response.json()["detail"]
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            "legacy-replay-contract-request"
         )
         is None
     )
