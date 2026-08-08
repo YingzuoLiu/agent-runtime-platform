@@ -238,6 +238,7 @@ def test_tool_sandbox_api_and_run_event_linkage(tmp_path):
         assert {item["name"] for item in tools.json()} == {
             "rank_trip_options",
             "route_cost_summary",
+            "search_trip_options",
         }
 
         submitted = client.post(

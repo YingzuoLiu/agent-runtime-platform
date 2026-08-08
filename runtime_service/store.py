@@ -56,6 +56,7 @@ class SQLiteRunStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
+                    execution_authority_json TEXT,
                     thread_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agent_version TEXT NOT NULL,
@@ -67,6 +68,7 @@ class SQLiteRunStore:
                     state_json TEXT,
                     output_message TEXT,
                     validation_errors_json TEXT NOT NULL,
+                    error_code TEXT,
                     error TEXT,
                     attempt INTEGER NOT NULL,
                     cancel_requested INTEGER NOT NULL,
@@ -117,6 +119,10 @@ class SQLiteRunStore:
                 "domain_id": "ALTER TABLE runs ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'travel'",
                 "schema_version": "ALTER TABLE runs ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'",
                 "input_json": "ALTER TABLE runs ADD COLUMN input_json TEXT",
+                "execution_authority_json": (
+                    "ALTER TABLE runs ADD COLUMN execution_authority_json TEXT"
+                ),
+                "error_code": "ALTER TABLE runs ADD COLUMN error_code TEXT",
             }
             for column, statement in run_migrations.items():
                 if column not in columns:
@@ -195,6 +201,7 @@ class SQLiteRunStore:
             CREATE TABLE runs_tenant_migration (
                 run_id TEXT PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
+                execution_authority_json TEXT,
                 thread_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
                 agent_version TEXT NOT NULL,
@@ -206,6 +213,7 @@ class SQLiteRunStore:
                 state_json TEXT,
                 output_message TEXT,
                 validation_errors_json TEXT NOT NULL,
+                error_code TEXT,
                 error TEXT,
                 attempt INTEGER NOT NULL,
                 cancel_requested INTEGER NOT NULL,
@@ -217,16 +225,16 @@ class SQLiteRunStore:
             );
 
             INSERT INTO runs_tenant_migration (
-                run_id, tenant_id, thread_id, agent_id, agent_version,
+                run_id, tenant_id, execution_authority_json, thread_id, agent_id, agent_version,
                 domain_id, schema_version, status, input_message, input_json,
-                state_json, output_message, validation_errors_json, error,
+                state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
                 updated_at, started_at, completed_at
             )
             SELECT
-                run_id, tenant_id, thread_id, agent_id, agent_version,
+                run_id, tenant_id, execution_authority_json, thread_id, agent_id, agent_version,
                 domain_id, schema_version, status, input_message, input_json,
-                state_json, output_message, validation_errors_json, error,
+                state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
                 updated_at, started_at, completed_at
             FROM runs;
@@ -273,12 +281,13 @@ class SQLiteRunStore:
             connection.execute(
                 """
                 INSERT INTO runs (
-                    run_id, tenant_id, thread_id, agent_id, agent_version, domain_id,
+                    run_id, tenant_id, execution_authority_json, thread_id, agent_id,
+                    agent_version, domain_id,
                     schema_version, status, input_message, input_json,
                     state_json, output_message,
-                    validation_errors_json, error, attempt, cancel_requested,
+                    validation_errors_json, error_code, error, attempt, cancel_requested,
                     client_request_id, created_at, updated_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -317,10 +326,11 @@ class SQLiteRunStore:
             cursor = connection.execute(
                 """
                 UPDATE runs SET
-                    thread_id = ?, agent_id = ?, agent_version = ?, domain_id = ?,
+                    execution_authority_json = ?, thread_id = ?, agent_id = ?,
+                    agent_version = ?, domain_id = ?,
                     schema_version = ?, status = ?, input_message = ?, input_json = ?,
                     state_json = ?, output_message = ?,
-                    validation_errors_json = ?, error = ?, attempt = ?,
+                    validation_errors_json = ?, error_code = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
                 WHERE run_id = ? AND tenant_id = ?
@@ -540,16 +550,22 @@ class SQLiteRunStore:
             cursor = connection.execute(
                 """
                 UPDATE runs SET
-                    thread_id = ?, agent_id = ?, agent_version = ?, domain_id = ?,
+                    execution_authority_json = ?, thread_id = ?, agent_id = ?,
+                    agent_version = ?, domain_id = ?,
                     schema_version = ?, status = ?, input_message = ?, input_json = ?,
                     state_json = ?, output_message = ?,
-                    validation_errors_json = ?, error = ?, attempt = ?,
+                    validation_errors_json = ?, error_code = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
                 WHERE run_id = ? AND tenant_id = ?
                     AND status IN (?, ?) AND cancel_requested = 1
                 """,
                 (
+                    (
+                        run.execution_authority.model_dump_json()
+                        if run.execution_authority is not None
+                        else None
+                    ),
                     run.thread_id,
                     run.agent_id,
                     run.agent_version,
@@ -561,6 +577,7 @@ class SQLiteRunStore:
                     state_json,
                     run.output_message,
                     validation_errors_json,
+                    run.error_code,
                     run.error,
                     run.attempt,
                     1,
@@ -768,6 +785,11 @@ class SQLiteRunStore:
         return (
             run.run_id,
             run.tenant_id,
+            (
+                run.execution_authority.model_dump_json()
+                if run.execution_authority is not None
+                else None
+            ),
             run.thread_id,
             run.agent_id,
             run.agent_version,
@@ -779,6 +801,7 @@ class SQLiteRunStore:
             run.state.model_dump_json() if run.state else None,
             run.output_message,
             json.dumps(run.validation_errors),
+            run.error_code,
             run.error,
             run.attempt,
             int(run.cancel_requested),
@@ -815,7 +838,14 @@ class SQLiteRunStore:
             ),
             output_message=row["output_message"],
             validation_errors=json.loads(row["validation_errors_json"]),
+            error_code=(row["error_code"] if "error_code" in keys else None),
             error=row["error"],
+            execution_authority=(
+                json.loads(row["execution_authority_json"])
+                if "execution_authority_json" in keys
+                and row["execution_authority_json"]
+                else None
+            ),
             attempt=row["attempt"],
             cancel_requested=bool(row["cancel_requested"]),
             client_request_id=(

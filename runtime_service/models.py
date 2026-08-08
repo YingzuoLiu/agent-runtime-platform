@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
-from agent.contracts import BaseRuntimeState, utc_now
+from agent.contracts import BaseRuntimeState, RuntimeExecutionAuthority, utc_now
 
 
 LEGACY_TENANT_ID = "legacy"
@@ -59,7 +59,12 @@ class RunRecord(BaseModel):
     state: SerializeAsAny[BaseRuntimeState] | None = None
     output_message: str | None = None
     validation_errors: list[str] = Field(default_factory=list)
+    error_code: str | None = None
     error: str | None = None
+    execution_authority: RuntimeExecutionAuthority | None = Field(
+        default=None,
+        exclude=True,
+    )
     attempt: int = 0
     cancel_requested: bool = False
     client_request_id: str | None = None
