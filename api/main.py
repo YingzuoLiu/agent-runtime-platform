@@ -108,6 +108,9 @@ def create_app(
         ),
         version="0.8.0",
         lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     def get_manager(request: Request) -> RuntimeManager:

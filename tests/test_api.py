@@ -629,6 +629,18 @@ def test_health_and_readiness_remain_public(tmp_path):
     assert ready.json() == {"status": "ready"}
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"],
+)
+def test_generated_documentation_routes_are_disabled(tmp_path, path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with FastAPITestClient(app) as client:
+        response = client.get(path)
+
+    assert response.status_code == 404
+
+
 def test_invalid_api_key_has_same_401_shape_as_missing_key(tmp_path):
     app = create_app(database_path=tmp_path / "runtime.db")
     with TestClient(app, api_key="wrong-key") as client:
