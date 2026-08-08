@@ -90,7 +90,7 @@ def create_app(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
             "plus policy-enforced sandboxed tool execution."
         ),
-        version="0.6.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
 

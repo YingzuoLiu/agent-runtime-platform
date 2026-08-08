@@ -147,8 +147,8 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
             "1.0.0",
             lambda: ManagedReleaseValidationRuntime(release_validation_workflow),
             description=(
-                "Fixed-order durable release validation with registered tools and "
-                "deterministic readiness findings."
+                "DAG-based durable release validation with selective replay, registered "
+                "tools and deterministic readiness findings."
             ),
             input_model=ReleaseValidationInput,
             state_model=ReleaseValidationState,

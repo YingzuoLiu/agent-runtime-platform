@@ -1,3 +1,4 @@
+from .dag import WorkflowDag, WorkflowGraphError, WorkflowNode
 from .manager import RuntimeManager
 from .models import AgentDescriptor, RunCreateRequest, RunEvent, RunRecord, RunStatus
 from .registry import AgentRegistry, build_default_registry
@@ -31,6 +32,9 @@ __all__ = [
     "ToolRegistry",
     "ToolSandbox",
     "ToolSpec",
+    "WorkflowDag",
+    "WorkflowGraphError",
+    "WorkflowNode",
     "build_default_registry",
     "build_default_tool_registry",
 ]

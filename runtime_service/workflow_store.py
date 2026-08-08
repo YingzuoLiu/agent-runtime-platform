@@ -47,6 +47,12 @@ class ExecutionOutcome(str, Enum):
     WORKFLOW_TYPE_MISMATCH = "workflow_type_mismatch"
 
 
+class StepReuseOutcome(str, Enum):
+    COPIED = "copied"
+    EXISTING = "existing"
+    NOT_REUSABLE = "not_reusable"
+
+
 class StaleAttemptError(Exception):
     """Raised when complete_step/fail_step target an attempt_token that no
     longer holds the row -- a newer attempt (a retry or an interrupted-step
@@ -103,8 +109,13 @@ class ClaimResult(BaseModel):
     attempt_token: str | None = None
 
 
+class StepReuseResult(BaseModel):
+    outcome: StepReuseOutcome
+    step: ToolCallRecord | None = None
+
+
 class SQLiteWorkflowStore:
-    """Durable persistence for a fixed-order, multi-step registered-tool
+    """Durable persistence for a multi-step registered-tool
     workflow: one `workflow_executions` row per run, one `tool_calls` row
     per step, and an append-only `workflow_events` log.
 
@@ -113,11 +124,9 @@ class SQLiteWorkflowStore:
     `RunRecord`, or `RuntimeManager`. A domain workflow may use this store
     directly and expose an explicit adapter through the generic manager.
 
-    There is no dependency graph, no scheduler, and no selective replay:
-    a workflow is a hardcoded, caller-supplied sequence of `step_id`s, and
-    `input_hash` is only ever compared for equality (cached reuse or an
-    explicit mismatch error) -- never used to decide what else to
-    invalidate. That decision logic is deferred to a later phase.
+    Graph topology and replay policy remain caller-owned. The store provides
+    atomic step claims plus a narrow primitive for copying compatible,
+    completed evidence from a terminal source execution into a new run.
     """
 
     def __init__(self, database_path: str | Path) -> None:
@@ -343,6 +352,151 @@ class SQLiteWorkflowStore:
         return self._row_to_execution(row)
 
     # ---- step-level ----
+
+    def reuse_completed_step(
+        self,
+        source_run_id: str,
+        target_run_id: str,
+        step_id: str,
+        tool_name: str,
+        input_hash: str,
+    ) -> StepReuseResult:
+        """Copy compatible completed evidence into a different execution.
+
+        The source execution must be READY or BLOCKED and use the same
+        workflow type as the target. The copied target row records zero
+        attempts because no tool ran in the target execution. A mismatch is
+        reported to the caller, which owns DAG invalidation policy.
+        """
+        if source_run_id == target_run_id:
+            raise ValueError("selective replay requires a different target run_id")
+
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("BEGIN IMMEDIATE")
+
+            source_execution_row = connection.execute(
+                "SELECT * FROM workflow_executions WHERE run_id = ?", (source_run_id,)
+            ).fetchone()
+            target_execution_row = connection.execute(
+                "SELECT * FROM workflow_executions WHERE run_id = ?", (target_run_id,)
+            ).fetchone()
+            if source_execution_row is None:
+                raise KeyError(f"Source workflow execution not found: {source_run_id}")
+            if target_execution_row is None:
+                raise KeyError(f"Target workflow execution not found: {target_run_id}")
+
+            source_execution = self._row_to_execution(source_execution_row)
+            target_execution = self._row_to_execution(target_execution_row)
+            if source_execution.workflow_type != target_execution.workflow_type:
+                raise ValueError(
+                    "source and target workflow types do not match: "
+                    f"{source_execution.workflow_type!r} != {target_execution.workflow_type!r}"
+                )
+            if source_execution.status not in {WorkflowStatus.READY, WorkflowStatus.BLOCKED}:
+                raise ValueError(
+                    f"source execution {source_run_id!r} is not replayable from status "
+                    f"{source_execution.status.value!r}"
+                )
+            if target_execution.status != WorkflowStatus.RUNNING:
+                raise ValueError(
+                    f"target execution {target_run_id!r} must be RUNNING to accept replay "
+                    f"evidence, not {target_execution.status.value!r}"
+                )
+
+            source_row = connection.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                (source_run_id, step_id),
+            ).fetchone()
+            if source_row is None:
+                connection.rollback()
+                return StepReuseResult(outcome=StepReuseOutcome.NOT_REUSABLE)
+            source_step = self._row_to_step(source_row)
+            if (
+                source_step.status != ToolCallStatus.COMPLETED
+                or source_step.tool_name != tool_name
+                or source_step.input_hash != input_hash
+                or source_step.result_json is None
+            ):
+                connection.rollback()
+                return StepReuseResult(
+                    outcome=StepReuseOutcome.NOT_REUSABLE,
+                    step=source_step,
+                )
+
+            target_row = connection.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                (target_run_id, step_id),
+            ).fetchone()
+            if target_row is not None:
+                target_step = self._row_to_step(target_row)
+                connection.rollback()
+                if (
+                    target_step.status == ToolCallStatus.COMPLETED
+                    and target_step.tool_name == tool_name
+                    and target_step.input_hash == input_hash
+                    and target_step.result_json is not None
+                ):
+                    return StepReuseResult(
+                        outcome=StepReuseOutcome.EXISTING,
+                        step=target_step,
+                    )
+                return StepReuseResult(
+                    outcome=StepReuseOutcome.NOT_REUSABLE,
+                    step=target_step,
+                )
+
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO tool_calls (
+                    call_id, run_id, step_id, tool_name, input_hash,
+                    status, attempt_count, attempt_token, result_json,
+                    error_code, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    f"call_{uuid4().hex}",
+                    target_run_id,
+                    step_id,
+                    tool_name,
+                    input_hash,
+                    ToolCallStatus.COMPLETED.value,
+                    0,
+                    source_step.result_json,
+                    now,
+                    now,
+                ),
+            )
+            self._append_event_with_connection(
+                connection,
+                target_run_id,
+                "step.replay_reused",
+                {
+                    "step_id": step_id,
+                    "tool_name": tool_name,
+                    "source_run_id": source_run_id,
+                    "attempt_count": 0,
+                    "outcome": "reused",
+                },
+            )
+            copied_row = connection.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                (target_run_id, step_id),
+            ).fetchone()
+            connection.commit()
+            return StepReuseResult(
+                outcome=StepReuseOutcome.COPIED,
+                step=self._row_to_step(copied_row),
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def claim_step(
         self,

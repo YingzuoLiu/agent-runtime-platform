@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import ClassVar, List
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent.contracts import BaseRuntimeState
 
@@ -68,10 +68,37 @@ class ReleaseValidationStatus(str, Enum):
     FAILED = "failed"
 
 
+class SelectiveReplayRequest(BaseModel):
+    """Replay selected DAG nodes into a new run from terminal source evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_run_id: str = Field(min_length=1)
+    step_ids: List[str] = Field(min_length=1)
+
+    @field_validator("step_ids")
+    @classmethod
+    def reject_duplicate_step_ids(cls, value: List[str]) -> List[str]:
+        if any(not step_id for step_id in value):
+            raise ValueError("replay step_ids must not contain empty values")
+        if len(set(value)) != len(value):
+            raise ValueError("replay step_ids must be unique")
+        return sorted(value)
+
+
+class SelectiveReplaySummary(BaseModel):
+    source_run_id: str
+    requested_step_ids: List[str]
+    replayed_step_ids: List[str]
+    reused_step_ids: List[str]
+    automatically_invalidated_step_ids: List[str]
+
+
 class ReleaseValidationResult(BaseModel):
     run_id: str
     status: ReleaseValidationStatus
     findings: List[ValidationFinding] = Field(default_factory=list)
+    replay: SelectiveReplaySummary | None = None
 
 
 class ReleaseValidationInput(BaseModel):
@@ -81,6 +108,7 @@ class ReleaseValidationInput(BaseModel):
 
     manifest: ReleaseManifest
     resume_interrupted: bool = False
+    replay: SelectiveReplayRequest | None = None
 
 
 class ReleaseValidationState(BaseRuntimeState):

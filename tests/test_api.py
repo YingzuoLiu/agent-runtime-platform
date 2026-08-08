@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from api.main import create_app
 from runtime_service import SQLiteRunStore
+from runtime_service.workflow_store import SQLiteWorkflowStore
 
 
 def valid_release_manifest() -> dict:
@@ -219,6 +220,7 @@ def test_agents_expose_typed_multi_domain_contracts(tmp_path):
     assert release["domain_id"] == "release-validation"
     assert release["schema_version"] == "1"
     assert "manifest" in release["input_schema"]["properties"]
+    assert "replay" in release["input_schema"]["properties"]
 
 
 def test_release_validation_runs_through_unified_lifecycle_api(tmp_path):
@@ -249,6 +251,81 @@ def test_release_validation_runs_through_unified_lifecycle_api(tmp_path):
     assert checkpoint.status_code == 200
     assert checkpoint.json()["result"]["run_id"] == result["run_id"]
     assert [event["event_type"] for event in events][-1] == "run.completed"
+
+
+def test_release_validation_selective_replay_uses_unified_runs_api(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        source = client.post(
+            "/runs",
+            json={
+                "thread_id": "release-replay-source",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        source_result = wait_for_run(client, source.json()["run_id"], timeout=10.0)
+        replayed = client.post(
+            "/runs",
+            json={
+                "thread_id": "release-replay-target",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {
+                    "manifest": valid_release_manifest(),
+                    "replay": {
+                        "source_run_id": source_result["run_id"],
+                        "step_ids": ["run_unit_tests"],
+                    },
+                },
+            },
+        )
+        replay_result = wait_for_run(client, replayed.json()["run_id"], timeout=10.0)
+
+    assert replay_result["status"] == "completed"
+    summary = replay_result["state"]["result"]["replay"]
+    assert summary["source_run_id"] == source_result["run_id"]
+    assert summary["replayed_step_ids"] == ["run_unit_tests", "generate_evidence"]
+    assert len(summary["reused_step_ids"]) == 4
+    target_steps = {
+        step.step_id: step for step in SQLiteWorkflowStore(database_path).list_steps(
+            replay_result["run_id"]
+        )
+    }
+    assert target_steps["run_unit_tests"].attempt_count == 1
+    assert sum(step.attempt_count == 0 for step in target_steps.values()) == 4
+
+
+def test_release_validation_replay_contract_rejects_duplicate_steps_before_queueing(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "thread_id": "duplicate-replay-steps",
+                "client_request_id": "duplicate-replay-steps-request",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {
+                    "manifest": valid_release_manifest(),
+                    "replay": {
+                        "source_run_id": "run_source",
+                        "step_ids": ["run_unit_tests", "run_unit_tests"],
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            "duplicate-replay-steps-request"
+        )
+        is None
+    )
 
 
 def test_release_business_block_is_not_reported_as_runtime_failure(tmp_path):

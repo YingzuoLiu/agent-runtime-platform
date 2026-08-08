@@ -7,6 +7,7 @@ from runtime_service.workflow_store import (
     ExecutionOutcome,
     SQLiteWorkflowStore,
     StaleAttemptError,
+    StepReuseOutcome,
     ToolCallStatus,
     WorkflowStatus,
 )
@@ -107,6 +108,116 @@ def test_claim_fresh_step_returns_token_and_attempt_one(tmp_path):
 
     events = [event.event_type for event in store.list_events("run-1")]
     assert events == ["step.claimed"]
+
+
+def test_reuse_completed_step_copies_terminal_source_evidence_without_attempt(tmp_path):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    store.create_or_get_execution("source", "release_validation", HASH_A)
+    store.mark_running("source")
+    source_claim = store.claim_step(
+        "source", "unit_tests", "run_unit_test_check", HASH_A, max_attempts=2
+    )
+    store.complete_step(
+        "source",
+        "unit_tests",
+        source_claim.attempt_token,
+        result_json='{"passed": true}',
+    )
+    store.finalize_ready("source", result_json='{"status": "ready"}')
+    store.create_or_get_execution("target", "release_validation", HASH_B)
+    store.mark_running("target")
+
+    copied = store.reuse_completed_step(
+        "source", "target", "unit_tests", "run_unit_test_check", HASH_A
+    )
+    repeated = store.reuse_completed_step(
+        "source", "target", "unit_tests", "run_unit_test_check", HASH_A
+    )
+
+    assert copied.outcome == StepReuseOutcome.COPIED
+    assert copied.step.attempt_count == 0
+    assert copied.step.result_json == '{"passed": true}'
+    assert repeated.outcome == StepReuseOutcome.EXISTING
+    assert store.get_step("source", "unit_tests").attempt_count == 1
+    assert [event.event_type for event in store.list_events("target")].count(
+        "step.replay_reused"
+    ) == 1
+
+
+def test_reuse_completed_step_reports_signature_mismatch_without_copy(tmp_path):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    store.create_or_get_execution("source", "release_validation", HASH_A)
+    store.mark_running("source")
+    source_claim = store.claim_step(
+        "source", "unit_tests", "run_unit_test_check", HASH_A, max_attempts=2
+    )
+    store.complete_step("source", "unit_tests", source_claim.attempt_token, result_json="{}")
+    store.finalize_ready("source", result_json='{"status": "ready"}')
+    store.create_or_get_execution("target", "release_validation", HASH_B)
+    store.mark_running("target")
+
+    result = store.reuse_completed_step(
+        "source", "target", "unit_tests", "run_unit_test_check", HASH_B
+    )
+
+    assert result.outcome == StepReuseOutcome.NOT_REUSABLE
+    assert store.get_step("target", "unit_tests") is None
+
+
+def test_reuse_completed_step_rejects_terminal_target(tmp_path):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    for run_id in ("source", "target"):
+        store.create_or_get_execution(run_id, "release_validation", HASH_A)
+        store.mark_running(run_id)
+    source_claim = store.claim_step(
+        "source", "unit_tests", "run_unit_test_check", HASH_A, max_attempts=2
+    )
+    store.complete_step("source", "unit_tests", source_claim.attempt_token, result_json="{}")
+    store.finalize_ready("source", result_json='{"status": "ready"}')
+    store.finalize_ready("target", result_json='{"status": "ready"}')
+
+    with pytest.raises(ValueError, match="must be RUNNING"):
+        store.reuse_completed_step(
+            "source", "target", "unit_tests", "run_unit_test_check", HASH_A
+        )
+
+    assert store.get_step("target", "unit_tests") is None
+
+
+def test_concurrent_reuse_copies_one_row_and_one_event(tmp_path):
+    store = SQLiteWorkflowStore(tmp_path / "workflow.db")
+    store.create_or_get_execution("source", "release_validation", HASH_A)
+    store.mark_running("source")
+    source_claim = store.claim_step(
+        "source", "unit_tests", "run_unit_test_check", HASH_A, max_attempts=2
+    )
+    store.complete_step("source", "unit_tests", source_claim.attempt_token, result_json="{}")
+    store.finalize_ready("source", result_json='{"status": "ready"}')
+    store.create_or_get_execution("target", "release_validation", HASH_B)
+    store.mark_running("target")
+    barrier = threading.Barrier(2)
+    outcomes: list[StepReuseOutcome] = []
+    lock = threading.Lock()
+
+    def reuse() -> None:
+        barrier.wait()
+        result = store.reuse_completed_step(
+            "source", "target", "unit_tests", "run_unit_test_check", HASH_A
+        )
+        with lock:
+            outcomes.append(result.outcome)
+
+    threads = [threading.Thread(target=reuse) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcome.value for outcome in outcomes) == ["copied", "existing"]
+    assert len(store.list_steps("target")) == 1
+    assert [event.event_type for event in store.list_events("target")].count(
+        "step.replay_reused"
+    ) == 1
 
 
 def test_two_threads_racing_first_claim_only_one_wins(tmp_path):
