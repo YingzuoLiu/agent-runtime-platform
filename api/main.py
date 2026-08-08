@@ -14,14 +14,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from domains.release_validation.runtime import ReleaseValidationWorkflow
 from domains.release_validation.tools import build_release_validation_tool_registry
+from domains.travel.dynamic_runtime import DynamicTravelRuntime
+from domains.travel.planner import build_travel_planner_from_environment
 from domains.travel.state import AgentState
 from domains.travel.runtime import TravelAgentRuntime
+from domains.travel.tools import build_travel_tool_registry
 from runtime_service import (
     AgentDescriptor,
     AuthenticationError,
     Authenticator,
     AuthorizationError,
     Authorizer,
+    DynamicToolLoop,
+    Planner,
     Principal,
     ReferencedRunNotFoundError,
     RoleAuthorizer,
@@ -32,12 +37,13 @@ from runtime_service import (
     RuntimePermission,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
+    TenantContext,
     ToolDescriptor,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolSandbox,
     build_default_registry,
-    build_default_tool_registry,
+    effective_execution_authority,
 )
 from runtime_service.workflow_store import SQLiteWorkflowStore
 
@@ -65,6 +71,7 @@ def create_app(
     worker_count: int | None = None,
     authenticator: Authenticator | None = None,
     authorizer: Authorizer | None = None,
+    travel_planner: Planner | None = None,
 ) -> FastAPI:
     database_value = database_path
     if database_value is None:
@@ -77,20 +84,38 @@ def create_app(
         else StaticApiKeyAuthenticator.from_environment()
     )
     resolved_authorizer = authorizer if authorizer is not None else RoleAuthorizer()
-    tool_registry = build_default_tool_registry()
+    resolved_travel_planner = (
+        travel_planner
+        if travel_planner is not None
+        else build_travel_planner_from_environment()
+    )
+    tool_registry = build_travel_tool_registry()
     bearer_scheme = HTTPBearer(auto_error=False)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        store = SQLiteRunStore(resolved_database_path)
         workflow_store = SQLiteWorkflowStore(resolved_database_path)
         release_workflow = ReleaseValidationWorkflow(
             workflow_store,
             ToolSandbox(build_release_validation_tool_registry()),
         )
+        dynamic_travel_loop = DynamicToolLoop(
+            planner=resolved_travel_planner,
+            tool_registry=tool_registry,
+            tool_sandbox=ToolSandbox(tool_registry),
+            workflow_store=workflow_store,
+            run_event_sink=store,
+            workflow_type="dynamic-tool-loop:travel-agent:1.0.0",
+            max_tool_calls=3,
+        )
         registry = build_default_registry(
             release_validation_workflow=release_workflow,
+            dynamic_travel_runtime_factory=(
+                lambda: DynamicTravelRuntime(dynamic_travel_loop)
+            ),
         )
-        store = SQLiteRunStore(resolved_database_path, state_registry=registry)
+        store.bind_state_registry(registry)
         manager = RuntimeManager(
             store=store,
             registry=registry,
@@ -113,7 +138,7 @@ def create_app(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
             "plus policy-enforced sandboxed tool execution."
         ),
-        version="0.9.0",
+        version="1.0.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -255,10 +280,15 @@ def create_app(
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
         require_permission(principal, RuntimePermission.RUNS_CREATE)
+        authority = effective_execution_authority(principal, resolved_authorizer)
         try:
             return get_manager(request).submit(
                 payload,
-                tenant_context=principal.tenant_context,
+                tenant_context=TenantContext(
+                    tenant_id=authority.tenant_id,
+                    subject_id=authority.subject_id,
+                    permissions=authority.permissions,
+                ),
             )
         except ReferencedRunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Referenced run not found") from exc

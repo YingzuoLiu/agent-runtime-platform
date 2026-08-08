@@ -9,6 +9,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
 
+from agent.contracts import RuntimeExecutionAuthority
+
 
 class AuthenticationError(ValueError):
     """The supplied credential did not authenticate a principal."""
@@ -52,6 +54,15 @@ class TenantContext(BaseModel):
 
     tenant_id: str = Field(min_length=1, max_length=200)
     subject_id: str = Field(min_length=1, max_length=200)
+    permissions: tuple[str, ...] = ()
+
+    @property
+    def execution_authority(self) -> RuntimeExecutionAuthority:
+        return RuntimeExecutionAuthority(
+            tenant_id=self.tenant_id,
+            subject_id=self.subject_id,
+            permissions=self.permissions,
+        )
 
 
 class Principal(BaseModel):
@@ -111,6 +122,26 @@ class RoleAuthorizer:
         allowed_permissions = self._PERMISSIONS_BY_ROLE.get(principal.role, frozenset())
         if permission not in allowed_permissions:
             raise AuthorizationError("Operation not permitted")
+
+
+def effective_execution_authority(
+    principal: Principal,
+    authorizer: Authorizer,
+) -> RuntimeExecutionAuthority:
+    """Snapshot server-evaluated permissions for asynchronous execution."""
+
+    allowed: list[str] = []
+    for permission in RuntimePermission:
+        try:
+            authorizer.authorize(principal, permission)
+        except AuthorizationError:
+            continue
+        allowed.append(permission.value)
+    return RuntimeExecutionAuthority(
+        tenant_id=principal.tenant_id,
+        subject_id=principal.subject_id,
+        permissions=tuple(allowed),
+    )
 
 
 class StaticApiKeyAuthenticator:

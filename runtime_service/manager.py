@@ -6,7 +6,12 @@ import threading
 import traceback
 from uuid import uuid4
 
-from agent.contracts import RuntimeExecutionContext, utc_now
+from agent.contracts import (
+    RuntimeExecutionAuthority,
+    RuntimeExecutionContext,
+    RuntimeExecutionError,
+    utc_now,
+)
 from .auth import TenantContext
 from .models import RunCreateRequest, RunRecord, RunStatus
 from .registry import AgentRegistry
@@ -50,6 +55,7 @@ class RuntimeManager:
                     run.status = RunStatus.QUEUED
                     run.started_at = None
                     run.error = None
+                    run.error_code = None
                     self.store.update_run(run)
                     self.store.append_event(run.run_id, "run.recovered", {"reason": "runtime_restart"})
                 self._queue.put((run.run_id, True))
@@ -100,6 +106,7 @@ class RuntimeManager:
                 status=RunStatus.QUEUED,
                 input=runtime_input.model_dump(mode="json"),
                 state=state,
+                execution_authority=tenant_context.execution_authority,
                 client_request_id=request.client_request_id,
             )
             try:
@@ -227,6 +234,7 @@ class RuntimeManager:
                     run_id=run.run_id,
                     thread_id=run.thread_id,
                     recovered_after_restart=recovered_after_restart,
+                    authority=self._execution_authority(run),
                 ),
             )
             run.state = result.state
@@ -243,10 +251,21 @@ class RuntimeManager:
                 self._mark_cancelled(run, reason="cancelled_during_failure_boundary")
                 return
             run.status = RunStatus.FAILED
+            run.error_code = (
+                exc.code
+                if isinstance(exc, RuntimeExecutionError)
+                else "runtime_execution_failed"
+            )
             run.error = f"{type(exc).__name__}: {exc}"
             run.completed_at = utc_now()
             self.store.update_run(run)
-            self.store.append_event(run.run_id, "run.failed", {"error": run.error, "traceback": traceback.format_exc(limit=5)})
+            event_payload = {
+                "error_code": run.error_code,
+                "error": run.error,
+            }
+            if not isinstance(exc, RuntimeExecutionError):
+                event_payload["traceback"] = traceback.format_exc(limit=5)
+            self.store.append_event(run.run_id, "run.failed", event_payload)
 
     def _mark_cancelled(self, run: RunRecord, *, reason: str) -> bool:
         return self.store.finalize_cancelled_run(run, reason=reason)
@@ -256,6 +275,19 @@ class RuntimeManager:
         if run is None:
             raise KeyError(f"Run not found: {run_id}")
         return run
+
+    @staticmethod
+    def _execution_authority(run: RunRecord) -> RuntimeExecutionAuthority:
+        authority = run.execution_authority
+        if authority is None:
+            return RuntimeExecutionAuthority(
+                tenant_id=run.tenant_id,
+                subject_id="legacy-unknown",
+                permissions=(),
+            )
+        if authority.tenant_id != run.tenant_id:
+            raise ValueError("Persisted execution authority tenant does not match run tenant")
+        return authority
 
     def _assert_referenced_runs_visible(
         self,

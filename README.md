@@ -1,6 +1,6 @@
 # Multi-Domain Agent Runtime Demo
 
-A runnable reference implementation of five related layers:
+A runnable reference implementation of six related layers:
 
 1. an **application-level Agent Runtime** for structured multi-turn travel planning;
 2. a small **self-hosted cloud runtime** for durable run lifecycle management;
@@ -9,8 +9,12 @@ A runnable reference implementation of five related layers:
    validator-gated local replanning.
 5. a second **release-validation domain** using the same durable run lifecycle and
    unified HTTP API with an explicit DAG and selective replay.
+6. a **policy-governed dynamic tool loop** with typed Planner decisions, durable
+   evidence, restart-safe tool calls, and Travel as its first reference adapter.
 
-The project is offline-first. It does not require an LLM key, Redis, PostgreSQL, or Kubernetes to demonstrate the runtime mechanics.
+The project is offline-first. Its default scripted Planner does not require an LLM key,
+Redis, PostgreSQL, or Kubernetes. An opt-in OpenAI Responses adapter demonstrates the
+same loop with live model decisions while retaining synthetic, non-booking Travel tools.
 
 ## Why this project exists
 
@@ -40,7 +44,9 @@ The later engineering work extends that same objective across additional boundar
 - API-key authentication derives a trusted tenant context before control-plane work begins;
 - tenant-qualified persistence prevents runs, events, checkpoints, and replay evidence from crossing tenant boundaries;
 - a typed default-deny role policy separates read-only observation from runtime mutation;
+- persisted execution-authority snapshots keep async and restarted workers on the original permissions;
 - tool allowlists and schema validation prevent unapproved execution;
+- typed Planner decisions and indexed evidence make dynamic tool selection inspectable;
 - subprocess timeouts, resource limits, and `tini` prevent runaway work from leaking resources.
 
 The engineering layer is therefore not a replacement for the evaluation work. It is the next layer of the same reliability problem.
@@ -54,7 +60,7 @@ Client
 Bearer API key -> Principal / TenantContext / RuntimeRole
   |
   v
-RoleAuthorizer -> typed permission
+RoleAuthorizer -> typed permission / persisted ExecutionAuthority
   |
   v
 FastAPI control API
@@ -74,14 +80,17 @@ RuntimeManager ---- AgentRegistry     ToolSandbox ---- ToolRegistry
   |       |- run_events
   |       `- tenant-scoped thread_states / checkpoints
   |
-  +--> TravelAgentRuntime
+  +--> TravelAgentRuntime 0.3 / 0.5
   |      `- typed patch/replan/review/validation
+  |
+  +--> DynamicTravelRuntime 1.0
+  |      `- DynamicToolLoop -> Planner -> policy -> durable tool call
   |
   `--> ManagedReleaseValidationRuntime
          `- durable DAG + selective replay
 ```
 
-Both Agent API paths read and write the same durable `thread_states` store. Authenticated tenant context scopes run lookup, idempotency, checkpoints, events, tool-to-run linkage, and selective-replay sources. Tool executions may optionally attach their start and finish events to a durable `run_id` visible to that tenant.
+Both Agent API paths read and write the same durable `thread_states` store. Authenticated tenant context scopes run lookup, idempotency, checkpoints, events, tool-to-run linkage, and selective-replay sources. Dynamic runs also persist the authenticated subject and server-evaluated effective permissions; workers never derive execution authority from request body fields. Tool executions may optionally attach their start and finish events to a durable `run_id` visible to that tenant.
 
 ## What the project demonstrates
 
@@ -148,6 +157,31 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 - optional linkage to append-only run events.
 
 The sandbox intentionally does **not** accept Python source, shell commands, executable paths, or arbitrary module names.
+
+### Policy-governed dynamic tool loop
+
+- strict `CALL_TOOL`, `REQUEST_CLARIFICATION`, and `FINISH` Planner decisions;
+- a domain-neutral `DynamicToolLoop` with no Travel or release-validation imports;
+- fixed pre-execution checks for step limit, allowlist membership, durable permission,
+  and argument schema;
+- stable failure codes for invalid tools/arguments, denied permission, timeout, handler
+  failure, step exhaustion, invalid decisions, and provider failure;
+- indexed Planner decisions and tool calls persisted before execution;
+- user-visible `planner.decision`, `policy.decision`, `tool.result`, and `loop.outcome`
+  events through both REST and SSE;
+- no system prompt, raw provider response, or provider-supplied terminal reason in
+  dynamic evidence; only typed decisions/results are stored, with adapter-generated
+  terminal reason labels;
+- explicit interrupted-step recovery and completed-result reuse after restart;
+- deterministic Travel tools whose next arguments and final branch depend on prior results;
+- domain-owned final mapping plus `TravelValidator`, so Planner `FINISH` cannot bypass
+  budget or preference constraints;
+- deterministic scripted planning for CI and an optional generic OpenAI Responses adapter.
+
+Travel's `search_trip_options` returns a synthetic reference catalog, not live inventory.
+Nothing in Phase 5A books or purchases travel. See
+[`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) for contracts, policy order,
+failure semantics, recovery boundaries, and the model-driven demo.
 
 ### Release-validation workflow
 
@@ -228,7 +262,41 @@ domain-neutral `input` object shown above. `GET /agents` publishes each register
 `client_request_id` returns the existing run for the authenticated tenant instead of creating a duplicate.
 
 `travel-agent:0.5.0` opts into the evidence-review path. The original
-`travel-agent:0.3.0` version remains registered and unchanged for controlled comparisons.
+`travel-agent:0.3.0` version remains registered and is still the request default.
+`travel-agent:1.0.0` explicitly opts into the Phase 5A dynamic loop:
+
+```bash
+curl -X POST http://127.0.0.1:8000/runs \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_id": "dynamic-tokyo-trip-001",
+    "agent_id": "travel-agent",
+    "agent_version": "1.0.0",
+    "input": {
+      "user_message": "I want a 5-day Tokyo trip under 9000 SGD and avoid red-eye flights."
+    }
+  }'
+```
+
+If required information is missing or the selected synthetic option exceeds budget, the run
+still completes and returns a clarification question with
+`state.current_stage="needs_clarification"`. Submit another `1.0.0` run on the same thread
+to continue from the durable checkpoint.
+
+The default Planner is deterministic and offline. To run the same API slice with a live model
+decision boundary:
+
+```bash
+pip install -r requirements-model-demo.txt
+export RUNTIME_PLANNER_PROVIDER=openai
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="..."
+python examples/model_driven_travel_demo.py
+```
+
+CI injects a fake Responses client; it does not claim to make a live model request. The demo
+still uses synthetic Travel tools and performs no booking.
 
 ```bash
 curl -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/runs/<run_id>
@@ -303,8 +371,9 @@ curl -X POST http://127.0.0.1:8000/tools/route_cost_summary/execute \
 An unknown tool is denied before any subprocess starts. Invalid arguments are rejected before execution. The default registry exposes:
 
 ```text
-route_cost_summary
+search_trip_options
 rank_trip_options
+route_cost_summary
 ```
 
 ## Security boundary
@@ -314,6 +383,12 @@ request execution. The local credential provider maps the key to an immutable `P
 `TenantContext`, and configured `RuntimeRole`; neither `tenant_id` nor `role` is accepted from
 request bodies. `RoleAuthorizer` then checks one typed permission at the operation boundary and
 denies permissions that are not explicitly granted.
+
+For `POST /runs`, the API also evaluates every declared permission and stores the resulting
+subject/tenant/permission snapshot as internal execution authority. Dynamic workers and restart
+recovery use that persisted snapshot rather than trusting the request or recomputing a later role.
+The authority is excluded from API responses; the stable failure code
+`tool_permission_denied` remains visible when a Planner requests a tool without permission.
 
 | Operation | Viewer | Operator |
 | --- | ---: | ---: |
@@ -360,9 +435,17 @@ See [`docs/cloud-runtime.md`](docs/cloud-runtime.md) for the detailed execution 
 
 ## Agent integration boundary
 
-The sandbox is exposed as an independent control-plane API, and it is also used by the static release-validation DAG through its managed runtime adapter. Neither path is a planner- or LLM-driven tool loop: every DAG node has a code-defined registered tool, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop.
+The sandbox is exposed as an independent control-plane API, used by the static
+release-validation DAG, and used by `travel-agent:1.0.0` through the dynamic loop. All three
+paths resolve server-owned `ToolSpec` records. Domain handlers are imported only from the
+entrypoint attached to that registered spec; planners and request payloads cannot provide an
+executable path or handler module.
 
-This keeps the current threat model narrow and testable: external clients may request only registered tools through the API, and release validation only executes tools declared by its static graph. A later Agent tool-calling integration -- dynamic, planner-selected tool calls driven by Travel or another domain -- must still add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
+Phase 5A tools are deterministic and read-only, so the existing attempt-token ledger and cached
+results provide restart-safe replay for this slice. Side-effecting tools would additionally need
+per-call idempotency contracts, approval policy, and compensation behavior. Prompt-injection
+detection, side-effect approval, parallel tool calls, multi-Agent delegation, and a general
+per-Agent/per-tool grant model remain deliberate later slices.
 
 ## Cancellation semantics
 
@@ -372,9 +455,16 @@ Cancellation is cooperative: code already executing inside an Agent step is not 
 
 At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again. The execution context marks startup-recovered work so the release-validation adapter explicitly recovers a persisted `running` DAG node instead of misclassifying it as a new concurrent execution. Replay children use the same rule; completed copied/executed nodes remain cached.
 
+Dynamic runs use the same boundary. They replay an indexed durable Planner decision, rebuild
+observations from completed `tool_calls`, and do not rerun completed subprocesses. A tool step
+left `running` is explicitly marked interrupted only when the manager says this is restart
+recovery, then claimed with a new attempt token. A real persisted tool failure is terminal rather
+than being silently retried. The original execution-authority snapshot is restored with the run.
+
 Terminal `failed` records are not recoverable and remain terminal under idempotent resubmission.
 
-This is safe for the deterministic demo. Booking and payment tools would additionally require per-tool-call idempotency records.
+This is safe for the deterministic read-only demo. Booking and payment tools would additionally
+require side-effect idempotency keys, approval and compensation semantics.
 
 ## Tests and CI
 
@@ -400,6 +490,15 @@ The suite covers:
 - subprocess timeout termination;
 - parent-secret environment scrubbing;
 - sandbox API execution and run-event linkage.
+- strict Planner decision parsing and all eight Phase 5A failure codes;
+- policy-order precedence with proof that denied calls neither claim a step nor start the sandbox;
+- observation-driven Travel search, ranking, cost, clarification, and blocked-FINISH branches;
+- durable Planner-decision replay, completed-tool cache reuse, and explicit interrupted recovery;
+- persisted execution authority across restart and idempotent resubmission;
+- REST/SSE equality for dynamic evidence;
+- a fake OpenAI Responses client covering strict tools, all three decisions, provider failure,
+  invalid JSON, and zero/multiple function-call rejection;
+- unchanged Travel `0.3.0`/`0.5.0` golden traces and release-validation DAG/replay behavior.
 
 GitHub Actions runs compile checks, Ruff, scoped mypy, and pytest on Python 3.11 and 3.12. A separate container smoke job builds the Docker image and verifies that `/usr/bin/tini` is the configured entrypoint.
 
@@ -431,15 +530,20 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - no worker lease or heartbeat;
 - only two static roles; no custom roles, per-Agent/per-tool grants, or quotas;
 - local static API-key configuration only; no rotation workflow or external secret manager integration;
-- no tool-call idempotency for the ad-hoc `/tools/{tool}/execute` API; the release-validation workflow has one, scoped to its own `SQLiteWorkflowStore` attempt-token claims;
+- no tool-call idempotency for the ad-hoc `/tools/{tool}/execute` API; release-validation and the dynamic loop use `SQLiteWorkflowStore` attempt-token claims for their read-only registered steps;
 - process sandbox does not isolate host networking or the full host filesystem;
 - POSIX resource limits are weaker on Windows;
 - no arbitrary user-code execution endpoint;
-- the sandbox is used by the static release-validation DAG, but not yet by the Travel runtime, and nowhere by a planner- or LLM-driven dynamic tool loop;
 - no OpenTelemetry backend or evaluation dashboard;
-- no real flight, hotel, payment, or booking API.
+- no real flight, hotel, payment, or booking API;
 - no real LLM preference analyzer by default; the semantic analyzer is an injectable boundary;
 - Schedule/Geography reviewers and workflow-task persistence are not part of the first slice;
 - the release-validation DAG is static and serial: there is no parallel scheduler, conditional branching, client-defined graph, or dynamic/LLM-driven tool selection -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
+- dynamic calls are serial and bounded: no parallel tool calls, multi-Agent delegation,
+  multi-model fallback, human approval state, quota/token accounting, or tool marketplace;
+- the optional model Planner has no prompt-injection detector beyond strict typed tool policy;
+- no exactly-once guarantee for future side-effecting tools.
 
-> An evidence-driven Agent Runtime prototype that connects behavioral evaluation with structured state, deterministic validation, durable execution lifecycle, checkpoint recovery, cancellation safety, idempotent submission, event observability, and policy-enforced registered-tool sandboxing.
+> An evidence-driven Agent Runtime prototype that connects behavioral evaluation with typed
+> Planner decisions, deterministic validation, durable execution and recovery, trusted runtime
+> authority, event observability, and policy-enforced registered-tool execution.

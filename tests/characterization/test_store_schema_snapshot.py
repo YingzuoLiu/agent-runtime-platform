@@ -1,9 +1,8 @@
 """Characterization of the current SQLite schema produced by SQLiteRunStore.
 
-Phase 4A adds tenant routing metadata and tenant-qualified idempotency/checkpoint
-keys on top of Phase 3A's domain/schema routing and canonical structured input.
-The snapshot proves that migration preserves all earlier run, event, and
-checkpoint data.
+Phase 5A adds a trusted execution-authority snapshot and stable runtime error
+code on top of Phase 4A's tenant-qualified routing. The snapshot proves that
+migration preserves all earlier run, event, and checkpoint data.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ EXPECTED_COLUMNS = {
     "runs": [
         ("run_id", "TEXT", 0, 1),
         ("tenant_id", "TEXT", 1, 0),
+        ("execution_authority_json", "TEXT", 0, 0),
         ("thread_id", "TEXT", 1, 0),
         ("agent_id", "TEXT", 1, 0),
         ("agent_version", "TEXT", 1, 0),
@@ -31,6 +31,7 @@ EXPECTED_COLUMNS = {
         ("state_json", "TEXT", 0, 0),
         ("output_message", "TEXT", 0, 0),
         ("validation_errors_json", "TEXT", 1, 0),
+        ("error_code", "TEXT", 0, 0),
         ("error", "TEXT", 0, 0),
         ("attempt", "INTEGER", 1, 0),
         ("cancel_requested", "INTEGER", 1, 0),
@@ -201,6 +202,8 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     assert migrated_run.tenant_id == LEGACY_TENANT_ID
     assert migrated_run.domain_id == "travel"
     assert migrated_run.schema_version == "1"
+    assert migrated_run.execution_authority is None
+    assert migrated_run.error_code is None
     assert migrated_run.input == {"user_message": "Plan Tokyo"}
     assert migrated_run.state is not None
     assert migrated_run.state.destination == "Tokyo"

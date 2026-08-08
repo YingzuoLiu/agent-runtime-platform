@@ -117,7 +117,11 @@ class AgentRegistry:
         ]
 
 
-def build_default_registry(*, release_validation_workflow: Any | None = None) -> AgentRegistry:
+def build_default_registry(
+    *,
+    release_validation_workflow: Any | None = None,
+    dynamic_travel_runtime_factory: RuntimeFactory | None = None,
+) -> AgentRegistry:
     from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
     from domains.travel.state import AgentState
 
@@ -130,6 +134,18 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
         input_model=TravelMessageInput,
         state_model=AgentState,
     )
+    if dynamic_travel_runtime_factory is not None:
+        registry.register(
+            "travel-agent",
+            "1.0.0",
+            dynamic_travel_runtime_factory,
+            description=(
+                "Policy-governed dynamic travel reference runtime with typed planner "
+                "decisions, durable tool evidence and deterministic final validation."
+            ),
+            input_model=TravelMessageInput,
+            state_model=AgentState,
+        )
     registry.register(
         "travel-agent",
         "0.5.0",

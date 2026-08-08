@@ -57,37 +57,13 @@ class ToolDescriptor(BaseModel):
     policy: ToolPolicy
 
 
-class RouteCostInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    transport_cost: int = Field(ge=0, le=1_000_000)
-    hotel_cost: int = Field(ge=0, le=1_000_000)
-    activity_cost: int = Field(ge=0, le=1_000_000)
-    budget: int = Field(gt=0, le=10_000_000)
-
-
-class TripOptionInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=200)
-    cost: float = Field(ge=0, le=10_000_000)
-    duration_hours: float = Field(gt=0, le=10_000)
-
-
-class RankOptionsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    options: list[TripOptionInput] = Field(min_length=1, max_length=50)
-    cost_weight: float = Field(default=0.6, ge=0, le=1)
-    duration_weight: float = Field(default=0.4, ge=0, le=1)
-
-
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
     description: str
     input_model: type[BaseModel]
     policy: ToolPolicy
+    handler_entrypoint: str
 
 
 class ToolRegistry:
@@ -97,6 +73,11 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         if spec.name in self._tools:
             raise ValueError(f"Tool already registered: {spec.name}")
+        module_name, separator, function_name = spec.handler_entrypoint.partition(":")
+        if not separator or not module_name or not function_name or ":" in function_name:
+            raise ValueError(
+                "handler_entrypoint must use the server-controlled 'module:function' format"
+            )
         self._tools[spec.name] = spec
 
     def resolve(self, tool_name: str) -> ToolSpec | None:
@@ -112,27 +93,6 @@ class ToolRegistry:
             )
             for spec in sorted(self._tools.values(), key=lambda item: item.name)
         ]
-
-
-def build_default_tool_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(
-        ToolSpec(
-            name="route_cost_summary",
-            description="Calculate a deterministic trip-cost summary and budget delta.",
-            input_model=RouteCostInput,
-            policy=ToolPolicy(timeout_seconds=2.0),
-        )
-    )
-    registry.register(
-        ToolSpec(
-            name="rank_trip_options",
-            description="Rank up to 50 trip options by normalized cost and duration.",
-            input_model=RankOptionsInput,
-            policy=ToolPolicy(timeout_seconds=2.0),
-        )
-    )
-    return registry
 
 
 class ToolSandbox:
@@ -173,10 +133,10 @@ class ToolSandbox:
                 duration_ms=self._duration_ms(started),
             )
 
-        command = [sys.executable, str(self._worker_path), tool_name]
+        command = [sys.executable, str(self._worker_path), spec.handler_entrypoint]
         environment = self._sanitized_environment(spec.policy)
 
-        with tempfile.TemporaryDirectory(prefix="travel-agent-sandbox-") as workspace:
+        with tempfile.TemporaryDirectory(prefix="agent-runtime-sandbox-") as workspace:
             process = subprocess.Popen(
                 command,
                 cwd=workspace,

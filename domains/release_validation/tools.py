@@ -77,6 +77,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Validate and echo a synthetic release manifest.",
             input_model=LoadReleaseManifestInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:load_release_manifest"
+            ),
         )
     )
     registry.register(
@@ -85,6 +88,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Check required build artifacts are present with plausible checksums.",
             input_model=InspectBuildArtifactsInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:inspect_build_artifacts"
+            ),
         )
     )
     registry.register(
@@ -93,6 +99,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Confirm the required unit test suite executed and passed.",
             input_model=RunUnitTestCheckInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:run_unit_test_check"
+            ),
         )
     )
     registry.register(
@@ -101,6 +110,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Confirm all required Python versions have compatibility evidence.",
             input_model=RunCompatibilityCheckInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:run_compatibility_check"
+            ),
         )
     )
     registry.register(
@@ -109,6 +121,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Confirm required deployment configuration keys are present.",
             input_model=InspectDeploymentConfigurationInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:inspect_deployment_configuration"
+            ),
         )
     )
     registry.register(
@@ -117,6 +132,9 @@ def build_release_validation_tool_registry() -> ToolRegistry:
             description="Generate a deterministic evidence record referencing prior checks.",
             input_model=GenerateReleaseEvidenceInput,
             policy=ToolPolicy(timeout_seconds=2.0),
+            handler_entrypoint=(
+                "domains.release_validation.tool_handlers:generate_release_evidence"
+            ),
         )
     )
     return registry

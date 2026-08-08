@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, Generic, List, Protocol, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utc_now() -> str:
@@ -76,12 +76,50 @@ class RuntimeResponse(BaseModel, Generic[StateT]):
     validation_errors: List[str]
 
 
+class RuntimeExecutionAuthority(BaseModel):
+    """Trusted identity and effective permissions captured when a run is created.
+
+    The API constructs this value from authenticated server-side policy. It is
+    persisted with the run so an asynchronous worker, including one recovering
+    after a restart, never has to trust request payload fields for authorization.
+    Permission names are strings here to keep the Core contract independent of
+    any concrete authentication or role implementation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tenant_id: str = Field(min_length=1, max_length=200)
+    subject_id: str = Field(min_length=1, max_length=200)
+    permissions: tuple[str, ...] = ()
+
+    @field_validator("permissions", mode="before")
+    @classmethod
+    def normalize_permissions(cls, value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        return tuple(sorted({str(permission) for permission in value}))
+
+    def allows(self, permission: str) -> bool:
+        return permission in self.permissions
+
+
 class RuntimeExecutionContext(BaseModel):
     """Stable identifiers supplied by ``RuntimeManager`` to one execution."""
 
     run_id: str
     thread_id: str
     recovered_after_restart: bool = False
+    authority: RuntimeExecutionAuthority
+
+
+class RuntimeExecutionError(RuntimeError):
+    """A fail-closed runtime error with a stable, user-visible code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class RuntimeProtocol(Protocol[StateT]):
