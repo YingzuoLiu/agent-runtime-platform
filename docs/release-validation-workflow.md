@@ -145,5 +145,5 @@ The validator remains a flat deterministic checklist, not a policy language.
 - Replay creates a child run; terminal source runs are immutable.
 - There is no worker lease or heartbeat, so interrupted recovery stays explicit.
 - Tool choice is fixed per node; there is no planner or LLM-driven tool loop.
-- Authorization/RBAC, quotas, PostgreSQL, and external secret management remain
-  future work.
+- The shared API applies static Viewer/Operator authorization; custom roles,
+  per-workflow grants, quotas, PostgreSQL, and external secret management remain future work.

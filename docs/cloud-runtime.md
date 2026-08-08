@@ -1,6 +1,6 @@
 # Cloud Runtime Upgrade
 
-Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery. Version `0.8.0` adds fail-closed API-key authentication and tenant-qualified control-plane persistence.
+Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery. Version `0.8.0` adds fail-closed API-key authentication and tenant-qualified control-plane persistence. Version `0.9.0` adds a typed default-deny Viewer/Operator authorization boundary.
 
 ## Architecture
 
@@ -8,7 +8,10 @@ Version `0.3.0` adds a self-hosted execution-management layer around the travel 
 Client
   |
   v
-Bearer API key -> Principal / TenantContext
+Bearer API key -> Principal / TenantContext / RuntimeRole
+  |
+  v
+RoleAuthorizer -> typed permission
   |
   v
 FastAPI API
@@ -43,11 +46,13 @@ execution. Thread identifiers are scoped within a tenant: two tenants may reuse
 the same identifier independently, while reusing it for a different domain or
 schema inside one tenant fails explicitly instead of overwriting a checkpoint.
 
-## Authentication and tenant boundary
+## Authentication, authorization, and tenant boundary
 
 `StaticApiKeyAuthenticator` loads local credential records from
 `RUNTIME_API_KEYS_JSON`, hashes each plaintext key in memory, and returns an immutable
-`Principal`. The API passes only the principal's derived `TenantContext` into
+`Principal`. Each credential must declare `viewer` or `operator`; missing or unknown roles fail
+configuration loading without retaining the plaintext key in the validation exception chain.
+The API passes only the principal's derived `TenantContext` into
 `RuntimeManager`; request models reject extra fields, so a client cannot select or override
 `tenant_id` in JSON. With no configured credentials, protected endpoints fail closed.
 
@@ -56,14 +61,20 @@ compatibility endpoint, runs, cancellation, event history/SSE, and thread checkp
 `Authorization: Bearer <api-key>`. Missing and invalid keys share one `401` response. Resource
 lookups that are unknown or owned by another tenant share one `404` response.
 
+`RoleAuthorizer` maps the trusted configured role to typed permissions. Viewers may list agents
+and tools and read run state, events/SSE, and thread checkpoints. Operators receive those read
+permissions plus run creation/replay, cancellation, tool execution, and the synchronous
+compatibility endpoint. Same-tenant permission failures return `403`; mutation is not attempted.
+
 Tenant filters are enforced again in `SQLiteRunStore`, not only at the route layer. Runs,
 idempotency lookup, cancellation, events, checkpoints, tool-to-run linkage, and selective
 replay sources are tenant-qualified. Existing pre-0.8 SQLite rows migrate to the reserved
 `legacy` tenant without changing their domain/schema state or event history; operators must
 explicitly map a credential to `legacy` if those rows should remain accessible.
 
-This slice does not implement roles, resource permissions, per-Agent/per-tool grants, quotas,
-key rotation, or an external secret provider.
+This slice intentionally stops at two static roles. It does not implement custom roles,
+user/role persistence, resource-specific grants, per-Agent/per-tool grants, quotas, key rotation,
+or an external secret provider.
 
 ## Run lifecycle
 
@@ -217,7 +228,7 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 
 On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again. Startup-recovered queue items carry a domain-neutral execution-context marker; the release-validation adapter maps that marker to explicit interrupted-step recovery, while normal submissions do not receive it. Terminal `failed` runs remain excluded from recovery.
 
-The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, tenant-scoped thread state and idempotency, fail-closed authentication, cross-tenant resource invisibility, DAG validation, tenant-safe selective replay, source-run immutability, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
+The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, tenant-scoped thread state and idempotency, fail-closed authentication, Viewer/Operator authorization and spoof resistance, cross-tenant resource invisibility, DAG validation, tenant-safe selective replay, source-run immutability, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
 
 ## Deliberate limitations
 
@@ -229,7 +240,7 @@ of that Secret are intentionally outside this slice. Therefore:
 - deploy one runtime replica only;
 - there is no distributed worker lease or heartbeat;
 - cancellation occurs at cooperative execution boundaries;
-- authentication uses a local static API-key provider; there is no RBAC, per-tool grant, quota, key-rotation, or external secret-manager integration;
+- authentication and two-role authorization use local static API-key configuration; there is no custom role model, per-tool grant, quota, key-rotation, or external secret-manager integration;
 - external side-effecting tools do not yet have idempotency records;
 - the subprocess sandbox does not isolate host networking or the complete host filesystem;
 - POSIX rlimits are not available on Windows, where timeout and process separation remain but resource enforcement is weaker;

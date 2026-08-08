@@ -31,7 +31,7 @@ spec:
         runAsUser: 10001
       containers:
         - name: runtime
-          image: your-registry/travel-agent-runtime:0.8.0
+          image: your-registry/travel-agent-runtime:0.9.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
