@@ -175,7 +175,15 @@ class DynamicTravelRuntime:
         )
         if selected is None:
             errors.append("Planner finish selection is absent from search evidence")
-            selected = {}
+            return FinishEvaluation(
+                outcome=DynamicLoopOutcome.BLOCKED,
+                message="The proposed plan was blocked by deterministic travel validation.",
+                output={
+                    "selected_option_name": payload.selected_option_name,
+                    "evidence_source": "synthetic_reference_catalog",
+                },
+                validation_errors=errors,
+            )
 
         expected_total = sum(
             self._integer_cost(selected, field_name)

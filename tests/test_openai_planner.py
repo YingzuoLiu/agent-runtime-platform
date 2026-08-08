@@ -161,6 +161,76 @@ def test_registered_tool_call_uses_strict_single_call_responses_request():
     assert "default" not in finish_output["properties"]["notes"]
 
 
+def test_finish_schema_rebases_nested_local_references_at_embedding_point():
+    client = FakeClient(
+        function_response(
+            "request_clarification",
+            {"question": "What is your maximum budget?"},
+        )
+    )
+    planner = OpenAIResponsesPlanner(
+        model="test-model",
+        system_instructions="Choose exactly one typed next action.",
+        finish_output_schema={
+            "$defs": {
+                "Leg": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                }
+            },
+            "type": "object",
+            "properties": {"leg": {"$ref": "#/$defs/Leg"}},
+            "required": ["leg"],
+        },
+        client=client,
+    )
+
+    planner.decide(planner_context())
+
+    finish_tool = next(
+        tool for tool in client.responses.calls[0]["tools"] if tool["name"] == "finish"
+    )
+    output_schema = finish_tool["parameters"]["properties"]["output"]
+    assert output_schema["properties"]["leg"]["$ref"] == (
+        "#/properties/output/$defs/Leg"
+    )
+    assert output_schema["$defs"]["Leg"]["additionalProperties"] is False
+
+
+def test_schema_property_named_default_is_preserved_and_made_required():
+    client = FakeClient(
+        function_response(
+            "request_clarification",
+            {"question": "What is your maximum budget?"},
+        )
+    )
+    planner = OpenAIResponsesPlanner(
+        model="test-model",
+        system_instructions="Choose exactly one typed next action.",
+        finish_output_schema={
+            "type": "object",
+            "properties": {
+                "default": {
+                    "type": "string",
+                    "default": "fallback value",
+                }
+            },
+        },
+        client=client,
+    )
+
+    planner.decide(planner_context())
+
+    finish_tool = next(
+        tool for tool in client.responses.calls[0]["tools"] if tool["name"] == "finish"
+    )
+    output_schema = finish_tool["parameters"]["properties"]["output"]
+    assert set(output_schema["properties"]) == {"default"}
+    assert output_schema["required"] == ["default"]
+    assert "default" not in output_schema["properties"]["default"]
+
+
 def test_request_clarification_function_maps_to_typed_decision():
     client = FakeClient(
         function_response(

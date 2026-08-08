@@ -261,6 +261,49 @@ def test_structurally_valid_finish_cannot_bypass_travel_validator(tmp_path):
     assert execution.error_code == "domain_validation_failed"
 
 
+class FabricatedSelectionPlanner(ScriptedTravelPlanner):
+    def decide(self, context):
+        decision = super().decide(context)
+        if isinstance(decision, FinishDecision):
+            return decision.model_copy(
+                update={
+                    "output": {
+                        **decision.output,
+                        "selected_option_name": "Fabricated option",
+                    }
+                }
+            )
+        return decision
+
+
+def test_finish_selection_absent_from_search_evidence_completes_blocked(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(
+        database_path=database_path,
+        authenticator=AUTHENTICATOR,
+        travel_planner=FabricatedSelectionPlanner(),
+    )
+    with client_for(app) as client:
+        run_id, result = submit_dynamic(
+            client,
+            "dynamic-fabricated-selection",
+            "I want a 5-day Tokyo trip under 9000 SGD.",
+        )
+
+    assert result["status"] == "completed"
+    assert result["state"]["current_stage"] == "blocked"
+    assert result["state"]["itinerary"] is None
+    assert result["error_code"] is None
+    assert result["validation_errors"] == [
+        "Planner finish selection does not match ranking evidence",
+        "Planner finish selection is absent from search evidence",
+    ]
+    execution = SQLiteWorkflowStore(database_path).get_execution(run_id)
+    assert execution is not None
+    assert execution.status == WorkflowStatus.BLOCKED
+    assert execution.error_code == "domain_validation_failed"
+
+
 class DenyToolExecutionAuthorizer:
     def authorize(self, _principal, permission: RuntimePermission) -> None:
         if permission == RuntimePermission.TOOLS_EXECUTE:

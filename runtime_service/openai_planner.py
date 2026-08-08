@@ -126,6 +126,11 @@ class OpenAIResponsesPlanner:
             rendered = ", ".join(sorted(conflicts))
             raise ValueError(f"planner tool names conflict with reserved decisions: {rendered}")
 
+        finish_output_schema = copy.deepcopy(self._finish_output_schema)
+        _rebase_local_schema_refs(
+            finish_output_schema,
+            embedding_pointer="#/properties/output",
+        )
         tools = [self._function_tool(descriptor) for descriptor in descriptors]
         tools.extend(
             [
@@ -163,7 +168,7 @@ class OpenAIResponsesPlanner:
                                 "minLength": 1,
                                 "maxLength": 4_000,
                             },
-                            "output": copy.deepcopy(self._finish_output_schema),
+                            "output": finish_output_schema,
                         },
                         "required": ["message", "output"],
                         "additionalProperties": False,
@@ -277,16 +282,44 @@ def _strict_object_schema(
 
 
 def _normalize_strict_schema_node(node: Any) -> None:
-    if isinstance(node, list):
-        for item in node:
-            _normalize_strict_schema_node(item)
-        return
     if not isinstance(node, dict):
         return
 
     node.pop("default", None)
-    for value in list(node.values()):
-        _normalize_strict_schema_node(value)
+
+    for keyword in (
+        "$defs",
+        "definitions",
+        "dependencies",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ):
+        children = node.get(keyword)
+        if isinstance(children, dict):
+            for child in children.values():
+                _normalize_strict_schema_node(child)
+
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = node.get(keyword)
+        if isinstance(children, list):
+            for child in children:
+                _normalize_strict_schema_node(child)
+
+    for keyword in (
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ):
+        _normalize_strict_schema_node(node.get(keyword))
 
     properties = node.get("properties")
     if node.get("type") == "object" or isinstance(properties, dict):
@@ -294,3 +327,21 @@ def _normalize_strict_schema_node(node: Any) -> None:
             raise ValueError("strict object schemas must define properties")
         node["required"] = list(properties)
         node["additionalProperties"] = False
+
+
+def _rebase_local_schema_refs(node: Any, *, embedding_pointer: str) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _rebase_local_schema_refs(item, embedding_pointer=embedding_pointer)
+        return
+    if not isinstance(node, dict):
+        return
+
+    reference = node.get("$ref")
+    if reference == "#":
+        node["$ref"] = embedding_pointer
+    elif isinstance(reference, str) and reference.startswith("#/"):
+        node["$ref"] = f"{embedding_pointer}{reference[1:]}"
+
+    for value in node.values():
+        _rebase_local_schema_refs(value, embedding_pointer=embedding_pointer)
