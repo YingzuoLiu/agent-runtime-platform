@@ -58,6 +58,26 @@ def test_fastapi_agent_message_endpoint(tmp_path):
     assert body["updated_state"]["budget"] == 7000
 
 
+def test_legacy_agent_message_rejects_mismatched_explicit_state_thread(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "request-thread",
+                "user_message": "Plan a five-day trip to Tokyo.",
+                "state": {"thread_id": "different-thread"},
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "state.thread_id must match request.thread_id"
+    store = SQLiteRunStore(database_path)
+    assert store.load_thread_state("request-thread") is None
+    assert store.load_thread_state("different-thread") is None
+
+
 def test_sync_and_async_endpoints_share_thread_state(tmp_path):
     app = create_app(database_path=tmp_path / "runtime.db")
     with TestClient(app) as client:
@@ -254,6 +274,58 @@ def test_release_validation_runs_through_unified_lifecycle_api(tmp_path):
     assert checkpoint.status_code == 200
     assert checkpoint.json()["result"]["run_id"] == result["run_id"]
     assert [event["event_type"] for event in events][-1] == "run.completed"
+
+
+def test_legacy_agent_message_rejects_release_bound_thread_without_mutating_checkpoint(
+    tmp_path,
+):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            json={
+                "thread_id": "release-bound-thread",
+                "agent_id": "release-validation",
+                "agent_version": "1.1.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        result = wait_for_run(client, submitted.json()["run_id"], timeout=10.0)
+        checkpoint_before = client.get(
+            "/threads/release-bound-thread/state",
+            params={"domain_id": "release-validation", "schema_version": "1"},
+        )
+
+        conflict = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "release-bound-thread",
+                "user_message": "Plan a five-day trip to Tokyo.",
+            },
+        )
+        explicit_state_conflict = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "release-bound-thread",
+                "user_message": "Plan a five-day trip to Tokyo.",
+                "state": {"thread_id": "release-bound-thread"},
+            },
+        )
+        checkpoint_after = client.get(
+            "/threads/release-bound-thread/state",
+            params={"domain_id": "release-validation", "schema_version": "1"},
+        )
+
+    assert result["status"] == "completed"
+    assert checkpoint_before.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == (
+        "Thread 'release-bound-thread' belongs to domain 'release-validation', not 'travel'"
+    )
+    assert explicit_state_conflict.status_code == 409
+    assert explicit_state_conflict.json()["detail"] == conflict.json()["detail"]
+    assert checkpoint_after.status_code == 200
+    assert checkpoint_after.json() == checkpoint_before.json()
 
 
 def test_release_validation_selective_replay_uses_unified_runs_api(tmp_path):
