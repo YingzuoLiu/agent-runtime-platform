@@ -133,7 +133,7 @@ def create_app(
         manager.stop()
 
     app = FastAPI(
-        title="Multi-Domain Agent Runtime Demo",
+        title="Agent Runtime Reliability Platform",
         description=(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
             "plus policy-enforced sandboxed tool execution."
