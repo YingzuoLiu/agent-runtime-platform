@@ -6,6 +6,7 @@ services:
     environment:
       RUNTIME_DB_PATH: /app/runtime_data/runtime.db
       RUNTIME_WORKER_COUNT: "1"
+      RUNTIME_API_KEYS_JSON: "${RUNTIME_API_KEYS_JSON:?set RUNTIME_API_KEYS_JSON before starting the runtime}"
     volumes:
       - runtime-data:/app/runtime_data
     restart: unless-stopped

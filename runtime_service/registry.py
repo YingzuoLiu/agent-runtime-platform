@@ -11,6 +11,7 @@ from agent.contracts import BaseRuntimeState, ManagedRuntimeProtocol
 from .models import AgentDescriptor
 
 RuntimeFactory = Callable[[], ManagedRuntimeProtocol[Any, Any]]
+RunReferenceResolver = Callable[[BaseModel], tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class RuntimeRegistration:
     input_model: type[BaseModel]
     state_model: type[BaseRuntimeState]
     factory: RuntimeFactory
+    run_reference_resolver: RunReferenceResolver | None = None
 
     def parse_input(self, payload: dict[str, Any]) -> BaseModel:
         return self.input_model.model_validate(payload)
@@ -33,6 +35,11 @@ class RuntimeRegistration:
         if isinstance(payload, BaseRuntimeState):
             payload = payload.model_dump(mode="python")
         return self.state_model.model_validate(payload)
+
+    def referenced_run_ids(self, runtime_input: BaseModel) -> tuple[str, ...]:
+        if self.run_reference_resolver is None:
+            return ()
+        return self.run_reference_resolver(runtime_input)
 
 
 class AgentRegistry:
@@ -51,6 +58,7 @@ class AgentRegistry:
         description: str,
         input_model: type[BaseModel],
         state_model: type[BaseRuntimeState],
+        run_reference_resolver: RunReferenceResolver | None = None,
     ) -> None:
         key = (agent_id, version)
         if key in self._registrations:
@@ -71,6 +79,7 @@ class AgentRegistry:
             input_model=input_model,
             state_model=state_model,
             factory=factory,
+            run_reference_resolver=run_reference_resolver,
         )
 
     def registration(self, agent_id: str, version: str) -> RuntimeRegistration:
@@ -143,6 +152,13 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
         )
         from domains.release_validation.runtime import ManagedReleaseValidationRuntime
 
+        def release_run_references(runtime_input: BaseModel) -> tuple[str, ...]:
+            if not isinstance(runtime_input, ReleaseValidationInput):
+                raise TypeError("release-validation:1.1.0 received an unexpected input model")
+            if runtime_input.replay is None:
+                return ()
+            return (runtime_input.replay.source_run_id,)
+
         registry.register(
             "release-validation",
             "1.0.0",
@@ -167,5 +183,6 @@ def build_default_registry(*, release_validation_workflow: Any | None = None) ->
             ),
             input_model=ReleaseValidationInput,
             state_model=ReleaseValidationState,
+            run_reference_resolver=release_run_references,
         )
     return registry

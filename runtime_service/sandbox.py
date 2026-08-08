@@ -33,6 +33,8 @@ class ToolPolicy(BaseModel):
 
 
 class ToolExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     arguments: dict[str, Any] = Field(default_factory=dict)
     run_id: str | None = None
 

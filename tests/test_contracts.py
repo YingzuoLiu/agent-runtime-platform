@@ -25,7 +25,29 @@ from agent.contracts import RuntimeResponse as GenericRuntimeResponse
 from domains.travel.runtime import TravelAgentRuntime
 from domains.travel.state import AgentState, TravelPlan
 from api.main import create_app
-from runtime_service import RunCreateRequest, RuntimeManager, SQLiteRunStore, build_default_registry
+from runtime_service import (
+    ApiKeyCredential,
+    RunCreateRequest,
+    RuntimeManager,
+    SQLiteRunStore,
+    StaticApiKeyAuthenticator,
+    TenantContext,
+    build_default_registry,
+)
+
+
+TENANT_CONTEXT = TenantContext(tenant_id="legacy", subject_id="contract-tester")
+CONTRACT_API_KEY = "contract-test-key"
+CONTRACT_AUTHENTICATOR = StaticApiKeyAuthenticator(
+    [
+        ApiKeyCredential(
+            credential_id="contract-credential",
+            api_key=CONTRACT_API_KEY,
+            tenant_id="tenant-contract",
+            subject_id="contract-tester",
+        )
+    ]
+)
 
 
 def _sample_state(thread_id: str = "contract-test") -> AgentState:
@@ -210,12 +232,13 @@ def test_sqlite_round_trip_preserves_all_travel_specific_fields(tmp_path):
             RunCreateRequest(
                 thread_id="contract-sqlite-thread",
                 user_message="I want a 5-day Tokyo trip under 9000 SGD.",
-            )
+            ),
+            tenant_context=TENANT_CONTEXT,
         )
         deadline = time.monotonic() + 10.0
         result = None
         while time.monotonic() < deadline:
-            result = manager.get_run(submitted.run_id)
+            result = manager.get_run(submitted.run_id, tenant_context=TENANT_CONTEXT)
             if result is not None and result.status.is_terminal:
                 break
             time.sleep(0.02)
@@ -230,7 +253,7 @@ def test_sqlite_round_trip_preserves_all_travel_specific_fields(tmp_path):
         database_path,
         state_registry=build_default_registry(),
     )
-    persisted_run = reopened_store.get_run(submitted.run_id)
+    persisted_run = reopened_store.get_run_internal(submitted.run_id)
     assert persisted_run is not None
     assert persisted_run.state is not None
     assert type(persisted_run.state) is AgentState
@@ -239,7 +262,10 @@ def test_sqlite_round_trip_preserves_all_travel_specific_fields(tmp_path):
     assert persisted_run.state.itinerary is not None
     assert persisted_run.state.itinerary.destination == "Tokyo"
 
-    persisted_thread_state = reopened_store.load_thread_state("contract-sqlite-thread")
+    persisted_thread_state = reopened_store.load_thread_state(
+        "contract-sqlite-thread",
+        tenant_id=TENANT_CONTEXT.tenant_id,
+    )
     assert persisted_thread_state is not None
     assert type(persisted_thread_state) is AgentState
     assert persisted_thread_state.destination == "Tokyo"
@@ -248,8 +274,14 @@ def test_sqlite_round_trip_preserves_all_travel_specific_fields(tmp_path):
 
 
 def test_api_response_preserves_travel_specific_fields(tmp_path):
-    app = create_app(database_path=tmp_path / "runtime.db")
-    with TestClient(app) as client:
+    app = create_app(
+        database_path=tmp_path / "runtime.db",
+        authenticator=CONTRACT_AUTHENTICATOR,
+    )
+    with TestClient(
+        app,
+        headers={"Authorization": f"Bearer {CONTRACT_API_KEY}"},
+    ) as client:
         response = client.post(
             "/agent/message",
             json={

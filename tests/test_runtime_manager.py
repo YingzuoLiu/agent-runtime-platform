@@ -26,16 +26,24 @@ from runtime_service import (
     RunStatus,
     RuntimeManager,
     SQLiteRunStore,
+    TenantContext,
     build_default_registry,
 )
 from runtime_service.sandbox import ToolSandbox
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStatus
 
 
+TENANT_CONTEXT = TenantContext(tenant_id="legacy", subject_id="runtime-tester")
+
+
+def submit_run(manager: RuntimeManager, request: RunCreateRequest):
+    return manager.submit(request, tenant_context=TENANT_CONTEXT)
+
+
 def wait_for_terminal(manager: RuntimeManager, run_id: str, timeout: float = 10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        run = manager.get_run(run_id)
+        run = manager.get_run(run_id, tenant_context=TENANT_CONTEXT)
         if run is not None and run.status.is_terminal:
             return run
         time.sleep(0.02)
@@ -131,12 +139,12 @@ def test_manager_persists_state_and_events(tmp_path):
     manager = RuntimeManager(store, build_default_registry())
     manager.start()
     try:
-        first = manager.submit(RunCreateRequest(thread_id="trip-001", user_message="I want a 5-day Tokyo trip under 7000 SGD."))
+        first = submit_run(manager, RunCreateRequest(thread_id="trip-001", user_message="I want a 5-day Tokyo trip under 7000 SGD."))
         first_result = wait_for_terminal(manager, first.run_id)
         assert first_result.status == RunStatus.COMPLETED
         assert first_result.state is not None
         assert first_result.state.destination == "Tokyo"
-        second = manager.submit(RunCreateRequest(thread_id="trip-001", user_message="Change the budget to 9000 and avoid red-eye flights."))
+        second = submit_run(manager, RunCreateRequest(thread_id="trip-001", user_message="Change the budget to 9000 and avoid red-eye flights."))
         second_result = wait_for_terminal(manager, second.run_id)
         assert second_result.state is not None
         assert second_result.state.destination == "Tokyo"
@@ -150,8 +158,8 @@ def test_manager_persists_state_and_events(tmp_path):
 def test_cancelled_before_start(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
     manager = RuntimeManager(store, build_default_registry())
-    submitted = manager.submit(RunCreateRequest(thread_id="cancel-before", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
-    manager.request_cancel(submitted.run_id)
+    submitted = submit_run(manager, RunCreateRequest(thread_id="cancel-before", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
+    manager.request_cancel(submitted.run_id, tenant_context=TENANT_CONTEXT)
     manager.start()
     try:
         result = wait_for_terminal(manager, submitted.run_id)
@@ -176,13 +184,13 @@ def test_cancelled_after_execution_boundary(tmp_path):
     manager = RuntimeManager(store, blocking_registry(started, release))
     manager.start()
     try:
-        submitted = manager.submit(RunCreateRequest(thread_id="cancel-running", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
+        submitted = submit_run(manager, RunCreateRequest(thread_id="cancel-running", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
         assert started.wait(timeout=5)
-        manager.request_cancel(submitted.run_id)
+        manager.request_cancel(submitted.run_id, tenant_context=TENANT_CONTEXT)
         release.set()
         result = wait_for_terminal(manager, submitted.run_id)
         assert result.status == RunStatus.CANCELLED
-        assert store.load_thread_state("cancel-running") is None
+        assert store.load_thread_state("cancel-running", tenant_id="legacy") is None
         reasons = [event.payload.get("reason") for event in store.list_events(submitted.run_id) if event.event_type == "run.cancelled"]
         assert reasons == ["cancelled_after_execution_boundary"]
         # A cancel that commits before finalize_completed_run's compare-and-set
@@ -222,7 +230,7 @@ def test_running_run_is_recovered_after_restart(tmp_path):
         assert "checkpoint.saved" in events
         assert events[-2] == "checkpoint.saved"
         assert events[-1] == "run.completed"
-        assert manager.store.load_thread_state("recovery-thread") is not None
+        assert manager.store.load_thread_state("recovery-thread", tenant_id="legacy") is not None
     finally:
         manager.stop()
 
@@ -296,6 +304,19 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
         ToolSandbox(build_release_validation_tool_registry()),
     )
     source_workflow.run("source", manifest)
+    run_store = SQLiteRunStore(database_path)
+    run_store.create_run(
+        RunRecord(
+            run_id="source",
+            thread_id="replay-source-thread",
+            agent_id="release-validation",
+            agent_version="1.1.0",
+            domain_id="release-validation",
+            schema_version="1",
+            status=RunStatus.COMPLETED,
+            input=ReleaseValidationInput(manifest=manifest).model_dump(mode="json"),
+        )
+    )
     replay = SelectiveReplayRequest(
         source_run_id="source",
         step_ids=["run_unit_tests"],
@@ -312,7 +333,7 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
         input=runtime_input.model_dump(mode="json"),
         attempt=1,
     )
-    SQLiteRunStore(database_path).create_run(target)
+    run_store.create_run(target)
     workflow_store.create_or_get_execution(
         target.run_id,
         WORKFLOW_TYPE,
@@ -404,7 +425,7 @@ def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
     events_after_second = store.list_events(run.run_id)
     assert events_after_second == events_after_first
 
-    persisted = store.get_run(run.run_id)
+    persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.COMPLETED
 
@@ -424,7 +445,7 @@ def test_finalize_completed_run_rejects_when_cancel_requested_first(tmp_path):
 
     # Simulate a cancel committing to the database first, in the window
     # between a worker starting execution and it finishing.
-    cancelled = store.request_cancel_atomically(run.run_id)
+    cancelled = store.request_cancel_atomically(run.run_id, tenant_id="legacy")
     assert cancelled.cancel_requested is True
     assert cancelled.status == RunStatus.RUNNING
 
@@ -435,13 +456,13 @@ def test_finalize_completed_run_rejects_when_cancel_requested_first(tmp_path):
     result = store.finalize_completed_run(run)
 
     assert result is False
-    persisted = store.get_run(run.run_id)
+    persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
     # RuntimeManager -- not finalize_completed_run -- owns the transition to
     # CANCELLED once this returns False; the row is left RUNNING here.
     assert persisted.status == RunStatus.RUNNING
     assert persisted.state is None
-    assert store.load_thread_state("cancel-race-thread") is None
+    assert store.load_thread_state("cancel-race-thread", tenant_id="legacy") is None
     events = [event.event_type for event in store.list_events(run.run_id)]
     assert "checkpoint.saved" not in events
     assert "run.completed" not in events
@@ -459,10 +480,10 @@ def test_request_cancel_atomically_is_idempotent_on_duplicate_call(tmp_path):
     )
     store.create_run(run)
 
-    first = store.request_cancel_atomically(run.run_id)
+    first = store.request_cancel_atomically(run.run_id, tenant_id="legacy")
     assert first.cancel_requested is True
 
-    second = store.request_cancel_atomically(run.run_id)
+    second = store.request_cancel_atomically(run.run_id, tenant_id="legacy")
 
     assert second.cancel_requested is True
     events = [event.event_type for event in store.list_events(run.run_id)]
@@ -499,7 +520,7 @@ def test_finalize_cancelled_run_is_idempotent_on_duplicate_call(tmp_path):
     events_after_second = store.list_events(run.run_id)
     assert events_after_second == events_after_first
 
-    persisted = store.get_run(run.run_id)
+    persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.CANCELLED
 
@@ -516,7 +537,7 @@ def test_cancellation_event_order_is_cancel_requested_before_cancelled(tmp_path)
     )
     store.create_run(run)
 
-    store.request_cancel_atomically(run.run_id)
+    store.request_cancel_atomically(run.run_id, tenant_id="legacy")
     store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
 
     events = [event.event_type for event in store.list_events(run.run_id)]
@@ -538,7 +559,7 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_cancel_wins(tmp
     # Cancel commits first, exactly like the real cancelled_after_execution_
     # boundary path: cancel_requested flips to 1 while the run is still
     # RUNNING and the runtime step is still in flight.
-    store.request_cancel_atomically(run.run_id)
+    store.request_cancel_atomically(run.run_id, tenant_id="legacy")
 
     run.state = AgentState(thread_id="race-cancel-wins-thread", destination="Tokyo", days=5, budget=9000)
     run.output_message = "Planned."
@@ -550,7 +571,7 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_cancel_wins(tmp
     cancelled = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
     assert cancelled is True
 
-    persisted = store.get_run(run.run_id)
+    persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.CANCELLED
 
@@ -583,14 +604,14 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_completion_wins
 
     # A cancel arriving after completion must not be able to flip anything:
     # the row is no longer QUEUED/RUNNING, so the CAS simply does not match.
-    cancel_request_result = store.request_cancel_atomically(run.run_id)
+    cancel_request_result = store.request_cancel_atomically(run.run_id, tenant_id="legacy")
     assert cancel_request_result.cancel_requested is False
     assert cancel_request_result.status == RunStatus.COMPLETED
 
     finalize_cancel_result = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
     assert finalize_cancel_result is False
 
-    persisted = store.get_run(run.run_id)
+    persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.COMPLETED
 
@@ -606,7 +627,7 @@ def test_request_cancel_on_already_terminal_run_is_a_no_op(tmp_path):
     manager = RuntimeManager(store, build_default_registry())
     manager.start()
     try:
-        submitted = manager.submit(
+        submitted = submit_run(manager,
             RunCreateRequest(thread_id="cancel-terminal", user_message="I want a 5-day Tokyo trip under 9000 SGD.")
         )
         completed = wait_for_terminal(manager, submitted.run_id)
@@ -618,7 +639,7 @@ def test_request_cancel_on_already_terminal_run_is_a_no_op(tmp_path):
         # already-terminal run is not an error and not a duplicate-cancel
         # code path either -- it is simply a no-op that returns the run
         # exactly as it already was.
-        result = manager.request_cancel(submitted.run_id)
+        result = manager.request_cancel(submitted.run_id, tenant_context=TENANT_CONTEXT)
 
         assert result.status == RunStatus.COMPLETED
         assert result.cancel_requested is False
@@ -633,7 +654,7 @@ def test_two_workers_complete_independent_runs(tmp_path):
     manager = RuntimeManager(store, build_default_registry(), worker_count=2)
     manager.start()
     try:
-        runs = [manager.submit(RunCreateRequest(thread_id=f"parallel-{index}", user_message="I want a 5-day Tokyo trip under 9000 SGD.")) for index in range(8)]
+        runs = [submit_run(manager, RunCreateRequest(thread_id=f"parallel-{index}", user_message="I want a 5-day Tokyo trip under 9000 SGD.")) for index in range(8)]
         results = [wait_for_terminal(manager, run.run_id) for run in runs]
         assert all(result.status == RunStatus.COMPLETED for result in results)
         assert len({result.run_id for result in results}) == 8
@@ -667,7 +688,7 @@ def test_submit_before_start_is_enqueued_once_with_two_workers(tmp_path):
         registry,
         worker_count=2,
     )
-    submitted = manager.submit(
+    submitted = submit_run(manager,
         RunCreateRequest(
             thread_id="submit-before-start",
             user_message="I want a 5-day Tokyo trip under 9000 SGD.",
@@ -694,8 +715,8 @@ def test_idempotent_submit_returns_existing_run(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
     manager = RuntimeManager(store, build_default_registry())
     request = RunCreateRequest(thread_id="idempotent", user_message="I want a 5-day Tokyo trip under 9000 SGD.", client_request_id="request-123")
-    first = manager.submit(request)
-    second = manager.submit(request)
+    first = submit_run(manager, request)
+    second = submit_run(manager, request)
     assert first.run_id == second.run_id
     assert len(store.list_events(first.run_id)) == 1
 
@@ -720,7 +741,7 @@ def test_restart_and_idempotent_submit_do_not_revive_failed_run(tmp_path):
     manager = RuntimeManager(SQLiteRunStore(database_path), build_default_registry())
     manager.start()
     try:
-        duplicate = manager.submit(
+        duplicate = submit_run(manager,
             RunCreateRequest(
                 thread_id="failed-terminal-thread",
                 user_message="Plan a five-day trip to Tokyo.",
@@ -742,12 +763,12 @@ def test_store_survives_new_store_instance(tmp_path):
     manager = RuntimeManager(SQLiteRunStore(database_path), build_default_registry())
     manager.start()
     try:
-        submitted = manager.submit(RunCreateRequest(thread_id="persistent-thread", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
+        submitted = submit_run(manager, RunCreateRequest(thread_id="persistent-thread", user_message="I want a 5-day Tokyo trip under 9000 SGD."))
         completed = wait_for_terminal(manager, submitted.run_id)
     finally:
         manager.stop()
     reopened = SQLiteRunStore(database_path, state_registry=build_default_registry())
-    persisted = reopened.get_run(completed.run_id)
+    persisted = reopened.get_run_internal(completed.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.COMPLETED
-    assert reopened.load_thread_state("persistent-thread") is not None
+    assert reopened.load_thread_state("persistent-thread", tenant_id="legacy") is not None
