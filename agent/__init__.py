@@ -1,4 +1,12 @@
-from .contracts import BaseRuntimeState, RuntimeProtocol, RuntimeResponse, TraceEvent, utc_now
+from .contracts import (
+    BaseRuntimeState,
+    ManagedRuntimeProtocol,
+    RuntimeExecutionContext,
+    RuntimeProtocol,
+    RuntimeResponse,
+    TraceEvent,
+    utc_now,
+)
 
 # `agent/__init__.py` imports only from `.contracts`: the domain-agnostic
 # base state, response envelope, and runtime protocol. Phase 1B moved
@@ -12,6 +20,8 @@ from .contracts import BaseRuntimeState, RuntimeProtocol, RuntimeResponse, Trace
 
 __all__ = [
     "BaseRuntimeState",
+    "ManagedRuntimeProtocol",
+    "RuntimeExecutionContext",
     "RuntimeProtocol",
     "RuntimeResponse",
     "TraceEvent",

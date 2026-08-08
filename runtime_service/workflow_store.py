@@ -109,11 +109,9 @@ class SQLiteWorkflowStore:
     per step, and an append-only `workflow_events` log.
 
     This lives in the same physical SQLite file as `SQLiteRunStore` but
-    owns a completely separate schema and does not import `AgentState`,
-    `RunRecord`, or `RuntimeManager`. Those three remain Travel-coupled
-    (see `store.py`/`models.py`/`manager.py`); generalizing them is out of
-    scope here -- a domain plugs into this store directly, bypassing
-    `RuntimeManager`/`AgentRegistry` entirely for now.
+    owns a completely separate schema and does not import a domain state,
+    `RunRecord`, or `RuntimeManager`. A domain workflow may use this store
+    directly and expose an explicit adapter through the generic manager.
 
     There is no dependency graph, no scheduler, and no selective replay:
     a workflow is a hardcoded, caller-supplied sequence of `step_id`s, and

@@ -3,6 +3,32 @@ import time
 from fastapi.testclient import TestClient
 
 from api.main import create_app
+from runtime_service import SQLiteRunStore
+
+
+def valid_release_manifest() -> dict:
+    return {
+        "release_id": "rel-api-001",
+        "application_name": "aurora-notes",
+        "release_version": "2.4.0",
+        "required_artifacts": ["aurora-notes-server", "aurora-notes-cli"],
+        "available_artifacts": [
+            {"name": "aurora-notes-server", "checksum": "a" * 64},
+            {"name": "aurora-notes-cli", "checksum": "b" * 64},
+        ],
+        "required_test_suite": "aurora-notes-full-suite",
+        "executed_test_suite": "aurora-notes-full-suite",
+        "tests_passed": True,
+        "required_python_versions": ["3.11", "3.12"],
+        "tested_python_versions": ["3.11", "3.12"],
+        "deployment_environment": "staging",
+        "configuration_requirements": ["DATABASE_URL", "FEATURE_FLAGS_ENDPOINT"],
+        "actual_configuration_keys": [
+            "DATABASE_URL",
+            "FEATURE_FLAGS_ENDPOINT",
+            "LOG_LEVEL",
+        ],
+    }
 
 
 def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
@@ -179,3 +205,145 @@ def test_unknown_agent_version_is_rejected(tmp_path):
             },
         )
     assert response.status_code == 422
+
+
+def test_agents_expose_typed_multi_domain_contracts(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        response = client.get("/agents")
+
+    assert response.status_code == 200
+    agents = {(item["agent_id"], item["version"]): item for item in response.json()}
+    assert agents[("travel-agent", "0.3.0")]["domain_id"] == "travel"
+    release = agents[("release-validation", "1.0.0")]
+    assert release["domain_id"] == "release-validation"
+    assert release["schema_version"] == "1"
+    assert "manifest" in release["input_schema"]["properties"]
+
+
+def test_release_validation_runs_through_unified_lifecycle_api(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            json={
+                "thread_id": "release-api-thread",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        assert submitted.status_code == 202
+        result = wait_for_run(client, submitted.json()["run_id"], timeout=10.0)
+        checkpoint = client.get(
+            "/threads/release-api-thread/state",
+            params={"domain_id": "release-validation", "schema_version": "1"},
+        )
+        events = client.get(f"/runs/{result['run_id']}/events").json()
+
+    assert result["status"] == "completed"
+    assert result["domain_id"] == "release-validation"
+    assert result["state"]["current_stage"] == "ready"
+    assert result["state"]["result"]["status"] == "ready"
+    assert result["validation_errors"] == []
+    assert checkpoint.status_code == 200
+    assert checkpoint.json()["result"]["run_id"] == result["run_id"]
+    assert [event["event_type"] for event in events][-1] == "run.completed"
+
+
+def test_release_business_block_is_not_reported_as_runtime_failure(tmp_path):
+    manifest = valid_release_manifest()
+    manifest["tests_passed"] = False
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            json={
+                "thread_id": "blocked-release-thread",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {"manifest": manifest},
+            },
+        )
+        result = wait_for_run(client, submitted.json()["run_id"], timeout=10.0)
+
+    assert result["status"] == "completed"
+    assert result["state"]["result"]["status"] == "blocked"
+    assert any("unit_test_suite_passed" in error for error in result["validation_errors"])
+
+
+def test_unified_api_rejects_domain_invalid_input_before_queueing(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "thread_id": "invalid-release-input",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {"manifest": {"release_id": "incomplete"}},
+            },
+        )
+
+    assert response.status_code == 422
+
+
+def test_unified_api_rejects_release_state_for_travel_agent(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "thread_id": "wrong-domain-state",
+                "client_request_id": "wrong-domain-state-request",
+                "agent_id": "travel-agent",
+                "agent_version": "0.3.0",
+                "input": {"user_message": "Plan a five-day trip to Tokyo."},
+                "state": {
+                    "thread_id": "wrong-domain-state",
+                    "execution_trace": [],
+                    "manifest": valid_release_manifest(),
+                    "result": None,
+                    "current_stage": "initialized",
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in response.json()["detail"]
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            "wrong-domain-state-request"
+        )
+        is None
+    )
+
+
+def test_same_thread_id_cannot_silently_cross_domain_checkpoint_boundary(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        travel = client.post(
+            "/runs",
+            json={
+                "thread_id": "globally-scoped-thread",
+                "input": {"user_message": "I want a 5-day Tokyo trip under 9000 SGD."},
+            },
+        )
+        travel_result = wait_for_run(client, travel.json()["run_id"])
+        release = client.post(
+            "/runs",
+            json={
+                "thread_id": "globally-scoped-thread",
+                "agent_id": "release-validation",
+                "agent_version": "1.0.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        release_result = wait_for_run(client, release.json()["run_id"])
+        travel_checkpoint = client.get("/threads/globally-scoped-thread/state")
+
+    assert travel_result["status"] == "completed"
+    assert release_result["status"] == "failed"
+    assert "belongs to domain 'travel'" in release_result["error"]
+    assert travel_checkpoint.json()["destination"] == "Tokyo"

@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
 
-from agent.contracts import RuntimeResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from agent.contracts import RuntimeExecutionContext, RuntimeResponse
 from .reducer import apply_patch, append_trace
 from .review.models import ReplanAction, ReplanDirective, WorkflowReviewResult
 from .review.orchestrator import WorkflowOrchestrator
@@ -20,6 +22,14 @@ from .validator import TravelValidator
 # output all showing every `AgentState` field, while leaving this module's
 # `RuntimeResponse` identical to the unbound Core contract -- see
 # `agent/contracts.py` and `tests/test_contracts.py`.
+
+
+class TravelMessageInput(BaseModel):
+    """Typed input accepted by Travel through the unified run API."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_message: str = Field(..., min_length=1)
 
 
 class TravelAgentRuntime:
@@ -44,6 +54,18 @@ class TravelAgentRuntime:
         self.review_orchestrator = review_orchestrator
         if self.enable_review_workflow and self.review_orchestrator is None:
             self.review_orchestrator = WorkflowOrchestrator()
+
+    def initial_state(self, thread_id: str) -> AgentState:
+        return AgentState(thread_id=thread_id)
+
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del context
+        return self.handle_user_message(state, runtime_input.user_message)
 
     def handle_user_message(self, state: AgentState, user_message: str) -> RuntimeResponse[AgentState]:
         intent, patch = self.detect_intent_and_patch(state, user_message)

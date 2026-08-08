@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.contracts import RuntimeExecutionContext, RuntimeResponse, TraceEvent
 from runtime_service.sandbox import ToolExecutionResult, ToolExecutionStatus, ToolSandbox
 from runtime_service.workflow_store import (
     ClaimOutcome,
@@ -16,7 +17,9 @@ from runtime_service.workflow_store import (
 
 from .models import (
     ReleaseManifest,
+    ReleaseValidationInput,
     ReleaseValidationResult,
+    ReleaseValidationState,
     ReleaseValidationStatus,
     ValidationFinding,
 )
@@ -289,10 +292,9 @@ def validate_release_readiness(step_results: Dict[str, Dict[str, Any]]) -> List[
 class ReleaseValidationWorkflow:
     """Fixed-order, multi-step registered-tool workflow.
 
-    Uses `SQLiteWorkflowStore` and `ToolSandbox` directly. Does not
-    register with `AgentRegistry`, does not go through `RuntimeManager`,
-    and has no HTTP surface -- see `docs/release-validation-workflow.md`
-    for what that boundary does and does not mean.
+    Uses `SQLiteWorkflowStore` and `ToolSandbox` directly. The workflow
+    itself has no manager or HTTP concerns; `ManagedReleaseValidationRuntime`
+    below is the explicit integration adapter.
     """
 
     def __init__(
@@ -514,3 +516,62 @@ def _step_error_code(status: ToolExecutionStatus, error: str | None) -> str:
     if status == ToolExecutionStatus.FAILED and error:
         return error.strip()[:200]
     return status.value
+
+
+class ManagedReleaseValidationRuntime:
+    """Adapter that exposes the fixed workflow through ``RuntimeManager``.
+
+    The workflow remains fixed-order. This adapter adds lifecycle integration,
+    typed input/state validation and a domain checkpoint; it does not add a DAG,
+    selective replay, planner-selected tools or dynamic execution policy.
+    """
+
+    def __init__(self, workflow: ReleaseValidationWorkflow):
+        self.workflow = workflow
+
+    def initial_state(self, thread_id: str) -> ReleaseValidationState:
+        return ReleaseValidationState(thread_id=thread_id)
+
+    def execute(
+        self,
+        state: ReleaseValidationState,
+        runtime_input: ReleaseValidationInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[ReleaseValidationState]:
+        result = self.workflow.run(
+            context.run_id,
+            runtime_input.manifest,
+            resume_interrupted=(
+                runtime_input.resume_interrupted or context.recovered_after_restart
+            ),
+        )
+        updated_state = state.model_copy(
+            update={
+                "manifest": runtime_input.manifest,
+                "result": result,
+                "current_stage": result.status.value,
+                "execution_trace": [
+                    *state.execution_trace,
+                    TraceEvent(
+                        event="release_validation_finished",
+                        reason=result.status.value,
+                        payload={
+                            "run_id": context.run_id,
+                            "finding_count": len(result.findings),
+                        },
+                    ),
+                ],
+            }
+        )
+        validation_errors = [
+            f"{finding.rule_id}: {finding.message}" for finding in result.findings
+        ]
+        return RuntimeResponse[ReleaseValidationState](
+            message=(
+                "Release validation passed."
+                if result.status == ReleaseValidationStatus.READY
+                else f"Release validation blocked by {len(result.findings)} finding(s)."
+            ),
+            state=updated_state,
+            validation_errors=validation_errors,
+        )

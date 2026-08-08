@@ -4,8 +4,9 @@ A synthetic, offline, fixed-order registered-tool workflow built on the
 same durable persistence (`SQLiteWorkflowStore`) and registered-tool
 sandbox (`ToolSandbox`) as the rest of `runtime_service`. It exists to
 prove those two pieces are genuinely domain-agnostic: this domain has no
-relationship to Travel, does not import `AgentState`, and does not go
-through `RuntimeManager` or `AgentRegistry`.
+relationship to Travel and does not import `AgentState`. Phase 3A adds a
+typed adapter that registers the workflow with `AgentRegistry` and runs it
+through `RuntimeManager` and the shared `/runs` HTTP lifecycle.
 
 All manifests, artifacts, test results, and compatibility data are
 synthetic fixtures for this repository. This is not a real release
@@ -99,12 +100,15 @@ have judged.
 `ALREADY_RUNNING` from `claim_step` is the normal outcome for a
 genuinely still-in-progress step. By default, `run()` raises
 `StepAlreadyRunningError` and finalizes nothing -- the execution stays
-`RUNNING` for a later call to resolve. Recovery only happens when the
-caller passes `resume_interrupted=True`, which calls
+`RUNNING` for a later call to resolve. Recovery only happens when a direct
+caller passes `resume_interrupted=True`, or when `RuntimeManager` marks a
+durable run as recovered during startup and the managed adapter supplies
+the same explicit recovery intent. That recovery calls
 `SQLiteWorkflowStore.recover_interrupted_step` (RUNNING -> FAILED with
 `error_code="interrupted"`) and then re-claims, producing a brand-new
 `attempt_token`. There is no lease, no heartbeat, and no automatic
-detection of a dead process -- the caller must decide.
+detection of a dead process inside `ReleaseValidationWorkflow`; either the
+direct caller or the outer durable manager must decide.
 
 ## Validator: why a tool succeeding is not the same as ready
 
@@ -138,10 +142,13 @@ verdict could be reached."
   or scheduler.
 - Tool selection is fixed at each step; nothing here is planner- or
   LLM-driven.
-- This workflow bypasses `RuntimeManager` and `AgentRegistry` entirely --
-  it is not evidence that either has been generalized to run two domains.
-- There is no HTTP endpoint for this workflow.
-- Interrupted-step recovery is explicit (`resume_interrupted=True`), not
-  automatic crash detection.
+- The core `ReleaseValidationWorkflow` still owns only fixed step execution;
+  `ManagedReleaseValidationRuntime` is the explicit adapter to the generic
+  manager. This separation does not make the workflow planner-driven.
+- The workflow is submitted through the shared `/runs` endpoint; there is no
+  release-specific execution endpoint.
+- Interrupted-step recovery is explicit (`resume_interrupted=True` for a
+  direct caller, or a startup-recovery context from `RuntimeManager`), not
+  automatic crash detection inside the workflow.
 - There is no selective replay: an input mismatch is rejected outright,
   never partially reused.

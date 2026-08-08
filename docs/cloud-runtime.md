@@ -1,6 +1,6 @@
 # Cloud Runtime Upgrade
 
-Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools.
+Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains.
 
 ## Architecture
 
@@ -23,12 +23,20 @@ RuntimeManager ---- AgentRegistry
   |       |- run_events
   |       `- thread_states / checkpoints
   |
+  +---- TravelAgentRuntime
+  |
+  +---- ManagedReleaseValidationRuntime
+  |
   `---- ToolSandbox ---- ToolRegistry
              |
              `- restricted subprocess worker
 ```
 
-Both Agent API paths use the same durable `thread_states` table. This avoids split-brain conversation state when a client switches between the synchronous compatibility endpoint and the asynchronous run API.
+Both Travel API paths use the same durable `thread_states` table. The generic
+run path persists `domain_id` and `schema_version` separately from state JSON,
+and the registry validates concrete input/state models before execution.
+Thread identifiers are globally scoped in this SQLite slice: reusing one for a
+different domain or schema fails explicitly instead of overwriting a checkpoint.
 
 ## Run lifecycle
 
@@ -38,7 +46,10 @@ queued -> running -> completed
 queued/running    -> cancelled
 ```
 
-Every run records its stable `run_id`, thread, pinned Agent version, input/output, timestamps, validation results, cancellation metadata, optional `client_request_id`, and latest serialized `AgentState`.
+Every run records its stable `run_id`, thread, pinned Agent version,
+domain/schema identity, structured input/output, timestamps, validation
+results, cancellation metadata, optional `client_request_id`, and latest
+serialized domain state.
 
 Important transitions are append-only events:
 
@@ -176,7 +187,7 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 
 ## Restart recovery
 
-On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again.
+On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again. Startup-recovered queue items carry a domain-neutral execution-context marker; the release-validation adapter maps that marker to explicit interrupted-step recovery, while normal submissions do not receive it. Terminal `failed` runs remain excluded from recovery.
 
 The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, shared thread state, submission idempotency, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
 

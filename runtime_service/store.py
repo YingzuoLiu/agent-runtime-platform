@@ -4,21 +4,42 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from agent.contracts import utc_now
-from domains.travel.state import AgentState
+from agent.contracts import BaseRuntimeState, utc_now
 from .models import RunEvent, RunRecord, RunStatus
+
+
+class StateRegistry(Protocol):
+    def parse_state(
+        self,
+        domain_id: str,
+        schema_version: str,
+        payload: dict[str, Any],
+    ) -> BaseRuntimeState:
+        ...
 
 
 class SQLiteRunStore:
     """Durable run, event and thread-state storage backed by SQLite."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        state_registry: StateRegistry | None = None,
+    ) -> None:
         self.database_path = str(database_path)
         self._lock = threading.RLock()
+        self._state_registry = state_registry
+        self._state_models: dict[tuple[str, str], type[BaseRuntimeState]] = {}
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
+
+    def bind_state_registry(self, state_registry: StateRegistry) -> None:
+        if self._state_registry is not None and self._state_registry is not state_registry:
+            raise ValueError("SQLiteRunStore is already bound to a different state registry")
+        self._state_registry = state_registry
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -36,8 +57,11 @@ class SQLiteRunStore:
                     thread_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agent_version TEXT NOT NULL,
+                    domain_id TEXT NOT NULL DEFAULT 'travel',
+                    schema_version TEXT NOT NULL DEFAULT '1',
                     status TEXT NOT NULL,
                     input_message TEXT NOT NULL,
+                    input_json TEXT,
                     state_json TEXT,
                     output_message TEXT,
                     validation_errors_json TEXT NOT NULL,
@@ -67,6 +91,8 @@ class SQLiteRunStore:
 
                 CREATE TABLE IF NOT EXISTS thread_states (
                     thread_id TEXT PRIMARY KEY,
+                    domain_id TEXT NOT NULL DEFAULT 'travel',
+                    schema_version TEXT NOT NULL DEFAULT '1',
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -82,6 +108,27 @@ class SQLiteRunStore:
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client_request_id "
                     "ON runs(client_request_id) WHERE client_request_id IS NOT NULL"
                 )
+            run_migrations = {
+                "domain_id": "ALTER TABLE runs ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'travel'",
+                "schema_version": "ALTER TABLE runs ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'",
+                "input_json": "ALTER TABLE runs ADD COLUMN input_json TEXT",
+            }
+            for column, statement in run_migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+
+            thread_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(thread_states)").fetchall()
+            }
+            if "domain_id" not in thread_columns:
+                connection.execute(
+                    "ALTER TABLE thread_states ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'travel'"
+                )
+            if "schema_version" not in thread_columns:
+                connection.execute(
+                    "ALTER TABLE thread_states ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'"
+                )
 
     def ping(self) -> None:
         with self._connect() as connection:
@@ -92,11 +139,12 @@ class SQLiteRunStore:
             connection.execute(
                 """
                 INSERT INTO runs (
-                    run_id, thread_id, agent_id, agent_version, status,
-                    input_message, state_json, output_message,
+                    run_id, thread_id, agent_id, agent_version, domain_id,
+                    schema_version, status, input_message, input_json,
+                    state_json, output_message,
                     validation_errors_json, error, attempt, cancel_requested,
                     client_request_id, created_at, updated_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -123,8 +171,9 @@ class SQLiteRunStore:
             cursor = connection.execute(
                 """
                 UPDATE runs SET
-                    thread_id = ?, agent_id = ?, agent_version = ?, status = ?,
-                    input_message = ?, state_json = ?, output_message = ?,
+                    thread_id = ?, agent_id = ?, agent_version = ?, domain_id = ?,
+                    schema_version = ?, status = ?, input_message = ?, input_json = ?,
+                    state_json = ?, output_message = ?,
                     validation_errors_json = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
@@ -214,10 +263,18 @@ class SQLiteRunStore:
         longer RUNNING).
         """
         completed_at = utc_now()
+        if run.state is not None:
+            self._remember_state_model(run.state)
         state_json = run.state.model_dump_json() if run.state is not None else None
         validation_errors_json = json.dumps(run.validation_errors)
 
         with self._lock, self._connect() as connection:
+            self._assert_thread_schema_available(
+                connection,
+                run.thread_id,
+                run.domain_id,
+                run.schema_version,
+            )
             cursor = connection.execute(
                 """
                 UPDATE runs SET
@@ -242,13 +299,22 @@ class SQLiteRunStore:
             if run.state is not None:
                 connection.execute(
                     """
-                    INSERT INTO thread_states (thread_id, state_json, updated_at)
-                    VALUES (?, ?, ?)
+                    INSERT INTO thread_states (
+                        thread_id, domain_id, schema_version, state_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
+                        domain_id = excluded.domain_id,
+                        schema_version = excluded.schema_version,
                         state_json = excluded.state_json,
                         updated_at = excluded.updated_at
                     """,
-                    (run.thread_id, state_json, completed_at),
+                    (
+                        run.thread_id,
+                        run.domain_id,
+                        run.schema_version,
+                        state_json,
+                        completed_at,
+                    ),
                 )
 
             trace_events = len(run.state.execution_trace) if run.state is not None else 0
@@ -310,6 +376,8 @@ class SQLiteRunStore:
         no-op for the same reason `finalize_completed_run` is.
         """
         completed_at = utc_now()
+        if run.state is not None:
+            self._remember_state_model(run.state)
         state_json = run.state.model_dump_json() if run.state is not None else None
         validation_errors_json = json.dumps(run.validation_errors)
 
@@ -317,8 +385,9 @@ class SQLiteRunStore:
             cursor = connection.execute(
                 """
                 UPDATE runs SET
-                    thread_id = ?, agent_id = ?, agent_version = ?, status = ?,
-                    input_message = ?, state_json = ?, output_message = ?,
+                    thread_id = ?, agent_id = ?, agent_version = ?, domain_id = ?,
+                    schema_version = ?, status = ?, input_message = ?, input_json = ?,
+                    state_json = ?, output_message = ?,
                     validation_errors_json = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
@@ -328,8 +397,11 @@ class SQLiteRunStore:
                     run.thread_id,
                     run.agent_id,
                     run.agent_version,
+                    run.domain_id,
+                    run.schema_version,
                     RunStatus.CANCELLED.value,
-                    run.input_message,
+                    self._legacy_input_message(run.input),
+                    json.dumps(run.input),
                     state_json,
                     run.output_message,
                     validation_errors_json,
@@ -421,6 +493,8 @@ class SQLiteRunStore:
                 event.created_at,
             ),
         )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an event id")
         event.event_id = int(cursor.lastrowid)
         return event
 
@@ -446,36 +520,77 @@ class SQLiteRunStore:
             for row in rows
         ]
 
-    def save_thread_state(self, state: AgentState) -> None:
+    def save_thread_state(self, state: BaseRuntimeState) -> None:
+        self._remember_state_model(state)
         with self._lock, self._connect() as connection:
+            self._assert_thread_schema_available(
+                connection,
+                state.thread_id,
+                state.domain_id,
+                state.schema_version,
+            )
             connection.execute(
                 """
-                INSERT INTO thread_states (thread_id, state_json, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO thread_states (
+                    thread_id, domain_id, schema_version, state_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(thread_id) DO UPDATE SET
+                    domain_id = excluded.domain_id,
+                    schema_version = excluded.schema_version,
                     state_json = excluded.state_json,
                     updated_at = excluded.updated_at
                 """,
-                (state.thread_id, state.model_dump_json(), utc_now()),
+                (
+                    state.thread_id,
+                    state.domain_id,
+                    state.schema_version,
+                    state.model_dump_json(),
+                    utc_now(),
+                ),
             )
 
-    def load_thread_state(self, thread_id: str) -> AgentState | None:
+    def load_thread_state(
+        self,
+        thread_id: str,
+        *,
+        domain_id: str | None = None,
+        schema_version: str | None = None,
+    ) -> BaseRuntimeState | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT state_json FROM thread_states WHERE thread_id = ?",
+                "SELECT domain_id, schema_version, state_json FROM thread_states WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
-        return AgentState.model_validate_json(row["state_json"]) if row else None
+        if row is None:
+            return None
+        if domain_id is not None and row["domain_id"] != domain_id:
+            raise ValueError(
+                f"Thread {thread_id!r} belongs to domain {row['domain_id']!r}, not {domain_id!r}"
+            )
+        if schema_version is not None and row["schema_version"] != schema_version:
+            raise ValueError(
+                f"Thread {thread_id!r} uses schema {row['schema_version']!r}, "
+                f"not {schema_version!r}"
+            )
+        return self._deserialize_state(
+            row["domain_id"],
+            row["schema_version"],
+            row["state_json"],
+        )
 
-    @staticmethod
-    def _run_values(run: RunRecord) -> tuple[Any, ...]:
+    def _run_values(self, run: RunRecord) -> tuple[Any, ...]:
+        if run.state is not None:
+            self._remember_state_model(run.state)
         return (
             run.run_id,
             run.thread_id,
             run.agent_id,
             run.agent_version,
+            run.domain_id,
+            run.schema_version,
             run.status.value,
-            run.input_message,
+            self._legacy_input_message(run.input),
+            json.dumps(run.input),
             run.state.model_dump_json() if run.state else None,
             run.output_message,
             json.dumps(run.validation_errors),
@@ -489,18 +604,26 @@ class SQLiteRunStore:
             run.completed_at,
         )
 
-    @staticmethod
-    def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         keys = set(row.keys())
+        domain_id = row["domain_id"] if "domain_id" in keys else "travel"
+        schema_version = row["schema_version"] if "schema_version" in keys else "1"
+        input_payload = (
+            json.loads(row["input_json"])
+            if "input_json" in keys and row["input_json"]
+            else {"user_message": row["input_message"]}
+        )
         return RunRecord(
             run_id=row["run_id"],
             thread_id=row["thread_id"],
             agent_id=row["agent_id"],
             agent_version=row["agent_version"],
+            domain_id=domain_id,
+            schema_version=schema_version,
             status=RunStatus(row["status"]),
-            input_message=row["input_message"],
+            input=input_payload,
             state=(
-                AgentState.model_validate_json(row["state_json"])
+                self._deserialize_state(domain_id, schema_version, row["state_json"])
                 if row["state_json"]
                 else None
             ),
@@ -517,3 +640,52 @@ class SQLiteRunStore:
             started_at=row["started_at"],
             completed_at=row["completed_at"],
         )
+
+    @staticmethod
+    def _legacy_input_message(payload: dict[str, Any] | None) -> str:
+        if payload is None:
+            return ""
+        value = payload.get("user_message")
+        return value if isinstance(value, str) else ""
+
+    def _remember_state_model(self, state: BaseRuntimeState) -> None:
+        self._state_models[(state.domain_id, state.schema_version)] = type(state)
+
+    def _deserialize_state(
+        self,
+        domain_id: str,
+        schema_version: str,
+        state_json: str,
+    ) -> BaseRuntimeState:
+        payload = json.loads(state_json)
+        if self._state_registry is not None:
+            return self._state_registry.parse_state(domain_id, schema_version, payload)
+        state_model = self._state_models.get((domain_id, schema_version))
+        if state_model is None:
+            raise RuntimeError(
+                "A state registry is required to deserialize persisted state "
+                f"for {domain_id}:{schema_version}"
+            )
+        return state_model.model_validate(payload)
+
+    @staticmethod
+    def _assert_thread_schema_available(
+        connection: sqlite3.Connection,
+        thread_id: str,
+        domain_id: str,
+        schema_version: str,
+    ) -> None:
+        existing = connection.execute(
+            "SELECT domain_id, schema_version FROM thread_states WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+        if existing is None:
+            return
+        if (
+            existing["domain_id"] != domain_id
+            or existing["schema_version"] != schema_version
+        ):
+            raise ValueError(
+                f"Thread {thread_id!r} is already bound to "
+                f"{existing['domain_id']}:{existing['schema_version']}"
+            )

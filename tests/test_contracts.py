@@ -183,6 +183,20 @@ def test_runtime_response_whole_object_serialization_keeps_travel_fields():
     assert round_tripped_state.itinerary.total_cost == 8000
 
 
+def test_generic_run_request_keeps_concrete_client_state_until_registry_validation():
+    state = _sample_state(thread_id="request-state-thread")
+    request = RunCreateRequest(
+        thread_id="request-state-thread",
+        input={"user_message": "Change the budget to 9500."},
+        state=state,
+    )
+
+    assert type(request.state) is AgentState
+    assert request.state.destination == "Tokyo"
+    assert request.state.itinerary is not None
+    assert request.state.itinerary.total_cost == 8000
+
+
 # --- Real production chain: RuntimeManager -> SQLite -> reload -------------
 
 
@@ -212,7 +226,10 @@ def test_sqlite_round_trip_preserves_all_travel_specific_fields(tmp_path):
     # Reload from a brand-new SQLiteRunStore instance against the same
     # database file, so this genuinely exercises persistence and not just
     # the in-memory RunRecord already held by the manager.
-    reopened_store = SQLiteRunStore(database_path)
+    reopened_store = SQLiteRunStore(
+        database_path,
+        state_registry=build_default_registry(),
+    )
     persisted_run = reopened_store.get_run(submitted.run_id)
     assert persisted_run is not None
     assert persisted_run.state is not None

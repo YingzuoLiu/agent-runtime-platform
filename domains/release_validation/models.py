@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List
+from typing import ClassVar, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from agent.contracts import BaseRuntimeState
 
 
 class BuildArtifact(BaseModel):
@@ -70,3 +72,23 @@ class ReleaseValidationResult(BaseModel):
     run_id: str
     status: ReleaseValidationStatus
     findings: List[ValidationFinding] = Field(default_factory=list)
+
+
+class ReleaseValidationInput(BaseModel):
+    """Typed input for one managed release-validation run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest: ReleaseManifest
+    resume_interrupted: bool = False
+
+
+class ReleaseValidationState(BaseRuntimeState):
+    """Checkpoint stored by the generic manager for this domain."""
+
+    domain_id: ClassVar[str] = "release-validation"
+    schema_version: ClassVar[str] = "1"
+
+    manifest: ReleaseManifest | None = None
+    result: ReleaseValidationResult | None = None
+    current_stage: str = "initialized"

@@ -1,12 +1,14 @@
-# Travel Agent Runtime Demo
+# Multi-Domain Agent Runtime Demo
 
-A runnable reference implementation of four related layers:
+A runnable reference implementation of five related layers:
 
 1. an **application-level Agent Runtime** for structured multi-turn travel planning;
 2. a small **self-hosted cloud runtime** for durable run lifecycle management;
 3. **policy-enforced registered-tool sandboxing** using restricted subprocess workers.
 4. an optional **evidence-review workflow** with typed handoff, partial results, and
    validator-gated local replanning.
+5. a second **release-validation domain** using the same durable run lifecycle and
+   unified HTTP API while retaining its own fixed-order tool workflow.
 
 The project is offline-first. It does not require an LLM key, Redis, PostgreSQL, or Kubernetes to demonstrate the runtime mechanics.
 
@@ -63,16 +65,11 @@ RuntimeManager ---- AgentRegistry     ToolSandbox ---- ToolRegistry
   |       |- run_events
   |       `- thread_states / checkpoints
   |
-  v
-TravelAgentRuntime
-  |- intent -> StatePatch -> reducer
-  |- partial replan
-  |- optional evidence review workflow
-  |    |- PlanEvidenceBuilder -> role-specific contexts
-  |    |- BudgetChecker + PreferenceReviewer
-  |    `- deterministic FindingReducer -> ReplanDirective
-  |- deterministic validator
-  `- blocker propagation
+  +--> TravelAgentRuntime
+  |      `- typed patch/replan/review/validation
+  |
+  `--> ManagedReleaseValidationRuntime
+         `- fixed-order durable registered-tool workflow
 ```
 
 Both Agent API paths read and write the same durable `thread_states` store. Tool executions may optionally attach their start and finish events to a durable `run_id`.
@@ -111,6 +108,8 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 ### Cloud runtime
 
 - asynchronous `POST /runs` API;
+- typed, registry-discovered input and state schemas for multiple domains;
+- strict domain-state validation that rejects unknown or cross-domain fields;
 - durable `run_id` lifecycle;
 - exact Agent-version pinning;
 - worker-based execution;
@@ -148,7 +147,7 @@ A durable registered-tool workflow using shared runtime infrastructure, with fix
 
 See [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md) for the retry classification, execution/step identity hashing, and interrupted-recovery semantics.
 
-This is fixed-order tool execution, not planner- or LLM-driven tool selection, and it bypasses `RuntimeManager`/`AgentRegistry`/the HTTP API entirely -- see [Agent integration boundary](#agent-integration-boundary) below for what that does and does not mean. All release manifests, artifacts, and compatibility data are synthetic fixtures for this repository.
+This is fixed-order tool execution, not planner- or LLM-driven tool selection. A typed adapter exposes it through `AgentRegistry`, `RuntimeManager`, and the shared `/runs` API, while `SQLiteWorkflowStore` continues to own step-level attempts and evidence. All release manifests, artifacts, and compatibility data are synthetic fixtures for this repository.
 
 ## Quick start
 
@@ -187,14 +186,19 @@ curl -X POST http://127.0.0.1:8000/runs \
   -H "Content-Type: application/json" \
   -d '{
     "thread_id": "tokyo-trip-001",
-    "user_message": "Change the budget to 10000 and avoid red-eye flights.",
     "agent_id": "travel-agent",
     "agent_version": "0.5.0",
+    "input": {
+      "user_message": "Change the budget to 10000 and avoid red-eye flights."
+    },
     "client_request_id": "request-20260713-001"
   }'
 ```
 
-Repeating the same `client_request_id` returns the existing run instead of creating a duplicate.
+The legacy top-level `user_message` remains accepted for Travel clients. New clients use the
+domain-neutral `input` object shown above. `GET /agents` publishes each registered runtime's
+`domain_id`, `schema_version`, and JSON input schema. Repeating the same
+`client_request_id` returns the existing run instead of creating a duplicate.
 
 `travel-agent:0.5.0` opts into the evidence-review path. The original
 `travel-agent:0.3.0` version remains registered and unchanged for controlled comparisons.
@@ -204,6 +208,19 @@ curl http://127.0.0.1:8000/runs/<run_id>
 curl http://127.0.0.1:8000/runs/<run_id>/events
 curl -N http://127.0.0.1:8000/runs/<run_id>/events/stream
 curl -X POST http://127.0.0.1:8000/runs/<run_id>/cancel
+```
+
+The release-validation domain uses the same lifecycle endpoints:
+
+```bash
+curl -X POST http://127.0.0.1:8000/runs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_id": "release-2.4.0",
+    "agent_id": "release-validation",
+    "agent_version": "1.0.0",
+    "input": {"manifest": {"...": "typed synthetic manifest fields"}}
+  }'
 ```
 
 ## Sandboxed tool API
@@ -266,7 +283,7 @@ See [`docs/cloud-runtime.md`](docs/cloud-runtime.md) for the detailed execution 
 
 ## Agent integration boundary
 
-The sandbox is exposed as an independent control-plane API, and it is also used directly by the fixed-order release-validation workflow (see above). Neither of those is a planner- or LLM-driven tool loop: the release-validation workflow always calls its six tools in the same hardcoded order, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop at all.
+The sandbox is exposed as an independent control-plane API, and it is also used by the fixed-order release-validation workflow through its managed runtime adapter. Neither path is a planner- or LLM-driven tool loop: release validation always calls its six tools in the same hardcoded order, and `TravelAgentRuntime` still does not invoke tools from an LLM or planner-driven tool loop.
 
 This keeps the current threat model narrow and testable: external clients may request only registered tools through the API, and the release-validation workflow only ever selects from its own fixed tool sequence. A later Agent tool-calling integration -- dynamic, planner-selected tool calls driven by Travel or another domain -- must still add per-Agent tool permissions, prompt-injection defenses, approval policies for side effects, per-call idempotency, and trace linkage between planner decisions and sandbox executions.
 
@@ -276,7 +293,9 @@ Cancellation is cooperative: code already executing inside an Agent step is not 
 
 ## Restart recovery
 
-At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again.
+At startup, `RuntimeManager` requeues durable records left in `queued` or `running`. A previously running task receives a `run.recovered` event and executes again. The execution context marks startup-recovered work so the fixed-order release-validation adapter explicitly recovers a persisted `running` step instead of misclassifying it as a new concurrent execution.
+
+Terminal `failed` records are not recoverable and remain terminal under idempotent resubmission.
 
 This is safe for the deterministic demo. Booking and payment tools would additionally require per-tool-call idempotency records.
 
@@ -293,6 +312,8 @@ The suite covers:
 - cancellation before start and after an execution boundary;
 - restart recovery and two-worker execution;
 - idempotent run submission;
+- domain-specific input rejection before queueing and multi-domain state round-trips;
+- release-validation execution through the shared run, event, and checkpoint APIs;
 - tool allowlisting and argument-schema rejection;
 - subprocess timeout termination;
 - parent-secret environment scrubbing;
@@ -333,6 +354,6 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - no real flight, hotel, payment, or booking API.
 - no real LLM preference analyzer by default; the semantic analyzer is an injectable boundary;
 - Schedule/Geography reviewers and workflow-task persistence are not part of the first slice;
-- the release-validation workflow has a fixed step order (no dependency graph or scheduler), no selective replay or input-change invalidation, no dynamic/LLM-driven tool selection, and no `RuntimeManager`/`AgentRegistry`/HTTP integration -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
+- the release-validation workflow has a fixed step order (no dependency graph or scheduler), no selective replay or input-change invalidation, and no dynamic/LLM-driven tool selection -- see [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md).
 
 > An evidence-driven Agent Runtime prototype that connects behavioral evaluation with structured state, deterministic validation, durable execution lifecycle, checkpoint recovery, cancellation safety, idempotent submission, event observability, and policy-enforced registered-tool sandboxing.
