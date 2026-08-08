@@ -37,8 +37,8 @@ class BaseRuntimeState(BaseModel):
     they identify which concrete state type a serialized blob belongs to,
     but they are routing metadata about the *type*, not part of the
     state's own data, so they must not be duplicated into every row's
-    `state_json`. A later phase's registry/store persists them as separate
-    database columns instead. Concrete subclasses (e.g. `AgentState`) set
+    `state_json`. The registry/store persists them as separate routing
+    columns instead. Concrete subclasses (e.g. `AgentState`) set
     both as real class attributes.
     """
 
@@ -50,6 +50,7 @@ class BaseRuntimeState(BaseModel):
 
 
 StateT = TypeVar("StateT", bound=BaseRuntimeState)
+InputT = TypeVar("InputT", bound=BaseModel, contravariant=True)
 
 
 class RuntimeResponse(BaseModel, Generic[StateT]):
@@ -73,14 +74,18 @@ class RuntimeResponse(BaseModel, Generic[StateT]):
     validation_errors: List[str]
 
 
-class RuntimeProtocol(Protocol[StateT]):
-    """Structural contract a domain runtime is expected to satisfy.
+class RuntimeExecutionContext(BaseModel):
+    """Stable identifiers supplied by ``RuntimeManager`` to one execution."""
 
-    Deliberately minimal for this phase: only the two capabilities that
-    already exist in some form today (constructing a fresh state for a
-    thread, and processing one user message). Approval/resume,
-    disposition, and memory-provider hooks belong to later phases and must
-    not be anticipated here.
+    run_id: str
+    thread_id: str
+
+
+class RuntimeProtocol(Protocol[StateT]):
+    """Legacy message-oriented contract retained for application callers.
+
+    Durable multi-domain execution uses ``ManagedRuntimeProtocol`` below.
+    Approval, disposition, and memory-provider hooks remain out of scope.
     """
 
     def initial_state(self, thread_id: str) -> StateT:
@@ -88,5 +93,24 @@ class RuntimeProtocol(Protocol[StateT]):
 
     def handle_user_message(
         self, state: StateT, user_message: str
+    ) -> RuntimeResponse[StateT]:
+        ...
+
+
+class ManagedRuntimeProtocol(Protocol[StateT, InputT]):
+    """Domain-neutral contract used by the durable runtime manager.
+
+    Domain runtimes own their concrete input and state models. The manager
+    supplies only execution identity and never branches on a domain name.
+    """
+
+    def initial_state(self, thread_id: str) -> StateT:
+        ...
+
+    def execute(
+        self,
+        state: StateT,
+        runtime_input: InputT,
+        context: RuntimeExecutionContext,
     ) -> RuntimeResponse[StateT]:
         ...

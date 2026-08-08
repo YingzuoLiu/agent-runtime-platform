@@ -11,6 +11,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from domains.release_validation.runtime import ReleaseValidationWorkflow
+from domains.release_validation.tools import build_release_validation_tool_registry
 from domains.travel.state import AgentState
 from domains.travel.runtime import TravelAgentRuntime
 from runtime_service import (
@@ -27,6 +29,7 @@ from runtime_service import (
     build_default_registry,
     build_default_tool_registry,
 )
+from runtime_service.workflow_store import SQLiteWorkflowStore
 
 
 class AgentMessageRequest(BaseModel):
@@ -49,16 +52,24 @@ def create_app(
     database_path: str | Path | None = None,
     worker_count: int | None = None,
 ) -> FastAPI:
-    resolved_database_path = Path(
-        database_path or os.getenv("RUNTIME_DB_PATH", "runtime_data/runtime.db")
-    )
+    database_value = database_path
+    if database_value is None:
+        database_value = os.getenv("RUNTIME_DB_PATH") or "runtime_data/runtime.db"
+    resolved_database_path = Path(database_value)
     resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
-    registry = build_default_registry()
     tool_registry = build_default_tool_registry()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        store = SQLiteRunStore(resolved_database_path)
+        workflow_store = SQLiteWorkflowStore(resolved_database_path)
+        release_workflow = ReleaseValidationWorkflow(
+            workflow_store,
+            ToolSandbox(build_release_validation_tool_registry()),
+        )
+        registry = build_default_registry(
+            release_validation_workflow=release_workflow,
+        )
+        store = SQLiteRunStore(resolved_database_path, state_registry=registry)
         manager = RuntimeManager(
             store=store,
             registry=registry,
@@ -74,12 +85,12 @@ def create_app(
         manager.stop()
 
     app = FastAPI(
-        title="Travel Agent Runtime Demo",
+        title="Multi-Domain Agent Runtime Demo",
         description=(
-            "A stateful travel agent plus durable run lifecycle and policy-enforced "
-            "sandboxed tool execution."
+            "Typed domain runtimes sharing one durable run lifecycle and unified API, "
+            "plus policy-enforced sandboxed tool execution."
         ),
-        version="0.4.0",
+        version="0.6.0",
         lifespan=lifespan,
     )
 
@@ -145,7 +156,11 @@ def create_app(
         runtime = TravelAgentRuntime(retry_limit=2)
         state_value = (
             payload.state
-            or store.load_thread_state(payload.thread_id)
+            or store.load_thread_state(
+                payload.thread_id,
+                domain_id=AgentState.domain_id,
+                schema_version=AgentState.schema_version,
+            )
             or AgentState(thread_id=payload.thread_id)
         )
         result = runtime.handle_user_message(state_value, payload.user_message)
@@ -160,7 +175,7 @@ def create_app(
     def create_run(payload: RunCreateRequest, request: Request) -> RunRecord:
         try:
             return get_manager(request).submit(payload)
-        except KeyError as exc:
+        except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/runs/{run_id}", response_model=RunRecord)
@@ -220,12 +235,24 @@ def create_app(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.get("/threads/{thread_id}/state", response_model=AgentState)
-    def get_thread_state(thread_id: str, request: Request) -> AgentState:
-        state_value = request.app.state.run_store.load_thread_state(thread_id)
+    @app.get("/threads/{thread_id}/state")
+    def get_thread_state(
+        thread_id: str,
+        request: Request,
+        domain_id: str = Query(default="travel"),
+        schema_version: str = Query(default="1"),
+    ) -> dict:
+        try:
+            state_value = request.app.state.run_store.load_thread_state(
+                thread_id,
+                domain_id=domain_id,
+                schema_version=schema_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if state_value is None:
             raise HTTPException(status_code=404, detail="Thread state not found")
-        return state_value
+        return state_value.model_dump(mode="json")
 
     return app
 

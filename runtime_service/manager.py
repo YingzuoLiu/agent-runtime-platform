@@ -6,8 +6,7 @@ import threading
 import traceback
 from uuid import uuid4
 
-from agent.contracts import utc_now
-from domains.travel.state import AgentState
+from agent.contracts import RuntimeExecutionContext, utc_now
 from .models import RunCreateRequest, RunRecord, RunStatus
 from .registry import AgentRegistry
 from .store import SQLiteRunStore
@@ -21,6 +20,7 @@ class RuntimeManager:
             raise ValueError("worker_count must be at least 1")
         self.store = store
         self.registry = registry
+        self.store.bind_state_registry(registry)
         self.worker_count = worker_count
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
@@ -61,7 +61,12 @@ class RuntimeManager:
             self._started = False
 
     def submit(self, request: RunCreateRequest) -> RunRecord:
-        self.registry.resolve(request.agent_id, request.agent_version)
+        registration = self.registry.registration(request.agent_id, request.agent_version)
+        assert request.input is not None
+        runtime_input = registration.parse_input(request.input)
+        state = registration.parse_state(request.state) if request.state is not None else None
+        if state is not None and state.thread_id != request.thread_id:
+            raise ValueError("state.thread_id must match request.thread_id")
         if request.client_request_id:
             existing = self.store.get_run_by_client_request_id(request.client_request_id)
             if existing is not None:
@@ -71,9 +76,11 @@ class RuntimeManager:
             thread_id=request.thread_id,
             agent_id=request.agent_id,
             agent_version=request.agent_version,
+            domain_id=registration.domain_id,
+            schema_version=registration.schema_version,
             status=RunStatus.QUEUED,
-            input_message=request.user_message,
-            state=request.state,
+            input=runtime_input.model_dump(mode="json"),
+            state=state,
             client_request_id=request.client_request_id,
         )
         try:
@@ -91,6 +98,8 @@ class RuntimeManager:
             {
                 "agent_id": run.agent_id,
                 "agent_version": run.agent_version,
+                "domain_id": run.domain_id,
+                "schema_version": run.schema_version,
                 "thread_id": run.thread_id,
                 "client_request_id": run.client_request_id,
             },
@@ -137,14 +146,33 @@ class RuntimeManager:
         self.store.append_event(run.run_id, "run.started", {"attempt": run.attempt})
         try:
             runtime = self.registry.resolve(run.agent_id, run.agent_version)
-            persisted_state = self.store.load_thread_state(run.thread_id)
-            state = run.state or persisted_state or AgentState(thread_id=run.thread_id)
+            registration = self.registry.registration(run.agent_id, run.agent_version)
+            if (
+                run.domain_id != registration.domain_id
+                or run.schema_version != registration.schema_version
+            ):
+                raise ValueError(
+                    "Persisted run schema does not match its registered runtime: "
+                    f"{run.domain_id}:{run.schema_version}"
+                )
+            persisted_state = self.store.load_thread_state(
+                run.thread_id,
+                domain_id=run.domain_id,
+                schema_version=run.schema_version,
+            )
+            state = run.state or persisted_state or runtime.initial_state(run.thread_id)
             self.store.append_event(
                 run.run_id,
                 "checkpoint.loaded",
                 {"source": "request" if run.state is not None else "thread_store" if persisted_state is not None else "new_state"},
             )
-            result = runtime.handle_user_message(state, run.input_message)
+            assert run.input is not None
+            runtime_input = registration.parse_input(run.input)
+            result = runtime.execute(
+                state,
+                runtime_input,
+                RuntimeExecutionContext(run_id=run.run_id, thread_id=run.thread_id),
+            )
             run.state = result.state
             run.output_message = result.message
             run.validation_errors = result.validation_errors

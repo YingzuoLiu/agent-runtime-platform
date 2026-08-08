@@ -4,8 +4,9 @@ A synthetic, offline, fixed-order registered-tool workflow built on the
 same durable persistence (`SQLiteWorkflowStore`) and registered-tool
 sandbox (`ToolSandbox`) as the rest of `runtime_service`. It exists to
 prove those two pieces are genuinely domain-agnostic: this domain has no
-relationship to Travel, does not import `AgentState`, and does not go
-through `RuntimeManager` or `AgentRegistry`.
+relationship to Travel and does not import `AgentState`. Phase 3A adds a
+typed adapter that registers the workflow with `AgentRegistry` and runs it
+through `RuntimeManager` and the shared `/runs` HTTP lifecycle.
 
 All manifests, artifacts, test results, and compatibility data are
 synthetic fixtures for this repository. This is not a real release
@@ -138,9 +139,11 @@ verdict could be reached."
   or scheduler.
 - Tool selection is fixed at each step; nothing here is planner- or
   LLM-driven.
-- This workflow bypasses `RuntimeManager` and `AgentRegistry` entirely --
-  it is not evidence that either has been generalized to run two domains.
-- There is no HTTP endpoint for this workflow.
+- The core `ReleaseValidationWorkflow` still owns only fixed step execution;
+  `ManagedReleaseValidationRuntime` is the explicit adapter to the generic
+  manager. This separation does not make the workflow planner-driven.
+- The workflow is submitted through the shared `/runs` endpoint; there is no
+  release-specific execution endpoint.
 - Interrupted-step recovery is explicit (`resume_interrupted=True`), not
   automatic crash detection.
 - There is no selective replay: an input mismatch is rejected outright,

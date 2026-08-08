@@ -2,7 +2,7 @@ import threading
 import time
 
 from agent.contracts import RuntimeResponse
-from domains.travel.runtime import TravelAgentRuntime
+from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
 from domains.travel.state import AgentState
 from runtime_service import (
     AgentRegistry,
@@ -45,6 +45,8 @@ def blocking_registry(started: threading.Event, release: threading.Event) -> Age
         "0.3.0",
         lambda: BlockingRuntime(started, release),
         description="Blocking test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
     )
     return registry
 
@@ -440,7 +442,7 @@ def test_store_survives_new_store_instance(tmp_path):
         completed = wait_for_terminal(manager, submitted.run_id)
     finally:
         manager.stop()
-    reopened = SQLiteRunStore(database_path)
+    reopened = SQLiteRunStore(database_path, state_registry=build_default_registry())
     persisted = reopened.get_run(completed.run_id)
     assert persisted is not None
     assert persisted.status == RunStatus.COMPLETED
