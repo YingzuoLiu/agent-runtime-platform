@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient as FastAPITestClient
 from api.main import create_app as create_runtime_app
 from runtime_service import (
     ApiKeyCredential,
+    AuthorizationError,
+    RuntimePermission,
     RuntimeRole,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
@@ -58,6 +60,15 @@ class TestClient(FastAPITestClient):
         headers = dict(kwargs.pop("headers", {}))
         headers.update(authorization_headers(api_key))
         super().__init__(app, headers=headers, **kwargs)
+
+
+class DenyPermissionAuthorizer:
+    def __init__(self, denied_permission: RuntimePermission) -> None:
+        self._denied_permission = denied_permission
+
+    def authorize(self, _principal, permission: RuntimePermission) -> None:
+        if permission == self._denied_permission:
+            raise AuthorizationError("Operation not permitted")
 
 
 def valid_release_manifest() -> dict:
@@ -1028,3 +1039,44 @@ def test_cross_tenant_resource_is_hidden_before_viewer_action_denial(tmp_path):
     assert linked_tool.status_code == 404
     assert cancel.json() == {"detail": "Run not found"}
     assert linked_tool.json() == {"detail": "Run not found"}
+
+
+@pytest.mark.parametrize(
+    ("path_template", "denied_permission"),
+    [
+        ("/runs/{run_id}", RuntimePermission.RUNS_READ),
+        ("/runs/{run_id}/events", RuntimePermission.RUN_EVENTS_READ),
+        ("/runs/{run_id}/events/stream", RuntimePermission.RUN_EVENTS_READ),
+    ],
+)
+def test_run_is_hidden_before_read_permission_denial(
+    tmp_path,
+    path_template,
+    denied_permission,
+):
+    app = create_app(
+        database_path=tmp_path / "runtime.db",
+        authorizer=DenyPermissionAuthorizer(denied_permission),
+    )
+    with TestClient(app) as client:
+        tenant_a_run = client.post(
+            "/runs",
+            json={"thread_id": "tenant-a-read-denial", "user_message": "Plan Tokyo"},
+        )
+        tenant_b_run = client.post(
+            "/runs",
+            headers=authorization_headers(TENANT_B_KEY),
+            json={"thread_id": "tenant-b-hidden-read", "user_message": "Plan Tokyo"},
+        )
+
+        same_tenant = client.get(
+            path_template.format(run_id=tenant_a_run.json()["run_id"]),
+        )
+        cross_tenant = client.get(
+            path_template.format(run_id=tenant_b_run.json()["run_id"]),
+        )
+
+    assert same_tenant.status_code == 403
+    assert same_tenant.json() == {"detail": "Operation not permitted"}
+    assert cross_tenant.status_code == 404
+    assert cross_tenant.json() == {"detail": "Run not found"}

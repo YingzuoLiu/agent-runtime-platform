@@ -29,10 +29,10 @@ from runtime_service import (
     ApiKeyCredential,
     RunCreateRequest,
     RuntimeManager,
+    RuntimeRole,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
-    RuntimeRole,
     build_default_registry,
 )
 

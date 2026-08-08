@@ -183,12 +183,11 @@ def create_app(
         principal: Principal = Depends(require_principal),
     ) -> ToolExecutionResult:
         store: SQLiteRunStore = request.app.state.run_store
-        if payload.run_id is not None:
-            if (
-                store.get_run_for_tenant(payload.run_id, principal.tenant_id)
-                is None
-            ):
-                raise HTTPException(status_code=404, detail="Run not found")
+        if (
+            payload.run_id is not None
+            and store.get_run_for_tenant(payload.run_id, principal.tenant_id) is None
+        ):
+            raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.TOOLS_EXECUTE)
         if payload.run_id is not None:
             store.append_event(
@@ -272,13 +271,13 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
-        require_permission(principal, RuntimePermission.RUNS_READ)
         run = get_manager(request).get_run(
             run_id,
             tenant_context=principal.tenant_context,
         )
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUNS_READ)
         return run
 
     @app.post("/runs/{run_id}/cancel", response_model=RunRecord)
@@ -311,7 +310,6 @@ def create_app(
         principal: Principal = Depends(require_principal),
         after_sequence: int = Query(default=0, ge=0),
     ) -> list[RunEvent]:
-        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
         if (
             get_manager(request).get_run(
                 run_id,
@@ -320,6 +318,7 @@ def create_app(
             is None
         ):
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
         return request.app.state.run_store.list_events_for_tenant(
             run_id,
             principal.tenant_id,
@@ -333,13 +332,13 @@ def create_app(
         principal: Principal = Depends(require_principal),
         after_sequence: int = Query(default=0, ge=0),
     ) -> StreamingResponse:
-        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
         manager = get_manager(request)
         if (
             manager.get_run(run_id, tenant_context=principal.tenant_context)
             is None
         ):
             raise HTTPException(status_code=404, detail="Run not found")
+        require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
 
         async def event_stream():
             sequence = after_sequence
