@@ -3,9 +3,12 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, SerializeAsAny, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
 from agent.contracts import BaseRuntimeState, utc_now
+
+
+LEGACY_TENANT_ID = "legacy"
 
 
 class RunStatus(str, Enum):
@@ -21,6 +24,8 @@ class RunStatus(str, Enum):
 
 
 class RunCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     thread_id: str = Field(..., min_length=1)
     agent_id: str = "travel-agent"
     agent_version: str = "0.3.0"
@@ -42,6 +47,7 @@ class RunCreateRequest(BaseModel):
 
 class RunRecord(BaseModel):
     run_id: str
+    tenant_id: str = Field(default=LEGACY_TENANT_ID, min_length=1, max_length=200)
     thread_id: str
     agent_id: str
     agent_version: str

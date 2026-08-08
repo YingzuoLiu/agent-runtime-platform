@@ -37,6 +37,8 @@ The later engineering work extends that same objective across additional boundar
 - durable run records make execution state observable across requests and restarts;
 - atomic completion and cancellation updates prevent stale writes from hiding races;
 - idempotent submission prevents network retries from silently duplicating work;
+- API-key authentication derives a trusted tenant context before control-plane work begins;
+- tenant-qualified persistence prevents runs, events, checkpoints, and replay evidence from crossing tenant boundaries;
 - tool allowlists and schema validation prevent unapproved execution;
 - subprocess timeouts, resource limits, and `tini` prevent runaway work from leaking resources.
 
@@ -46,6 +48,9 @@ The engineering layer is therefore not a replacement for the evaluation work. It
 
 ```text
 Client
+  |
+  v
+Bearer API key -> Principal / TenantContext
   |
   v
 FastAPI control API
@@ -61,9 +66,9 @@ RuntimeManager ---- AgentRegistry     ToolSandbox ---- ToolRegistry
   +---- worker queue                     `- restricted subprocess
   |
   +---- SQLiteRunStore
-  |       |- runs
+  |       |- tenant-scoped runs
   |       |- run_events
-  |       `- thread_states / checkpoints
+  |       `- tenant-scoped thread_states / checkpoints
   |
   +--> TravelAgentRuntime
   |      `- typed patch/replan/review/validation
@@ -72,7 +77,7 @@ RuntimeManager ---- AgentRegistry     ToolSandbox ---- ToolRegistry
          `- durable DAG + selective replay
 ```
 
-Both Agent API paths read and write the same durable `thread_states` store. Tool executions may optionally attach their start and finish events to a durable `run_id`.
+Both Agent API paths read and write the same durable `thread_states` store. Authenticated tenant context scopes run lookup, idempotency, checkpoints, events, tool-to-run linkage, and selective-replay sources. Tool executions may optionally attach their start and finish events to a durable `run_id` visible to that tenant.
 
 ## What the project demonstrates
 
@@ -109,6 +114,8 @@ contracts, retry semantics, offline semantic-analyzer boundary, and deliberate n
 
 - asynchronous `POST /runs` API;
 - typed, registry-discovered input and state schemas for multiple domains;
+- fail-closed Bearer API-key authentication with typed `Principal` and `TenantContext`;
+- tenant-scoped runs, idempotency keys, events, checkpoints, and replay references;
 - strict domain-state validation that rejects unknown or cross-domain fields;
 - durable `run_id` lifecycle;
 - exact Agent-version pinning;
@@ -160,8 +167,15 @@ python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 pytest -q
+export RUNTIME_API_KEY="replace-with-a-random-local-key"
+export RUNTIME_API_KEYS_JSON='[{"credential_id":"local-demo","api_key":"replace-with-a-random-local-key","tenant_id":"tenant-demo","subject_id":"local-user"}]'
 uvicorn api.main:app --reload
 ```
+
+`RUNTIME_API_KEYS_JSON` configures the local Phase 4A credential provider. If it is absent or
+empty, every protected endpoint fails closed with `401`; only `/health` and `/ready` remain
+public. Plaintext keys are hashed when loaded and are not retained by the authenticator. This
+local provider is deliberately separate from the later external secret-provider slice.
 
 Health endpoints:
 
@@ -174,6 +188,7 @@ curl http://127.0.0.1:8000/ready
 
 ```bash
 curl -X POST http://127.0.0.1:8000/agent/message \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "thread_id": "tokyo-trip-001",
@@ -187,6 +202,7 @@ This endpoint executes in the request process but saves its updated state to the
 
 ```bash
 curl -X POST http://127.0.0.1:8000/runs \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "thread_id": "tokyo-trip-001",
@@ -202,22 +218,23 @@ curl -X POST http://127.0.0.1:8000/runs \
 The legacy top-level `user_message` remains accepted for Travel clients. New clients use the
 domain-neutral `input` object shown above. `GET /agents` publishes each registered runtime's
 `domain_id`, `schema_version`, and JSON input schema. Repeating the same
-`client_request_id` returns the existing run instead of creating a duplicate.
+`client_request_id` returns the existing run for the authenticated tenant instead of creating a duplicate.
 
 `travel-agent:0.5.0` opts into the evidence-review path. The original
 `travel-agent:0.3.0` version remains registered and unchanged for controlled comparisons.
 
 ```bash
-curl http://127.0.0.1:8000/runs/<run_id>
-curl http://127.0.0.1:8000/runs/<run_id>/events
-curl -N http://127.0.0.1:8000/runs/<run_id>/events/stream
-curl -X POST http://127.0.0.1:8000/runs/<run_id>/cancel
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/runs/<run_id>
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/runs/<run_id>/events
+curl -N -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/runs/<run_id>/events/stream
+curl -X POST -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/runs/<run_id>/cancel
 ```
 
 The release-validation domain uses the same lifecycle endpoints:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/runs \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "thread_id": "release-2.4.0",
@@ -235,6 +252,7 @@ Selective replay also uses `POST /runs`, creating a new immutable child run:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/runs \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "thread_id": "release-replay-2.4.0",
@@ -255,13 +273,14 @@ curl -X POST http://127.0.0.1:8000/runs \
 List the only tools clients are allowed to request:
 
 ```bash
-curl http://127.0.0.1:8000/tools
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/tools
 ```
 
 Execute a deterministic tool:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/tools/route_cost_summary/execute \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "run_id": null,
@@ -283,7 +302,18 @@ rank_trip_options
 
 ## Security boundary
 
-The current backend is a **registered-tool process sandbox**, not a general untrusted-code service.
+Every control-plane endpoint except `/health` and `/ready` authenticates a Bearer API key before
+request execution. The local credential provider maps the key to an immutable `Principal` and
+`TenantContext`; `tenant_id` is not accepted from request bodies. Cross-tenant run, cancellation,
+event, stream, checkpoint, tool-linkage, and replay-source lookups return the same `404` shape as
+an unknown resource. SQLite uniqueness and checkpoint keys are tenant-qualified, so tenants may
+reuse the same `thread_id` and `client_request_id` without sharing state.
+
+This is authentication and tenant isolation, not full authorization. RBAC, per-Agent/per-tool
+grants, quotas, key rotation, and an external/AWS-backed secret provider remain later Phase 4
+slices.
+
+The execution backend is a **registered-tool process sandbox**, not a general untrusted-code service.
 
 It protects the runtime from accidental or unauthorized tool selection, malformed inputs, inherited API keys, runaway execution time, and excessive POSIX resource use. Registered tools remain trusted service code.
 
@@ -339,6 +369,9 @@ The suite covers:
 - cancellation before start and after an execution boundary;
 - restart recovery and two-worker execution;
 - idempotent run submission;
+- fail-closed API-key authentication and typed principal/tenant derivation;
+- tenant isolation across runs, idempotency, events, SSE, checkpoints, tool linkage, and replay sources;
+- additive migration of pre-tenant SQLite records into the reserved `legacy` tenant;
 - domain-specific input rejection before queueing and multi-domain state round-trips;
 - release-validation execution through the shared run, event, and checkpoint APIs;
 - DAG validation, deterministic topology, descendant expansion, source immutability, and input-safe selective replay;
@@ -352,6 +385,10 @@ GitHub Actions runs compile checks, Ruff, scoped mypy, and pytest on Python 3.11
 ## Deployment boundary
 
 SQLite and the in-process queue keep the project self-contained, but they are not horizontally scalable. The Kubernetes manifest therefore uses one replica and persistent storage.
+
+Docker Compose requires `RUNTIME_API_KEYS_JSON` from the caller environment. The Kubernetes
+manifest expects the same JSON in Secret `travel-agent-runtime-auth`, key `api-keys.json`; the
+repository does not contain or generate credential material.
 
 Before increasing replicas, replace them with:
 
@@ -371,8 +408,8 @@ This is a cloud-runtime prototype, not a complete Agent Platform:
 - SQLite instead of PostgreSQL;
 - local queue instead of distributed workers;
 - no worker lease or heartbeat;
-- no authentication, tenant isolation, or quotas;
-- no external secret manager integration;
+- no RBAC, per-Agent/per-tool grants, or quotas;
+- local static API-key configuration only; no rotation workflow or external secret manager integration;
 - no tool-call idempotency for the ad-hoc `/tools/{tool}/execute` API; the release-validation workflow has one, scoped to its own `SQLiteWorkflowStore` attempt-token claims;
 - process sandbox does not isolate host networking or the full host filesystem;
 - POSIX resource limits are weaker on Windows;

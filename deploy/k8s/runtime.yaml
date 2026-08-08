@@ -31,7 +31,7 @@ spec:
         runAsUser: 10001
       containers:
         - name: runtime
-          image: your-registry/travel-agent-runtime:0.3.0
+          image: your-registry/travel-agent-runtime:0.8.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -41,6 +41,11 @@ spec:
               value: /app/runtime_data/runtime.db
             - name: RUNTIME_WORKER_COUNT
               value: "1"
+            - name: RUNTIME_API_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: travel-agent-runtime-auth
+                  key: api-keys.json
           resources:
             requests:
               cpu: 100m

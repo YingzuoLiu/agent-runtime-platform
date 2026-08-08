@@ -1,10 +1,48 @@
 import time
 
-from fastapi.testclient import TestClient
+import pytest
+from fastapi.testclient import TestClient as FastAPITestClient
 
-from api.main import create_app
-from runtime_service import SQLiteRunStore
+from api.main import create_app as create_runtime_app
+from runtime_service import ApiKeyCredential, SQLiteRunStore, StaticApiKeyAuthenticator
 from runtime_service.workflow_store import SQLiteWorkflowStore
+
+
+TENANT_A_KEY = "test-key-tenant-a"
+TENANT_B_KEY = "test-key-tenant-b"
+TENANT_A_ID = "tenant-a"
+TENANT_B_ID = "tenant-b"
+TEST_AUTHENTICATOR = StaticApiKeyAuthenticator(
+    [
+        ApiKeyCredential(
+            credential_id="credential-a",
+            api_key=TENANT_A_KEY,
+            tenant_id=TENANT_A_ID,
+            subject_id="subject-a",
+        ),
+        ApiKeyCredential(
+            credential_id="credential-b",
+            api_key=TENANT_B_KEY,
+            tenant_id=TENANT_B_ID,
+            subject_id="subject-b",
+        ),
+    ]
+)
+
+
+def authorization_headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def create_app(**kwargs):
+    return create_runtime_app(authenticator=TEST_AUTHENTICATOR, **kwargs)
+
+
+class TestClient(FastAPITestClient):
+    def __init__(self, app, *, api_key: str = TENANT_A_KEY, **kwargs):
+        headers = dict(kwargs.pop("headers", {}))
+        headers.update(authorization_headers(api_key))
+        super().__init__(app, headers=headers, **kwargs)
 
 
 def valid_release_manifest() -> dict:
@@ -32,10 +70,19 @@ def valid_release_manifest() -> dict:
     }
 
 
-def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
+def wait_for_run(
+    client: TestClient,
+    run_id: str,
+    timeout: float = 3.0,
+    *,
+    api_key: str = TENANT_A_KEY,
+) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        body = client.get(f"/runs/{run_id}").json()
+        body = client.get(
+            f"/runs/{run_id}",
+            headers=authorization_headers(api_key),
+        ).json()
         if body["status"] in {"completed", "failed", "cancelled"}:
             return body
         time.sleep(0.02)
@@ -74,8 +121,8 @@ def test_legacy_agent_message_rejects_mismatched_explicit_state_thread(tmp_path)
     assert response.status_code == 422
     assert response.json()["detail"] == "state.thread_id must match request.thread_id"
     store = SQLiteRunStore(database_path)
-    assert store.load_thread_state("request-thread") is None
-    assert store.load_thread_state("different-thread") is None
+    assert store.load_thread_state("request-thread", tenant_id=TENANT_A_ID) is None
+    assert store.load_thread_state("different-thread", tenant_id=TENANT_A_ID) is None
 
 
 def test_sync_and_async_endpoints_share_thread_state(tmp_path):
@@ -397,6 +444,7 @@ def test_release_validation_replay_contract_rejects_duplicate_steps_before_queue
     assert response.status_code == 422
     assert (
         SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
             "duplicate-replay-steps-request"
         )
         is None
@@ -428,6 +476,7 @@ def test_release_validation_v1_contract_rejects_phase3b_replay_before_queueing(t
     assert "Extra inputs are not permitted" in response.json()["detail"]
     assert (
         SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
             "legacy-replay-contract-request"
         )
         is None
@@ -497,6 +546,7 @@ def test_unified_api_rejects_release_state_for_travel_agent(tmp_path):
     assert "Extra inputs are not permitted" in response.json()["detail"]
     assert (
         SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
             "wrong-domain-state-request"
         )
         is None
@@ -530,3 +580,215 @@ def test_same_thread_id_cannot_silently_cross_domain_checkpoint_boundary(tmp_pat
     assert release_result["status"] == "failed"
     assert "belongs to domain 'travel'" in release_result["error"]
     assert travel_checkpoint.json()["destination"] == "Tokyo"
+
+
+@pytest.mark.parametrize(
+    "method,path,payload",
+    [
+        ("GET", "/agents", None),
+        ("GET", "/tools", None),
+        (
+            "POST",
+            "/tools/route_cost_summary/execute",
+            {"arguments": {}},
+        ),
+        (
+            "POST",
+            "/agent/message",
+            {"thread_id": "unauthenticated", "user_message": "Plan Tokyo"},
+        ),
+        (
+            "POST",
+            "/runs",
+            {"thread_id": "unauthenticated", "user_message": "Plan Tokyo"},
+        ),
+        ("GET", "/runs/run_missing", None),
+        ("POST", "/runs/run_missing/cancel", None),
+        ("GET", "/runs/run_missing/events", None),
+        ("GET", "/runs/run_missing/events/stream", None),
+        ("GET", "/threads/thread-missing/state", None),
+    ],
+)
+def test_control_plane_endpoints_require_authentication(tmp_path, method, path, payload):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with FastAPITestClient(app) as client:
+        response = client.request(method, path, json=payload)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or missing API key"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_health_and_readiness_remain_public(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with FastAPITestClient(app) as client:
+        health = client.get("/health")
+        ready = client.get("/ready")
+
+    assert health.json() == {"status": "ok"}
+    assert ready.json() == {"status": "ready"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"],
+)
+def test_generated_documentation_routes_are_disabled(tmp_path, path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with FastAPITestClient(app) as client:
+        response = client.get(path)
+
+    assert response.status_code == 404
+
+
+def test_invalid_api_key_has_same_401_shape_as_missing_key(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app, api_key="wrong-key") as client:
+        response = client.get("/agents")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or missing API key"
+
+
+def test_request_body_cannot_supply_tenant_identity(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/runs",
+            json={
+                "tenant_id": TENANT_B_ID,
+                "thread_id": "spoofed-tenant",
+                "client_request_id": "spoofed-tenant-request",
+                "user_message": "Plan Tokyo",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in str(response.json())
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_A_ID,
+            "spoofed-tenant-request",
+        )
+        is None
+    )
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_B_ID,
+            "spoofed-tenant-request",
+        )
+        is None
+    )
+
+
+def test_run_thread_event_and_tool_linkage_are_tenant_isolated(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    shared_request_id = "same-idempotency-key"
+    shared_thread_id = "same-thread-id"
+    tenant_b_headers = authorization_headers(TENANT_B_KEY)
+    with TestClient(app) as client:
+        submitted_a = client.post(
+            "/runs",
+            json={
+                "thread_id": shared_thread_id,
+                "client_request_id": shared_request_id,
+                "user_message": "I want a 5-day Tokyo trip under 7000 SGD.",
+            },
+        )
+        submitted_b = client.post(
+            "/runs",
+            headers=tenant_b_headers,
+            json={
+                "thread_id": shared_thread_id,
+                "client_request_id": shared_request_id,
+                "user_message": "I want a 5-day Tokyo trip under 9000 SGD.",
+            },
+        )
+        assert submitted_a.status_code == 202
+        assert submitted_b.status_code == 202
+        assert submitted_a.json()["run_id"] != submitted_b.json()["run_id"]
+
+        run_a = wait_for_run(client, submitted_a.json()["run_id"])
+        run_b = wait_for_run(
+            client,
+            submitted_b.json()["run_id"],
+            api_key=TENANT_B_KEY,
+        )
+        assert run_a["tenant_id"] == TENANT_A_ID
+        assert run_b["tenant_id"] == TENANT_B_ID
+
+        run_a_id = run_a["run_id"]
+        assert client.get(f"/runs/{run_a_id}", headers=tenant_b_headers).status_code == 404
+        assert (
+            client.post(f"/runs/{run_a_id}/cancel", headers=tenant_b_headers).status_code
+            == 404
+        )
+        assert (
+            client.get(f"/runs/{run_a_id}/events", headers=tenant_b_headers).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"/runs/{run_a_id}/events/stream",
+                headers=tenant_b_headers,
+            ).status_code
+            == 404
+        )
+        linked_tool = client.post(
+            "/tools/route_cost_summary/execute",
+            headers=tenant_b_headers,
+            json={"run_id": run_a_id, "arguments": {}},
+        )
+        assert linked_tool.status_code == 404
+
+        checkpoint_a = client.get(f"/threads/{shared_thread_id}/state")
+        checkpoint_b = client.get(
+            f"/threads/{shared_thread_id}/state",
+            headers=tenant_b_headers,
+        )
+        assert checkpoint_a.json()["budget"] == 7000
+        assert checkpoint_b.json()["budget"] == 9000
+
+
+def test_selective_replay_source_cannot_cross_tenant_boundary(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        source = client.post(
+            "/runs",
+            json={
+                "thread_id": "tenant-a-release-source",
+                "agent_id": "release-validation",
+                "agent_version": "1.1.0",
+                "input": {"manifest": valid_release_manifest()},
+            },
+        )
+        source_result = wait_for_run(client, source.json()["run_id"], timeout=10.0)
+        replay = client.post(
+            "/runs",
+            headers=authorization_headers(TENANT_B_KEY),
+            json={
+                "thread_id": "tenant-b-replay-target",
+                "client_request_id": "cross-tenant-replay",
+                "agent_id": "release-validation",
+                "agent_version": "1.1.0",
+                "input": {
+                    "manifest": valid_release_manifest(),
+                    "replay": {
+                        "source_run_id": source_result["run_id"],
+                        "step_ids": ["run_unit_tests"],
+                    },
+                },
+            },
+        )
+
+    assert replay.status_code == 404
+    assert replay.json()["detail"] == "Referenced run not found"
+    assert (
+        SQLiteRunStore(database_path).get_run_by_client_request_id(
+            TENANT_B_ID,
+            "cross-tenant-replay",
+        )
+        is None
+    )

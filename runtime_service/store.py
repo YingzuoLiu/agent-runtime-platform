@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.contracts import BaseRuntimeState, utc_now
-from .models import RunEvent, RunRecord, RunStatus
+from .models import LEGACY_TENANT_ID, RunEvent, RunRecord, RunStatus
 
 
 class StateRegistry(Protocol):
@@ -50,10 +50,12 @@ class SQLiteRunStore:
 
     def initialize(self) -> None:
         with self._lock, self._connect() as connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agent_version TEXT NOT NULL,
@@ -68,15 +70,12 @@ class SQLiteRunStore:
                     error TEXT,
                     attempt INTEGER NOT NULL,
                     cancel_requested INTEGER NOT NULL,
-                    client_request_id TEXT UNIQUE,
+                    client_request_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_runs_thread_id ON runs(thread_id);
-                CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 
                 CREATE TABLE IF NOT EXISTS run_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,11 +89,13 @@ class SQLiteRunStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS thread_states (
-                    thread_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
                     domain_id TEXT NOT NULL DEFAULT 'travel',
                     schema_version TEXT NOT NULL DEFAULT '1',
                     state_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(tenant_id, thread_id)
                 );
                 """
             )
@@ -109,6 +110,10 @@ class SQLiteRunStore:
                     "ON runs(client_request_id) WHERE client_request_id IS NOT NULL"
                 )
             run_migrations = {
+                "tenant_id": (
+                    "ALTER TABLE runs ADD COLUMN tenant_id "
+                    f"TEXT NOT NULL DEFAULT '{LEGACY_TENANT_ID}'"
+                ),
                 "domain_id": "ALTER TABLE runs ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'travel'",
                 "schema_version": "ALTER TABLE runs ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'",
                 "input_json": "ALTER TABLE runs ADD COLUMN input_json TEXT",
@@ -129,6 +134,135 @@ class SQLiteRunStore:
                 connection.execute(
                     "ALTER TABLE thread_states ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'"
                 )
+            if "tenant_id" not in thread_columns:
+                connection.execute(
+                    "ALTER TABLE thread_states ADD COLUMN tenant_id "
+                    f"TEXT NOT NULL DEFAULT '{LEGACY_TENANT_ID}'"
+                )
+
+            if self._has_global_client_request_uniqueness(connection):
+                self._rebuild_runs_table(connection)
+            if not self._thread_states_has_tenant_primary_key(connection):
+                self._rebuild_thread_states_table(connection)
+
+            connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_runs_tenant_thread_id
+                    ON runs(tenant_id, thread_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_tenant_client_request_id
+                    ON runs(tenant_id, client_request_id)
+                    WHERE client_request_id IS NOT NULL;
+                """
+            )
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys=ON")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("Tenant schema migration left invalid foreign keys")
+
+    @staticmethod
+    def _has_global_client_request_uniqueness(connection: sqlite3.Connection) -> bool:
+        for index in connection.execute("PRAGMA index_list(runs)").fetchall():
+            if not index["unique"]:
+                continue
+            quoted_name = index["name"].replace('"', '""')
+            columns = [
+                row["name"]
+                for row in connection.execute(
+                    f'PRAGMA index_info("{quoted_name}")'
+                ).fetchall()
+            ]
+            if columns == ["client_request_id"]:
+                return True
+        return False
+
+    @staticmethod
+    def _thread_states_has_tenant_primary_key(connection: sqlite3.Connection) -> bool:
+        columns = connection.execute("PRAGMA table_info(thread_states)").fetchall()
+        primary_key = {
+            row["name"]: row["pk"]
+            for row in columns
+            if row["pk"]
+        }
+        return primary_key == {"tenant_id": 1, "thread_id": 2}
+
+    @staticmethod
+    def _rebuild_runs_table(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE runs_tenant_migration (
+                run_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_version TEXT NOT NULL,
+                domain_id TEXT NOT NULL DEFAULT 'travel',
+                schema_version TEXT NOT NULL DEFAULT '1',
+                status TEXT NOT NULL,
+                input_message TEXT NOT NULL,
+                input_json TEXT,
+                state_json TEXT,
+                output_message TEXT,
+                validation_errors_json TEXT NOT NULL,
+                error TEXT,
+                attempt INTEGER NOT NULL,
+                cancel_requested INTEGER NOT NULL,
+                client_request_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+
+            INSERT INTO runs_tenant_migration (
+                run_id, tenant_id, thread_id, agent_id, agent_version,
+                domain_id, schema_version, status, input_message, input_json,
+                state_json, output_message, validation_errors_json, error,
+                attempt, cancel_requested, client_request_id, created_at,
+                updated_at, started_at, completed_at
+            )
+            SELECT
+                run_id, tenant_id, thread_id, agent_id, agent_version,
+                domain_id, schema_version, status, input_message, input_json,
+                state_json, output_message, validation_errors_json, error,
+                attempt, cancel_requested, client_request_id, created_at,
+                updated_at, started_at, completed_at
+            FROM runs;
+
+            DROP TABLE runs;
+            ALTER TABLE runs_tenant_migration RENAME TO runs;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _rebuild_thread_states_table(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE thread_states_tenant_migration (
+                tenant_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                domain_id TEXT NOT NULL DEFAULT 'travel',
+                schema_version TEXT NOT NULL DEFAULT '1',
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(tenant_id, thread_id)
+            );
+
+            INSERT INTO thread_states_tenant_migration (
+                tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+            )
+            SELECT tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+            FROM thread_states;
+
+            DROP TABLE thread_states;
+            ALTER TABLE thread_states_tenant_migration RENAME TO thread_states;
+            COMMIT;
+            """
+        )
 
     def ping(self) -> None:
         with self._connect() as connection:
@@ -139,29 +273,41 @@ class SQLiteRunStore:
             connection.execute(
                 """
                 INSERT INTO runs (
-                    run_id, thread_id, agent_id, agent_version, domain_id,
+                    run_id, tenant_id, thread_id, agent_id, agent_version, domain_id,
                     schema_version, status, input_message, input_json,
                     state_json, output_message,
                     validation_errors_json, error, attempt, cancel_requested,
                     client_request_id, created_at, updated_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
         return run
 
-    def get_run(self, run_id: str) -> RunRecord | None:
+    def get_run_internal(self, run_id: str) -> RunRecord | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
         return self._row_to_run(row) if row else None
 
-    def get_run_by_client_request_id(self, client_request_id: str) -> RunRecord | None:
+    def get_run_for_tenant(self, run_id: str, tenant_id: str) -> RunRecord | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM runs WHERE client_request_id = ?",
-                (client_request_id,),
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def get_run_by_client_request_id(
+        self,
+        tenant_id: str,
+        client_request_id: str,
+    ) -> RunRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE tenant_id = ? AND client_request_id = ?",
+                (tenant_id, client_request_id),
             ).fetchone()
         return self._row_to_run(row) if row else None
 
@@ -177,15 +323,15 @@ class SQLiteRunStore:
                     validation_errors_json = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
-                WHERE run_id = ?
+                WHERE run_id = ? AND tenant_id = ?
                 """,
-                (*self._run_values(run)[1:], run.run_id),
+                (*self._run_values(run)[2:], run.run_id, run.tenant_id),
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Run not found: {run.run_id}")
         return run
 
-    def request_cancel_atomically(self, run_id: str) -> RunRecord:
+    def request_cancel_atomically(self, run_id: str, *, tenant_id: str) -> RunRecord:
         """Atomically flip `cancel_requested` 0 -> 1 for a QUEUED/RUNNING run.
 
         The eligibility check and the flag flip are the same statement: a
@@ -213,17 +359,20 @@ class SQLiteRunStore:
                 """
                 UPDATE runs
                 SET cancel_requested = 1, updated_at = ?
-                WHERE run_id = ? AND status IN (?, ?) AND cancel_requested = 0
+                WHERE run_id = ? AND tenant_id = ?
+                    AND status IN (?, ?) AND cancel_requested = 0
                 """,
                 (
                     utc_now(),
                     run_id,
+                    tenant_id,
                     RunStatus.QUEUED.value,
                     RunStatus.RUNNING.value,
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
             ).fetchone()
             if row is None:
                 raise KeyError(f"Run not found: {run_id}")
@@ -271,6 +420,7 @@ class SQLiteRunStore:
         with self._lock, self._connect() as connection:
             self._assert_thread_schema_available(
                 connection,
+                run.tenant_id,
                 run.thread_id,
                 run.domain_id,
                 run.schema_version,
@@ -280,7 +430,8 @@ class SQLiteRunStore:
                 UPDATE runs SET
                     status = ?, state_json = ?, output_message = ?,
                     validation_errors_json = ?, completed_at = ?, updated_at = ?
-                WHERE run_id = ? AND status = ? AND cancel_requested = 0
+                WHERE run_id = ? AND tenant_id = ?
+                    AND status = ? AND cancel_requested = 0
                 """,
                 (
                     RunStatus.COMPLETED.value,
@@ -290,6 +441,7 @@ class SQLiteRunStore:
                     completed_at,
                     completed_at,
                     run.run_id,
+                    run.tenant_id,
                     RunStatus.RUNNING.value,
                 ),
             )
@@ -300,15 +452,16 @@ class SQLiteRunStore:
                 connection.execute(
                     """
                     INSERT INTO thread_states (
-                        thread_id, domain_id, schema_version, state_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(thread_id) DO UPDATE SET
+                        tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(tenant_id, thread_id) DO UPDATE SET
                         domain_id = excluded.domain_id,
                         schema_version = excluded.schema_version,
                         state_json = excluded.state_json,
                         updated_at = excluded.updated_at
                     """,
                     (
+                        run.tenant_id,
                         run.thread_id,
                         run.domain_id,
                         run.schema_version,
@@ -357,8 +510,10 @@ class SQLiteRunStore:
           would still be caught if `cancel_requested` were ever 0 here,
           though that combination should not occur given the call sites.
 
-        Every column other than `status`/`cancel_requested`/`completed_at`/
-        `updated_at` is written exactly as it currently stands on `run`, so
+        Every mutable column other than `status`/`cancel_requested`/`completed_at`/
+        `updated_at` is written exactly as it currently stands on `run`. The
+        persisted `tenant_id` is deliberately immutable and is part of the
+        UPDATE predicate instead of its SET list. Therefore,
         each existing call site's semantics survive unchanged: a
         before-start cancellation leaves the original request/thread-store
         state alone (the caller never overwrote `run.state`), while an
@@ -391,7 +546,8 @@ class SQLiteRunStore:
                     validation_errors_json = ?, error = ?, attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
-                WHERE run_id = ? AND status IN (?, ?) AND cancel_requested = 1
+                WHERE run_id = ? AND tenant_id = ?
+                    AND status IN (?, ?) AND cancel_requested = 1
                 """,
                 (
                     run.thread_id,
@@ -414,6 +570,7 @@ class SQLiteRunStore:
                     run.started_at,
                     completed_at,
                     run.run_id,
+                    run.tenant_id,
                     RunStatus.QUEUED.value,
                     RunStatus.RUNNING.value,
                 ),
@@ -508,6 +665,29 @@ class SQLiteRunStore:
                 """,
                 (run_id, after_sequence),
             ).fetchall()
+        return self._rows_to_events(rows)
+
+    def list_events_for_tenant(
+        self,
+        run_id: str,
+        tenant_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> list[RunEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event.* FROM run_events AS event
+                INNER JOIN runs AS run ON run.run_id = event.run_id
+                WHERE event.run_id = ? AND run.tenant_id = ? AND event.sequence > ?
+                ORDER BY event.sequence
+                """,
+                (run_id, tenant_id, after_sequence),
+            ).fetchall()
+        return self._rows_to_events(rows)
+
+    @staticmethod
+    def _rows_to_events(rows: list[sqlite3.Row]) -> list[RunEvent]:
         return [
             RunEvent(
                 event_id=row["event_id"],
@@ -520,11 +700,12 @@ class SQLiteRunStore:
             for row in rows
         ]
 
-    def save_thread_state(self, state: BaseRuntimeState) -> None:
+    def save_thread_state(self, state: BaseRuntimeState, *, tenant_id: str) -> None:
         self._remember_state_model(state)
         with self._lock, self._connect() as connection:
             self._assert_thread_schema_available(
                 connection,
+                tenant_id,
                 state.thread_id,
                 state.domain_id,
                 state.schema_version,
@@ -532,15 +713,16 @@ class SQLiteRunStore:
             connection.execute(
                 """
                 INSERT INTO thread_states (
-                    thread_id, domain_id, schema_version, state_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(thread_id) DO UPDATE SET
+                    tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, thread_id) DO UPDATE SET
                     domain_id = excluded.domain_id,
                     schema_version = excluded.schema_version,
                     state_json = excluded.state_json,
                     updated_at = excluded.updated_at
                 """,
                 (
+                    tenant_id,
                     state.thread_id,
                     state.domain_id,
                     state.schema_version,
@@ -553,13 +735,15 @@ class SQLiteRunStore:
         self,
         thread_id: str,
         *,
+        tenant_id: str,
         domain_id: str | None = None,
         schema_version: str | None = None,
     ) -> BaseRuntimeState | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT domain_id, schema_version, state_json FROM thread_states WHERE thread_id = ?",
-                (thread_id,),
+                "SELECT domain_id, schema_version, state_json FROM thread_states "
+                "WHERE tenant_id = ? AND thread_id = ?",
+                (tenant_id, thread_id),
             ).fetchone()
         if row is None:
             return None
@@ -583,6 +767,7 @@ class SQLiteRunStore:
             self._remember_state_model(run.state)
         return (
             run.run_id,
+            run.tenant_id,
             run.thread_id,
             run.agent_id,
             run.agent_version,
@@ -615,6 +800,7 @@ class SQLiteRunStore:
         )
         return RunRecord(
             run_id=row["run_id"],
+            tenant_id=(row["tenant_id"] if "tenant_id" in keys else LEGACY_TENANT_ID),
             thread_id=row["thread_id"],
             agent_id=row["agent_id"],
             agent_version=row["agent_version"],
@@ -671,13 +857,15 @@ class SQLiteRunStore:
     @staticmethod
     def _assert_thread_schema_available(
         connection: sqlite3.Connection,
+        tenant_id: str,
         thread_id: str,
         domain_id: str,
         schema_version: str,
     ) -> None:
         existing = connection.execute(
-            "SELECT domain_id, schema_version FROM thread_states WHERE thread_id = ?",
-            (thread_id,),
+            "SELECT domain_id, schema_version FROM thread_states "
+            "WHERE tenant_id = ? AND thread_id = ?",
+            (tenant_id, thread_id),
         ).fetchone()
         if existing is None:
             return

@@ -7,9 +7,14 @@ import traceback
 from uuid import uuid4
 
 from agent.contracts import RuntimeExecutionContext, utc_now
+from .auth import TenantContext
 from .models import RunCreateRequest, RunRecord, RunStatus
 from .registry import AgentRegistry
 from .store import SQLiteRunStore
+
+
+class ReferencedRunNotFoundError(KeyError):
+    """A tenant-scoped run reference is not visible to the authenticated caller."""
 
 
 class RuntimeManager:
@@ -60,20 +65,33 @@ class RuntimeManager:
             self._workers.clear()
             self._started = False
 
-    def submit(self, request: RunCreateRequest) -> RunRecord:
+    def submit(
+        self,
+        request: RunCreateRequest,
+        *,
+        tenant_context: TenantContext,
+    ) -> RunRecord:
         registration = self.registry.registration(request.agent_id, request.agent_version)
         assert request.input is not None
         runtime_input = registration.parse_input(request.input)
+        self._assert_referenced_runs_visible(
+            registration.referenced_run_ids(runtime_input),
+            tenant_id=tenant_context.tenant_id,
+        )
         state = registration.parse_state(request.state) if request.state is not None else None
         if state is not None and state.thread_id != request.thread_id:
             raise ValueError("state.thread_id must match request.thread_id")
         with self._lock:
             if request.client_request_id:
-                existing = self.store.get_run_by_client_request_id(request.client_request_id)
+                existing = self.store.get_run_by_client_request_id(
+                    tenant_context.tenant_id,
+                    request.client_request_id,
+                )
                 if existing is not None:
                     return existing
             run = RunRecord(
                 run_id=f"run_{uuid4().hex}",
+                tenant_id=tenant_context.tenant_id,
                 thread_id=request.thread_id,
                 agent_id=request.agent_id,
                 agent_version=request.agent_version,
@@ -89,7 +107,10 @@ class RuntimeManager:
             except sqlite3.IntegrityError:
                 if not request.client_request_id:
                     raise
-                existing = self.store.get_run_by_client_request_id(request.client_request_id)
+                existing = self.store.get_run_by_client_request_id(
+                    tenant_context.tenant_id,
+                    request.client_request_id,
+                )
                 if existing is None:
                     raise
                 return existing
@@ -101,6 +122,8 @@ class RuntimeManager:
                     "agent_version": run.agent_version,
                     "domain_id": run.domain_id,
                     "schema_version": run.schema_version,
+                    "tenant_id": run.tenant_id,
+                    "subject_id": tenant_context.subject_id,
                     "thread_id": run.thread_id,
                     "client_request_id": run.client_request_id,
                 },
@@ -109,10 +132,20 @@ class RuntimeManager:
                 self._queue.put((run.run_id, False))
             return run
 
-    def get_run(self, run_id: str) -> RunRecord | None:
-        return self.store.get_run(run_id)
+    def get_run(
+        self,
+        run_id: str,
+        *,
+        tenant_context: TenantContext,
+    ) -> RunRecord | None:
+        return self.store.get_run_for_tenant(run_id, tenant_context.tenant_id)
 
-    def request_cancel(self, run_id: str) -> RunRecord:
+    def request_cancel(
+        self,
+        run_id: str,
+        *,
+        tenant_context: TenantContext,
+    ) -> RunRecord:
         """Request cancellation of a run.
 
         Delegates entirely to the store's atomic compare-and-set: an
@@ -122,7 +155,10 @@ class RuntimeManager:
         QUEUED/RUNNING -> cancel-requested transition is what actually
         appends a `run.cancel_requested` event.
         """
-        return self.store.request_cancel_atomically(run_id)
+        return self.store.request_cancel_atomically(
+            run_id,
+            tenant_id=tenant_context.tenant_id,
+        )
 
     def _worker_loop(self) -> None:
         while True:
@@ -168,6 +204,7 @@ class RuntimeManager:
                 )
             persisted_state = self.store.load_thread_state(
                 run.thread_id,
+                tenant_id=run.tenant_id,
                 domain_id=run.domain_id,
                 schema_version=run.schema_version,
             )
@@ -179,6 +216,10 @@ class RuntimeManager:
             )
             assert run.input is not None
             runtime_input = registration.parse_input(run.input)
+            self._assert_referenced_runs_visible(
+                registration.referenced_run_ids(runtime_input),
+                tenant_id=run.tenant_id,
+            )
             result = runtime.execute(
                 state,
                 runtime_input,
@@ -211,7 +252,17 @@ class RuntimeManager:
         return self.store.finalize_cancelled_run(run, reason=reason)
 
     def _require_run(self, run_id: str) -> RunRecord:
-        run = self.store.get_run(run_id)
+        run = self.store.get_run_internal(run_id)
         if run is None:
             raise KeyError(f"Run not found: {run_id}")
         return run
+
+    def _assert_referenced_runs_visible(
+        self,
+        run_ids: tuple[str, ...],
+        *,
+        tenant_id: str,
+    ) -> None:
+        for run_id in run_ids:
+            if self.store.get_run_for_tenant(run_id, tenant_id) is None:
+                raise ReferencedRunNotFoundError("Referenced run not found")

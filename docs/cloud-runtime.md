@@ -1,11 +1,14 @@
 # Cloud Runtime Upgrade
 
-Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery.
+Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery. Version `0.8.0` adds fail-closed API-key authentication and tenant-qualified control-plane persistence.
 
 ## Architecture
 
 ```text
 Client
+  |
+  v
+Bearer API key -> Principal / TenantContext
   |
   v
 FastAPI API
@@ -19,9 +22,9 @@ RuntimeManager ---- AgentRegistry
   +---- local worker queue
   |
   +---- SQLiteRunStore
-  |       |- runs
+  |       |- tenant-scoped runs
   |       |- run_events
-  |       `- thread_states / checkpoints
+  |       `- tenant-scoped thread_states / checkpoints
   |
   +---- TravelAgentRuntime
   |
@@ -34,10 +37,33 @@ RuntimeManager ---- AgentRegistry
 ```
 
 Both Travel API paths use the same durable `thread_states` table. The generic
-run path persists `domain_id` and `schema_version` separately from state JSON,
-and the registry validates concrete input/state models before execution.
-Thread identifiers are globally scoped in this SQLite slice: reusing one for a
-different domain or schema fails explicitly instead of overwriting a checkpoint.
+run path persists `tenant_id`, `domain_id`, and `schema_version` separately from
+state JSON, and the registry validates concrete input/state models before
+execution. Thread identifiers are scoped within a tenant: two tenants may reuse
+the same identifier independently, while reusing it for a different domain or
+schema inside one tenant fails explicitly instead of overwriting a checkpoint.
+
+## Authentication and tenant boundary
+
+`StaticApiKeyAuthenticator` loads local credential records from
+`RUNTIME_API_KEYS_JSON`, hashes each plaintext key in memory, and returns an immutable
+`Principal`. The API passes only the principal's derived `TenantContext` into
+`RuntimeManager`; request models reject extra fields, so a client cannot select or override
+`tenant_id` in JSON. With no configured credentials, protected endpoints fail closed.
+
+Only `/health` and `/ready` are public. `/agents`, `/tools`, tool execution, the synchronous
+compatibility endpoint, runs, cancellation, event history/SSE, and thread checkpoints require
+`Authorization: Bearer <api-key>`. Missing and invalid keys share one `401` response. Resource
+lookups that are unknown or owned by another tenant share one `404` response.
+
+Tenant filters are enforced again in `SQLiteRunStore`, not only at the route layer. Runs,
+idempotency lookup, cancellation, events, checkpoints, tool-to-run linkage, and selective
+replay sources are tenant-qualified. Existing pre-0.8 SQLite rows migrate to the reserved
+`legacy` tenant without changing their domain/schema state or event history; operators must
+explicitly map a credential to `legacy` if those rows should remain accessible.
+
+This slice does not implement roles, resource permissions, per-Agent/per-tool grants, quotas,
+key rotation, or an external secret provider.
 
 ## Run lifecycle
 
@@ -47,7 +73,7 @@ queued -> running -> completed
 queued/running    -> cancelled
 ```
 
-Every run records its stable `run_id`, thread, pinned Agent version,
+Every run records its stable `run_id`, authenticated tenant, thread, pinned Agent version,
 domain/schema identity, structured input/output, timestamps, validation
 results, cancellation metadata, optional `client_request_id`, and latest
 serialized domain state.
@@ -66,7 +92,7 @@ sandbox.execution_finished
 
 ## Submission idempotency
 
-Clients may send a `client_request_id` when creating a run. The database applies a unique constraint to this field. Repeating the same submission returns the existing run instead of creating another queued task.
+Clients may send a `client_request_id` when creating a run. The database applies a unique constraint to `(tenant_id, client_request_id)`. Repeating the same submission returns the existing run for that tenant instead of creating another queued task; another tenant may independently use the same key.
 
 This protects the control API from duplicate runs caused by HTTP retries. It is separate from tool-call idempotency: booking or payment tools still need their own per-call ledger.
 
@@ -146,9 +172,10 @@ rank_trip_options
 Example:
 
 ```bash
-curl http://127.0.0.1:8000/tools
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" http://127.0.0.1:8000/tools
 
 curl -X POST http://127.0.0.1:8000/tools/route_cost_summary/execute \
+  -H "Authorization: Bearer $RUNTIME_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "run_id": null,
@@ -190,16 +217,19 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 
 On startup, the manager scans records left in `queued` or `running`. A previously running run is moved back to `queued`, receives `run.recovered`, and is executed again. Startup-recovered queue items carry a domain-neutral execution-context marker; the release-validation adapter maps that marker to explicit interrupted-step recovery, while normal submissions do not receive it. Terminal `failed` runs remain excluded from recovery.
 
-The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, shared thread state, submission idempotency, DAG validation, input-safe selective replay, source-run immutability, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
+The test suite verifies recovery, cancellation before start, cancellation at an execution boundary, two-worker execution, tenant-scoped thread state and idempotency, fail-closed authentication, cross-tenant resource invisibility, DAG validation, tenant-safe selective replay, source-run immutability, tool allowlisting, schema rejection, timeout termination, environment scrubbing, and API event linkage.
 
 ## Deliberate limitations
 
-SQLite and an in-process queue keep the repository runnable without external services. Therefore:
+SQLite and an in-process queue keep the repository runnable without external services. The
+supplied Compose configuration requires `RUNTIME_API_KEYS_JSON`. The Kubernetes Deployment reads
+that value from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and rotation
+of that Secret are intentionally outside this slice. Therefore:
 
 - deploy one runtime replica only;
 - there is no distributed worker lease or heartbeat;
 - cancellation occurs at cooperative execution boundaries;
-- there is no tenant authentication, quota, or secret-manager integration;
+- authentication uses a local static API-key provider; there is no RBAC, per-tool grant, quota, key-rotation, or external secret-manager integration;
 - external side-effecting tools do not yet have idempotency records;
 - the subprocess sandbox does not isolate host networking or the complete host filesystem;
 - POSIX rlimits are not available on Windows, where timeout and process separation remain but resource enforcement is weaker;
