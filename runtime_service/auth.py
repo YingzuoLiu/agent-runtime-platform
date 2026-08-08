@@ -84,23 +84,22 @@ class StaticApiKeyAuthenticator:
             return cls()
         try:
             credentials = TypeAdapter(list[ApiKeyCredential]).validate_json(raw_value)
-        except ValidationError as exc:
+        except ValidationError:
+            credentials = None
+        if credentials is None:
             raise ValueError(
                 f"{variable_name} must be a JSON array of API-key credential records"
-            ) from exc
+            )
         return cls(credentials)
 
     def authenticate(self, api_key: str | None) -> Principal:
         if api_key is None or not api_key:
             raise AuthenticationError("Invalid or missing API key")
         candidate = self._digest(api_key)
-        matched: Principal | None = None
         for digest, principal in self._principals_by_digest.items():
             if hmac.compare_digest(candidate, digest):
-                matched = principal
-        if matched is None:
-            raise AuthenticationError("Invalid or missing API key")
-        return matched
+                return principal
+        raise AuthenticationError("Invalid or missing API key")
 
     @staticmethod
     def _digest(api_key: str) -> bytes:

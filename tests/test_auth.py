@@ -1,3 +1,5 @@
+import traceback
+
 import pytest
 
 from runtime_service import (
@@ -93,3 +95,58 @@ def test_environment_authenticator_rejects_invalid_configuration(monkeypatch):
 
     with pytest.raises(ValueError, match="must be a JSON array"):
         StaticApiKeyAuthenticator.from_environment()
+
+
+def test_environment_authenticator_does_not_expose_secret_on_validation_failure(
+    monkeypatch,
+):
+    secret = "sk-live-VALIDATION-FAILURE-SENTINEL"
+    monkeypatch.setenv(
+        "RUNTIME_API_KEYS_JSON",
+        (
+            '[{"credential_id":"env-a","apikey":"'
+            + secret
+            + '","tenant_id":"tenant-env","subject_id":"subject-env"}]'
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be a JSON array") as caught:
+        StaticApiKeyAuthenticator.from_environment()
+
+    rendered_traceback = "".join(
+        traceback.format_exception(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        )
+    )
+    assert caught.value.__context__ is None
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert secret not in rendered_traceback
+
+
+def test_static_api_key_authenticator_returns_after_first_digest_match(monkeypatch):
+    authenticator = StaticApiKeyAuthenticator(
+        [
+            credential(),
+            credential(
+                credential_id="credential-b",
+                api_key="test-key-b",
+                tenant_id="tenant-b",
+            ),
+        ]
+    )
+    compare_calls = 0
+
+    def counting_compare_digest(candidate: bytes, digest: bytes) -> bool:
+        nonlocal compare_calls
+        compare_calls += 1
+        return candidate == digest
+
+    monkeypatch.setattr("runtime_service.auth.hmac.compare_digest", counting_compare_digest)
+
+    principal = authenticator.authenticate("test-key-a")
+
+    assert principal.credential_id == "credential-a"
+    assert compare_calls == 1
