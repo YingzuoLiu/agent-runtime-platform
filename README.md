@@ -45,6 +45,18 @@ The later engineering work extends that same objective across additional boundar
 
 The engineering layer is therefore not a replacement for the evaluation work. It is the next layer of the same reliability problem.
 
+## Interactive runtime explorer
+
+The repository includes an interview-friendly React visualization in [`interactive-demo/`](interactive-demo/). It walks through an 11-step Tokyo planning scenario and makes the collaboration between Router, Memory, Planner, Executor, Validator, Reducer, and structured State visible.
+
+```bash
+cd interactive-demo
+npm install
+npm run dev
+```
+
+The explorer is a presentation layer with deterministic in-browser state snapshots; the Python implementation remains the executable runtime reference.
+
 ## Architecture
 
 ```text
