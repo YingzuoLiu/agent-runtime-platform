@@ -121,6 +121,7 @@ def build_default_registry(
     *,
     release_validation_workflow: Any | None = None,
     dynamic_travel_runtime_factory: RuntimeFactory | None = None,
+    governed_memory_travel_runtime_factory: RuntimeFactory | None = None,
 ) -> AgentRegistry:
     from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
     from domains.travel.state import AgentState
@@ -142,6 +143,18 @@ def build_default_registry(
             description=(
                 "Policy-governed dynamic travel reference runtime with typed planner "
                 "decisions, durable tool evidence and deterministic final validation."
+            ),
+            input_model=TravelMessageInput,
+            state_model=AgentState,
+        )
+    if governed_memory_travel_runtime_factory is not None:
+        registry.register(
+            "travel-agent",
+            "1.1.0",
+            governed_memory_travel_runtime_factory,
+            description=(
+                "Governed cross-thread Travel memory with subject-scoped retrieval, "
+                "sealed run snapshots and deterministic preference application."
             ),
             input_model=TravelMessageInput,
             state_model=AgentState,

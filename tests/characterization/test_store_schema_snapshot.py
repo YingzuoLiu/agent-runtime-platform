@@ -1,8 +1,8 @@
 """Characterization of the current SQLite schema produced by SQLiteRunStore.
 
-Phase 5A adds a trusted execution-authority snapshot and stable runtime error
-code on top of Phase 4A's tenant-qualified routing. The snapshot proves that
-migration preserves all earlier run, event, and checkpoint data.
+Phase 6A adds subject-scoped versioned memories, append-only mutation events,
+and sealed per-run retrieval snapshots. The snapshot also proves that adding
+the memory tables preserves all earlier run, event, and checkpoint data.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import sqlite3
 
 from domains.travel.state import AgentState
 from runtime_service import RunRecord, RunStatus
+from runtime_service.memory import SQLiteMemoryStore
 from runtime_service.registry import build_default_registry
 from runtime_service.models import LEGACY_TENANT_ID
 from runtime_service.store import SQLiteRunStore
@@ -57,6 +58,42 @@ EXPECTED_COLUMNS = {
         ("state_json", "TEXT", 1, 0),
         ("updated_at", "TEXT", 1, 0),
     ],
+    "memory_records": [
+        ("memory_id", "TEXT", 0, 1),
+        ("tenant_id", "TEXT", 1, 0),
+        ("subject_id", "TEXT", 1, 0),
+        ("domain_id", "TEXT", 1, 0),
+        ("kind", "TEXT", 1, 0),
+        ("memory_key", "TEXT", 1, 0),
+        ("value_json", "TEXT", 1, 0),
+        ("status", "TEXT", 1, 0),
+        ("source_run_id", "TEXT", 0, 0),
+        ("source_thread_id", "TEXT", 0, 0),
+        ("confidence", "REAL", 1, 0),
+        ("version", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+        ("expires_at", "TEXT", 0, 0),
+    ],
+    "memory_events": [
+        ("event_id", "INTEGER", 0, 1),
+        ("tenant_id", "TEXT", 1, 0),
+        ("subject_id", "TEXT", 1, 0),
+        ("event_type", "TEXT", 1, 0),
+        ("memory_id", "TEXT", 0, 0),
+        ("actor_subject_id", "TEXT", 1, 0),
+        ("source_run_id", "TEXT", 0, 0),
+        ("payload_json", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    ],
+    "run_memory_snapshots": [
+        ("run_id", "TEXT", 0, 1),
+        ("tenant_id", "TEXT", 1, 0),
+        ("subject_id", "TEXT", 1, 0),
+        ("domain_id", "TEXT", 1, 0),
+        ("memories_json", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    ],
 }
 
 
@@ -77,16 +114,20 @@ def _columns(database_path) -> dict[str, list[tuple]]:
 
 
 def test_schema_matches_current_column_snapshot(tmp_path):
-    SQLiteRunStore(tmp_path / "runtime.db")
+    database_path = tmp_path / "runtime.db"
+    SQLiteRunStore(database_path)
+    SQLiteMemoryStore(database_path)
 
-    columns = _columns(tmp_path / "runtime.db")
+    columns = _columns(database_path)
     assert columns == EXPECTED_COLUMNS
 
 
-def test_expected_tables_are_exactly_runs_run_events_thread_states(tmp_path):
-    SQLiteRunStore(tmp_path / "runtime.db")
+def test_expected_tables_include_runtime_and_governed_memory_tables(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    SQLiteRunStore(database_path)
+    SQLiteMemoryStore(database_path)
 
-    connection = sqlite3.connect(tmp_path / "runtime.db")
+    connection = sqlite3.connect(database_path)
     try:
         rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -190,6 +231,7 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
         connection.close()
 
     store = SQLiteRunStore(database_path, state_registry=build_default_registry())
+    memory_store = SQLiteMemoryStore(database_path)
     migrated_run = store.get_run_internal("run_legacy")
     migrated_state = store.load_thread_state(
         "legacy-thread",
@@ -212,6 +254,10 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     assert [event.event_type for event in store.list_events("run_legacy")] == [
         "run.completed"
     ]
+    assert memory_store.list_memories(
+        tenant_id=LEGACY_TENANT_ID,
+        subject_id="legacy-unknown",
+    ) == []
     store.create_run(
         RunRecord(
             run_id="run_new_tenant",

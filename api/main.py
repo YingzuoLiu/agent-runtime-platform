@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from domains.release_validation.runtime import ReleaseValidationWorkflow
 from domains.release_validation.tools import build_release_validation_tool_registry
 from domains.travel.dynamic_runtime import DynamicTravelRuntime
+from domains.travel.memory import TravelMemoryPolicy
 from domains.travel.planner import build_travel_planner_from_environment
 from domains.travel.state import AgentState
 from domains.travel.runtime import TravelAgentRuntime
@@ -26,6 +27,9 @@ from runtime_service import (
     AuthorizationError,
     Authorizer,
     DynamicToolLoop,
+    GovernedMemory,
+    MemoryKind,
+    MemoryRecord,
     Planner,
     Principal,
     ReferencedRunNotFoundError,
@@ -35,6 +39,7 @@ from runtime_service import (
     RunRecord,
     RuntimeManager,
     RuntimePermission,
+    SQLiteMemoryStore,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
@@ -95,6 +100,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = SQLiteRunStore(resolved_database_path)
+        memory_store = SQLiteMemoryStore(resolved_database_path)
+        governed_memory = GovernedMemory(memory_store, store)
         workflow_store = SQLiteWorkflowStore(resolved_database_path)
         release_workflow = ReleaseValidationWorkflow(
             workflow_store,
@@ -109,10 +116,26 @@ def create_app(
             workflow_type="dynamic-tool-loop:travel-agent:1.0.0",
             max_tool_calls=3,
         )
+        governed_memory_travel_loop = DynamicToolLoop(
+            planner=resolved_travel_planner,
+            tool_registry=tool_registry,
+            tool_sandbox=ToolSandbox(tool_registry),
+            workflow_store=workflow_store,
+            run_event_sink=store,
+            workflow_type="dynamic-tool-loop:travel-agent:1.1.0",
+            max_tool_calls=3,
+        )
         registry = build_default_registry(
             release_validation_workflow=release_workflow,
             dynamic_travel_runtime_factory=(
                 lambda: DynamicTravelRuntime(dynamic_travel_loop)
+            ),
+            governed_memory_travel_runtime_factory=(
+                lambda: DynamicTravelRuntime(
+                    governed_memory_travel_loop,
+                    governed_memory=governed_memory,
+                    memory_policy=TravelMemoryPolicy(),
+                )
             ),
         )
         store.bind_state_registry(registry)
@@ -123,6 +146,7 @@ def create_app(
         )
         manager.start()
         app.state.run_store = store
+        app.state.memory_store = memory_store
         app.state.runtime_manager = manager
         app.state.agent_registry = registry
         app.state.tool_registry = tool_registry
@@ -136,9 +160,9 @@ def create_app(
         title="Agent Runtime Reliability Platform",
         description=(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
-            "plus policy-enforced sandboxed tool execution."
+            "plus policy-enforced tools and governed cross-thread memory."
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -182,6 +206,7 @@ def create_app(
     @app.get("/ready")
     def ready(request: Request) -> dict[str, str]:
         request.app.state.run_store.ping()
+        request.app.state.memory_store.ping()
         return {"status": "ready"}
 
     @app.get("/agents", response_model=list[AgentDescriptor])
@@ -415,6 +440,50 @@ def create_app(
         if state_value is None:
             raise HTTPException(status_code=404, detail="Thread state not found")
         return state_value.model_dump(mode="json")
+
+    @app.get("/memories", response_model=list[MemoryRecord])
+    def list_memories(
+        request: Request,
+        principal: Principal = Depends(require_principal),
+        domain_id: str | None = Query(default=None),
+        kind: MemoryKind | None = Query(default=None),
+        include_inactive: bool = Query(default=False),
+    ) -> list[MemoryRecord]:
+        require_permission(principal, RuntimePermission.MEMORY_READ)
+        return request.app.state.memory_store.list_memories(
+            tenant_id=principal.tenant_id,
+            subject_id=principal.subject_id,
+            domain_id=domain_id,
+            kind=kind,
+            include_inactive=include_inactive,
+        )
+
+    @app.delete("/memories/{memory_id}", response_model=MemoryRecord)
+    def forget_memory(
+        memory_id: str,
+        request: Request,
+        principal: Principal = Depends(require_principal),
+    ) -> MemoryRecord:
+        memory_store: SQLiteMemoryStore = request.app.state.memory_store
+        if (
+            memory_store.get_memory_for_subject(
+                memory_id,
+                tenant_id=principal.tenant_id,
+                subject_id=principal.subject_id,
+            )
+            is None
+        ):
+            raise HTTPException(status_code=404, detail="Memory not found")
+        require_permission(principal, RuntimePermission.MEMORY_DELETE)
+        try:
+            return memory_store.forget_memory(
+                memory_id,
+                tenant_id=principal.tenant_id,
+                subject_id=principal.subject_id,
+                actor_subject_id=principal.subject_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Memory not found") from exc
 
     return app
 

@@ -2,12 +2,12 @@
 
 [![CI](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)
-![Status](https://img.shields.io/badge/status-Phase%205A%20complete-2ea44f)
+![Status](https://img.shields.io/badge/status-Phase%206A%20complete-2ea44f)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A production-oriented reference implementation for reliable Agent execution: typed Planner
 decisions, policy-governed registered tools, durable state and events, restart-safe recovery,
-multi-tenant authorization, and explicit failure semantics.
+multi-tenant authorization, governed cross-thread memory, and explicit failure semantics.
 
 Travel is the first reference application, not the architecture boundary. A separate
 release-validation domain exercises the same runtime through a deterministic DAG and selective
@@ -50,9 +50,10 @@ See [`FINDINGS.md`](FINDINGS.md) for the scenarios, traces, and ablation results
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | Security | Fail-closed API-key auth, tenant isolation, Viewer/Operator RBAC, registered-tool sandboxing | [`runtime_service/auth.py`](runtime_service/auth.py), [`docs/cloud-runtime.md`](docs/cloud-runtime.md) |
-| Domains | Three Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
+| Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
+| Domains | Four Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
 | Evidence | Typed REST/SSE events for Planner, policy, tool, recovery, and terminal outcomes | [`tests/test_dynamic_travel_api.py`](tests/test_dynamic_travel_api.py) |
-| Verification | 295 tests on the Phase 5A merge baseline; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
+| Verification | 310 tests; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
 
 ## Quick start
 
@@ -87,7 +88,7 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/ready
 ```
 
-Submit a Phase 5A dynamic Travel run:
+Submit a Phase 6A memory-governed Travel run:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/runs \
@@ -96,7 +97,7 @@ curl -X POST http://127.0.0.1:8000/runs \
   -d '{
     "thread_id": "dynamic-tokyo-trip-001",
     "agent_id": "travel-agent",
-    "agent_version": "1.0.0",
+    "agent_version": "1.1.0",
     "input": {
       "user_message": "I want a 5-day Tokyo trip under 9000 SGD and avoid red-eye flights."
     }
@@ -122,8 +123,20 @@ The observable loop is:
 planner.decision -> policy.decision -> tool.result -> ... -> loop.outcome
 ```
 
+The `1.1.0` path also emits `memory.retrieved` and, when the message contains an explicit
+allowlisted stable preference, `memory.created` or `memory.superseded`. A new thread for the same
+authenticated subject retrieves that preference automatically:
+
+```bash
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" \
+  http://127.0.0.1:8000/memories
+
+curl -X DELETE -H "Authorization: Bearer $RUNTIME_API_KEY" \
+  http://127.0.0.1:8000/memories/<memory_id>
+```
+
 If required information is missing, the completed run returns
-`state.current_stage="needs_clarification"`. Submit another `travel-agent:1.0.0` run on the
+`state.current_stage="needs_clarification"`. Submit another `travel-agent:1.1.0` run on the
 same tenant-qualified thread to continue from its durable checkpoint.
 
 ## Architecture
@@ -136,6 +149,8 @@ flowchart TB
     M --> S[(SQLite runs, events, checkpoints)]
     M --> T[Travel runtimes]
     M --> R[Release-validation runtimes]
+    T --> X[Governed memory]
+    X --> Q[(SQLite memories and run snapshots)]
     T --> L[DynamicToolLoop]
     R --> G[Static validated DAG]
     L --> P[Planner and policy gate]
@@ -184,6 +199,19 @@ stable runtime failures. Each domain owns Planner context construction, observat
 final validation. A Planner `FINISH` decision cannot bypass the Travel budget and preference
 validator.
 
+### The Phase 6A memory boundary
+
+`travel-agent:1.1.0` retrieves only allowlisted, active preferences for the authenticated
+`tenant_id + subject_id`. The first retrieval, including an empty result, is sealed per run before
+Planner execution. Recovered attempts reuse that exact typed snapshot rather than querying current
+memory again.
+
+Current-message preferences override retrieved values. Values injected by `1.1.0` are execution
+overlays, not thread-checkpoint preferences, so superseding or deleting them does not leave a stale
+memory copy in that thread. Exact mutation history remains versioned and auditable. See
+[`docs/governed-memory.md`](docs/governed-memory.md) for conflict, forgetting, and evidence
+semantics.
+
 ## Registered runtime versions
 
 Versions remain registered because durable runs pin exact behavior for recovery and replay.
@@ -193,6 +221,7 @@ Versions remain registered because durable runs pin exact behavior for recovery 
 | `travel-agent` | `0.3.0` | Deterministic application runtime | Original typed state, reducer, validation, and partial replanning path |
 | `travel-agent` | `0.5.0` | Deterministic review workflow | Budget and preference evidence review with validator-gated local replanning |
 | `travel-agent` | `1.0.0` | Policy-governed dynamic loop | Observation-driven tool selection, clarification, and validated finish |
+| `travel-agent` | `1.1.0` | Governed cross-thread memory | Subject-scoped typed preferences, sealed retrieval snapshots, and auditable forgetting |
 | `release-validation` | `1.0.0` | Fixed-order workflow | Compatibility contract for existing durable runs |
 | `release-validation` | `1.1.0` | Static validated DAG | Step persistence, selective replay, signature-safe evidence reuse |
 
@@ -222,7 +251,9 @@ execution claim is made.
 - exclusive step claims and attempt-token protection;
 - immutable selective-replay child runs with typed source and step lineage;
 - replay of indexed Planner decisions and reuse of completed tool results;
-- explicit interrupted-step recovery without silently retrying a persisted terminal tool failure.
+- explicit interrupted-step recovery without silently retrying a persisted terminal tool failure;
+- sealed per-run memory retrieval, including empty snapshots, across restart and retry;
+- versioned preference conflict handling with idempotent same-value writes.
 
 The safety claim is intentionally limited to deterministic, read-only tools. Booking, payment, or
 other side-effecting tools would also need per-call idempotency, approval, and compensation
@@ -232,6 +263,7 @@ contracts.
 
 - fail-closed Bearer API-key authentication;
 - tenant-qualified runs, idempotency keys, events, checkpoints, tool linkage, and replay sources;
+- tenant-and-subject-qualified memory records, history, retrieval snapshots, and APIs;
 - same-shape `404` responses for cross-tenant and unknown resources;
 - centralized default-deny Viewer/Operator authorization;
 - service-derived execution authority excluded from API responses;
@@ -254,10 +286,12 @@ networking or create a private mount namespace.
 | `GET /runs/{id}/events` | Read durable events | yes | yes |
 | `GET /runs/{id}/events/stream` | Stream the same event model over SSE | yes | yes |
 | `GET /threads/{id}/state` | Read the tenant-scoped checkpoint | yes | yes |
+| `GET /memories` | Read the current subject's active or historical memory records | yes | yes |
 | `POST /runs` | Create or selectively replay a run | no | yes |
 | `POST /runs/{id}/cancel` | Request cooperative cancellation | no | yes |
 | `POST /tools/{tool}/execute` | Execute a registered tool directly | no | yes |
 | `POST /agent/message` | Call the synchronous Travel compatibility path | no | yes |
+| `DELETE /memories/{id}` | Forget one logical memory key for future runs | no | yes |
 
 `RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
 `viewer` or `operator`; missing or unknown roles fail configuration loading without retaining the
@@ -319,7 +353,9 @@ input signatures still match; the source run is never mutated.
 | [`runtime_service/dynamic_loop.py`](runtime_service/dynamic_loop.py) | Domain-neutral Planner/policy/tool state machine and recovery logic |
 | [`runtime_service/manager.py`](runtime_service/manager.py) | Durable run lifecycle, worker queue, cancellation, and restart handoff |
 | [`runtime_service/auth.py`](runtime_service/auth.py) | Principal derivation, typed permissions, and default-deny authorization |
+| [`runtime_service/memory.py`](runtime_service/memory.py) | Versioned records, audit events, sealed snapshots, and run evidence |
 | [`domains/travel/dynamic_runtime.py`](domains/travel/dynamic_runtime.py) | Reference adapter and domain-owned final validation |
+| [`domains/travel/memory.py`](domains/travel/memory.py) | Allowlisted extraction and typed Travel preference mapping |
 | [`domains/release_validation/runtime.py`](domains/release_validation/runtime.py) | Independent DAG workflow and selective replay adapter |
 | [`tests/test_execution_authority.py`](tests/test_execution_authority.py) | Trusted authority, restart, tampering, and idempotent-resubmission proofs |
 
@@ -327,6 +363,8 @@ input signatures still match; the source run is never mutated.
 
 - [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md): Planner contracts, policy order,
   failure codes, recovery boundaries, and model adapter;
+- [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
+  retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
   and security model;
 - [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md): DAG validation,
@@ -355,6 +393,9 @@ continuation, run lifecycle, cancellation races, restart recovery, idempotency, 
 RBAC, schema migration, DAG validation, selective replay, tool sandboxing, all eight Phase 5A
 failure codes, policy-order precedence, decision replay, cached tool results, execution authority,
 REST/SSE evidence equality, and the fake OpenAI Responses boundary.
+Phase 6A additionally covers cross-thread restart continuity, same-tenant subject isolation,
+version conflicts, empty-snapshot sealing, memory RBAC, and deletion without checkpoint
+resurrection.
 
 GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
 
@@ -367,7 +408,7 @@ scalable.
 Before increasing replicas, the architecture would need:
 
 ```text
-PostgreSQL runs/checkpoints/events
+PostgreSQL runs/checkpoints/events/memories
 + Redis, Pub/Sub, or another distributed queue
 + worker leases and heartbeats
 + idempotent side-effect contracts
@@ -394,11 +435,14 @@ platform.
 - no real flight, hotel, booking, payment, or other side-effecting API;
 - no OpenTelemetry backend or evaluation dashboard;
 - no prompt-injection detector beyond typed decisions, policy checks, and registered tools;
+- memory is limited to explicit allowlisted preferences, without embeddings, inferred facts, or
+  erasure of immutable historical run evidence;
 - no exactly-once guarantee for future side-effecting tools.
 
-Phase 5A is the completed core milestone. Human approval, bounded parallel read-only calls, a live
-read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation are possible
-follow-up slices, not prerequisites for the runtime demonstrated here.
+Phase 6A is the completed portfolio milestone. Human approval, semantic memory retrieval, bounded
+parallel read-only calls, a live read-only Travel adapter, multi-model fallback, and durable
+multi-Agent delegation are possible follow-up slices, not prerequisites for the runtime
+demonstrated here.
 
 ## License
 
