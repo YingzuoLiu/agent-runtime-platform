@@ -16,6 +16,11 @@ conversation-history replay, inferred profile facts, summarization, or an extern
 
 Only explicit Travel preferences on a fixed domain allowlist are extracted:
 
+The strict explicit-intent parser is pinned to `travel-agent:1.1.0`. The published
+`travel-agent:1.0.0` registration retains its Phase 5A compatibility parser, including its broader
+substring semantics, so recovery and replay do not silently change behavior for an existing
+version.
+
 | Memory key | Typed value | Travel state input |
 | --- | --- | --- |
 | `flight.avoid_red_eye` | `bool` | `preferences.avoid_red_eye` |
@@ -132,6 +137,8 @@ The Phase 6A tests prove:
 - conflicting writes create ordered versions and append non-value audit evidence;
 - current-run and persisted preference updates share one explicit-intent parser; supported
   negative intent supersedes prior values, while ambiguous keyword mentions fail closed;
+- `travel-agent:1.0.0` and `1.1.0` retain distinct pinned parsers across normal execution and
+  restart recovery;
 - an invalid stored value fails before the Planner can act on it;
 - empty and non-empty run snapshots remain sealed across later writes;
 - retry mirroring repairs a committed mutation/run-event gap without duplicate evidence;

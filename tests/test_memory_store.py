@@ -359,3 +359,63 @@ def test_retry_mirrors_committed_memory_audit_without_duplicate_run_events(tmp_p
         "memory.retrieved",
         "memory.created",
     ]
+
+
+def test_mutation_mirroring_reads_run_events_once_per_batch(tmp_path, monkeypatch):
+    database_path = tmp_path / "runtime.db"
+    run_store = SQLiteRunStore(database_path)
+    memory_store = SQLiteMemoryStore(database_path)
+    create_run(run_store, "run-batch", thread_id="thread-batch")
+    context = RuntimeExecutionContext(
+        run_id="run-batch",
+        thread_id="thread-batch",
+        authority=RuntimeExecutionAuthority(
+            tenant_id="tenant-a",
+            subject_id="subject-a",
+            permissions=("memory:write",),
+        ),
+    )
+    governed = GovernedMemory(memory_store, run_store)
+    writes = (
+        write_preference(True),
+        MemoryWrite(
+            kind=MemoryKind.PREFERENCE,
+            key="hotel.near_subway",
+            value=True,
+        ),
+        MemoryWrite(
+            kind=MemoryKind.PREFERENCE,
+            key="travel.style",
+            value="relaxed",
+        ),
+    )
+
+    original_list_events = run_store.list_events
+    list_events_calls = 0
+
+    def counting_list_events(run_id):
+        nonlocal list_events_calls
+        list_events_calls += 1
+        return original_list_events(run_id)
+
+    monkeypatch.setattr(run_store, "list_events", counting_list_events)
+
+    governed.remember(
+        context,
+        domain_id="travel",
+        source_thread_id="thread-batch",
+        writes=writes,
+    )
+    governed.remember(
+        context,
+        domain_id="travel",
+        source_thread_id="thread-batch",
+        writes=writes,
+    )
+
+    assert list_events_calls == 2
+    assert [event.event_type for event in original_list_events("run-batch")] == [
+        "memory.created",
+        "memory.created",
+        "memory.created",
+    ]

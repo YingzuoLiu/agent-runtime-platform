@@ -1,14 +1,34 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Literal
 
 
 TravelPreferenceValue = bool | Literal["balanced", "relaxed"]
+TravelPreferenceParser = Callable[[str], dict[str, TravelPreferenceValue]]
 
 AVOID_RED_EYE_STATE_KEY = "avoid_red_eye"
 HOTEL_NEAR_SUBWAY_STATE_KEY = "hotel_near_subway"
 TRAVEL_STYLE_STATE_KEY = "travel_style"
+
+
+def parse_legacy_travel_preferences(
+    user_message: str,
+) -> dict[str, TravelPreferenceValue]:
+    """Preserve the published ``travel-agent:1.0.0`` substring semantics."""
+
+    text = user_message.lower()
+    updates: dict[str, TravelPreferenceValue] = {}
+    if "red-eye" in text or "red eye" in text or "红眼" in user_message:
+        updates[AVOID_RED_EYE_STATE_KEY] = not any(
+            phrase in text for phrase in ("allow red-eye", "allow red eye")
+        )
+    if "near subway" in text or "靠近地铁" in user_message:
+        updates[HOTEL_NEAR_SUBWAY_STATE_KEY] = True
+    if "relaxed" in text or "轻松" in user_message:
+        updates[TRAVEL_STYLE_STATE_KEY] = "relaxed"
+    return updates
 
 _RED_EYE_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (

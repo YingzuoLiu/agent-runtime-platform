@@ -915,6 +915,11 @@ class GovernedMemory:
         self._mirror_mutation_events(context)
 
     def _mirror_mutation_events(self, context: RuntimeExecutionContext) -> None:
+        existing_audit_events = {
+            (event.event_type, event.payload.get("audit_event_id"))
+            for event in self.run_event_sink.list_events(context.run_id)
+            if event.payload.get("audit_event_id") is not None
+        }
         for event in self.store.list_events_for_run(
             context.run_id,
             tenant_id=context.authority.tenant_id,
@@ -927,13 +932,11 @@ class GovernedMemory:
                 "memory_id": event.memory_id,
                 **event.payload,
             }
-            self._ensure_run_event(
-                context.run_id,
-                event.event_type,
-                payload,
-                identity_key="audit_event_id",
-                identity_value=event.event_id,
-            )
+            identity = (event.event_type, event.event_id)
+            if identity in existing_audit_events:
+                continue
+            self.run_event_sink.append_event(context.run_id, event.event_type, payload)
+            existing_audit_events.add(identity)
 
     def _ensure_run_event(
         self,

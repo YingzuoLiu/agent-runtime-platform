@@ -17,6 +17,10 @@ from domains.release_validation.tools import build_release_validation_tool_regis
 from domains.travel.dynamic_runtime import DynamicTravelRuntime
 from domains.travel.memory import TravelMemoryPolicy
 from domains.travel.planner import build_travel_planner_from_environment
+from domains.travel.preferences import (
+    parse_explicit_travel_preferences,
+    parse_legacy_travel_preferences,
+)
 from domains.travel.state import AgentState
 from domains.travel.runtime import TravelAgentRuntime
 from domains.travel.tools import build_travel_tool_registry
@@ -128,13 +132,17 @@ def create_app(
         registry = build_default_registry(
             release_validation_workflow=release_workflow,
             dynamic_travel_runtime_factory=(
-                lambda: DynamicTravelRuntime(dynamic_travel_loop)
+                lambda: DynamicTravelRuntime(
+                    dynamic_travel_loop,
+                    preference_parser=parse_legacy_travel_preferences,
+                )
             ),
             governed_memory_travel_runtime_factory=(
                 lambda: DynamicTravelRuntime(
                     governed_memory_travel_loop,
                     governed_memory=governed_memory,
                     memory_policy=TravelMemoryPolicy(),
+                    preference_parser=parse_explicit_travel_preferences,
                 )
             ),
         )

@@ -15,7 +15,10 @@ from runtime_service.memory import GovernedMemory
 from runtime_service.planner import FinishDecision, ToolObservation
 
 from .memory import TravelMemoryPolicy
-from .preferences import parse_explicit_travel_preferences
+from .preferences import (
+    TravelPreferenceParser,
+    parse_legacy_travel_preferences,
+)
 from .reducer import append_trace
 from .runtime import TravelMessageInput
 from .state import AgentState, TravelPlan
@@ -54,11 +57,13 @@ class DynamicTravelRuntime:
         *,
         governed_memory: GovernedMemory | None = None,
         memory_policy: TravelMemoryPolicy | None = None,
+        preference_parser: TravelPreferenceParser = parse_legacy_travel_preferences,
     ) -> None:
         self.loop = loop
         self.validator = TravelValidator()
         self.governed_memory = governed_memory
         self.memory_policy = memory_policy
+        self.preference_parser = preference_parser
         if (governed_memory is None) != (memory_policy is None):
             raise ValueError("governed_memory and memory_policy must be configured together")
 
@@ -326,7 +331,7 @@ class DynamicTravelRuntime:
                 break
 
         preferences = dict(state.preferences)
-        preferences.update(parse_explicit_travel_preferences(user_message))
+        preferences.update(self.preference_parser(user_message))
         if preferences:
             updates["preferences"] = preferences
         return state.model_copy(update=updates, deep=True)

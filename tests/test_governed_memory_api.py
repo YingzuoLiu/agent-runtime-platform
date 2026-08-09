@@ -5,14 +5,18 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from agent.contracts import RuntimeExecutionAuthority
 from api.main import create_app
 from runtime_service import (
     ApiKeyCredential,
     AuthorizationError,
     MemoryKind,
     MemoryWrite,
+    RunRecord,
+    RunStatus,
     RuntimePermission,
     RuntimeRole,
+    SQLiteRunStore,
     StaticApiKeyAuthenticator,
 )
 
@@ -345,6 +349,81 @@ def test_phase5a_version_remains_memory_free(tmp_path):
         assert client.app.state.memory_store.get_run_snapshot(run_id) is None
         events = client.get(f"/runs/{run_id}/events").json()
         assert not any(event["event_type"].startswith("memory.") for event in events)
+
+
+def test_registered_versions_pin_legacy_and_explicit_preference_parsers(tmp_path):
+    app = create_app(
+        database_path=tmp_path / "versioned-parsers.db",
+        authenticator=AUTHENTICATOR,
+    )
+    message = (
+        "I want a 5-day Tokyo trip under 9000 SGD. "
+        "I heard red-eye flights might be cheap, any details?"
+    )
+    with TestClient(app, headers=headers(SUBJECT_A_KEY)) as client:
+        arguments_by_version = {}
+        for version in ("1.0.0", "1.1.0"):
+            response = client.post(
+                "/runs",
+                json={
+                    "thread_id": f"versioned-parser-{version}",
+                    "agent_id": "travel-agent",
+                    "agent_version": version,
+                    "input": {"user_message": message},
+                },
+            )
+            assert response.status_code == 202, response.text
+            run_id = response.json()["run_id"]
+            assert wait_for_terminal(client, run_id)["status"] == "completed"
+            arguments_by_version[version] = search_arguments(
+                client,
+                run_id,
+                api_key=SUBJECT_A_KEY,
+            )
+
+        assert arguments_by_version["1.0.0"]["avoid_red_eye"] is True
+        assert arguments_by_version["1.1.0"]["avoid_red_eye"] is False
+        assert client.get("/memories").json() == []
+
+
+def test_recovered_phase5a_run_uses_version_pinned_legacy_parser(tmp_path):
+    database_path = tmp_path / "phase5a-parser-recovery.db"
+    run_id = "run_phase5a_parser_recovery"
+    SQLiteRunStore(database_path).create_run(
+        RunRecord(
+            run_id=run_id,
+            tenant_id=TENANT_A,
+            thread_id="phase5a-parser-recovery",
+            agent_id="travel-agent",
+            agent_version="1.0.0",
+            status=RunStatus.RUNNING,
+            input={
+                "user_message": (
+                    "I want a 5-day Tokyo trip under 9000 SGD. "
+                    "I heard red-eye flights might be cheap, any details?"
+                )
+            },
+            execution_authority=RuntimeExecutionAuthority(
+                tenant_id=TENANT_A,
+                subject_id="subject-a",
+                permissions=(RuntimePermission.TOOLS_EXECUTE.value,),
+            ),
+            attempt=1,
+        )
+    )
+
+    app = create_app(database_path=database_path, authenticator=AUTHENTICATOR)
+    with TestClient(app, headers=headers(SUBJECT_A_KEY)) as client:
+        result = wait_for_terminal(client, run_id)
+        assert result["status"] == "completed"
+        assert search_arguments(
+            client,
+            run_id,
+            api_key=SUBJECT_A_KEY,
+        )["avoid_red_eye"] is True
+        events = client.get(f"/runs/{run_id}/events").json()
+        assert "run.recovered" in {event["event_type"] for event in events}
+        assert client.get("/memories").json() == []
 
 
 def test_current_message_overrides_snapshot_and_supersedes_active_memory(tmp_path):

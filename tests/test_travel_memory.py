@@ -1,7 +1,10 @@
 import pytest
 
 from domains.travel.memory import TravelMemoryPolicy
-from domains.travel.preferences import parse_explicit_travel_preferences
+from domains.travel.preferences import (
+    parse_explicit_travel_preferences,
+    parse_legacy_travel_preferences,
+)
 from domains.travel.state import AgentState
 from runtime_service.memory import RetrievedMemory
 
@@ -81,3 +84,15 @@ def test_explicit_travel_preference_parser_handles_intent_direction(message, exp
 )
 def test_explicit_travel_preference_parser_fails_closed_on_ambiguous_mentions(message):
     assert parse_explicit_travel_preferences(message) == {}
+
+
+def test_legacy_travel_preference_parser_preserves_phase5a_substring_behavior():
+    assert parse_legacy_travel_preferences(
+        "I heard red-eye flights might be cheap, any details?"
+    ) == {"avoid_red_eye": True}
+    assert parse_legacy_travel_preferences(
+        "I do not want a hotel near subway."
+    ) == {"hotel_near_subway": True}
+    assert parse_legacy_travel_preferences(
+        "I prefer NOT a relaxed travel style."
+    ) == {"travel_style": "relaxed"}
