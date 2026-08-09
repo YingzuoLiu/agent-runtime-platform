@@ -204,6 +204,7 @@ def test_static_api_key_authenticator_returns_after_first_digest_match(monkeypat
         RuntimePermission.RUNS_READ,
         RuntimePermission.RUN_EVENTS_READ,
         RuntimePermission.THREAD_STATE_READ,
+        RuntimePermission.MEMORY_READ,
     ],
 )
 def test_viewer_role_allows_only_read_permissions(permission):
@@ -221,6 +222,8 @@ def test_viewer_role_allows_only_read_permissions(permission):
         RuntimePermission.AGENT_MESSAGE_EXECUTE,
         RuntimePermission.RUNS_CREATE,
         RuntimePermission.RUNS_CANCEL,
+        RuntimePermission.MEMORY_WRITE,
+        RuntimePermission.MEMORY_DELETE,
     ],
 )
 def test_viewer_role_denies_mutating_permissions_by_default(permission):

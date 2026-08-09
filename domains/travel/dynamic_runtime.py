@@ -11,8 +11,14 @@ from runtime_service.dynamic_loop import (
     DynamicToolLoop,
     FinishEvaluation,
 )
+from runtime_service.memory import GovernedMemory
 from runtime_service.planner import FinishDecision, ToolObservation
 
+from .memory import TravelMemoryPolicy
+from .preferences import (
+    TravelPreferenceParser,
+    parse_legacy_travel_preferences,
+)
 from .reducer import append_trace
 from .runtime import TravelMessageInput
 from .state import AgentState, TravelPlan
@@ -45,9 +51,21 @@ class DynamicTravelRuntime:
         "首尔": "Seoul",
     }
 
-    def __init__(self, loop: DynamicToolLoop) -> None:
+    def __init__(
+        self,
+        loop: DynamicToolLoop,
+        *,
+        governed_memory: GovernedMemory | None = None,
+        memory_policy: TravelMemoryPolicy | None = None,
+        preference_parser: TravelPreferenceParser = parse_legacy_travel_preferences,
+    ) -> None:
         self.loop = loop
         self.validator = TravelValidator()
+        self.governed_memory = governed_memory
+        self.memory_policy = memory_policy
+        self.preference_parser = preference_parser
+        if (governed_memory is None) != (memory_policy is None):
+            raise ValueError("governed_memory and memory_policy must be configured together")
 
     def initial_state(self, thread_id: str) -> AgentState:
         return AgentState(thread_id=thread_id)
@@ -58,6 +76,32 @@ class DynamicTravelRuntime:
         runtime_input: TravelMessageInput,
         context: RuntimeExecutionContext,
     ) -> RuntimeResponse[AgentState]:
+        checkpoint_preferences: dict[str, Any] | None = None
+        if self.governed_memory is not None and self.memory_policy is not None:
+            checkpoint_preferences = dict(state.preferences)
+            snapshot = self.governed_memory.retrieve(
+                context,
+                domain_id=self.memory_policy.DOMAIN_ID,
+                allowed_keys=self.memory_policy.SUPPORTED_KEYS,
+            )
+            state = self.memory_policy.apply(state, snapshot.memories)
+            state = append_trace(
+                state,
+                event="memory_context_applied",
+                reason="run_memory_snapshot_loaded",
+                payload={
+                    "snapshot_id": snapshot.run_id,
+                    "memories": [
+                        {
+                            "memory_id": memory.memory_id,
+                            "key": memory.key,
+                            "version": memory.version,
+                        }
+                        for memory in snapshot.memories
+                    ],
+                },
+            )
+
         prepared = self._prepare_state(state, runtime_input.user_message)
         prepared = append_trace(
             prepared,
@@ -81,6 +125,13 @@ class DynamicTravelRuntime:
                 observations,
             ),
         )
+        if self.governed_memory is not None and self.memory_policy is not None:
+            self.governed_memory.remember(
+                context,
+                domain_id=self.memory_policy.DOMAIN_ID,
+                source_thread_id=context.thread_id,
+                writes=self.memory_policy.extract(runtime_input.user_message),
+            )
         tool_outputs = {
             observation.step_id: {
                 "tool_name": observation.tool_name,
@@ -131,6 +182,14 @@ class DynamicTravelRuntime:
                 "validation_errors": result.validation_errors,
             },
         )
+        if (
+            checkpoint_preferences is not None
+            and self.memory_policy is not None
+        ):
+            updated = self.memory_policy.restore_checkpoint_preferences(
+                updated,
+                checkpoint_preferences,
+            )
         return RuntimeResponse[AgentState](
             message=result.message,
             state=updated,
@@ -272,14 +331,7 @@ class DynamicTravelRuntime:
                 break
 
         preferences = dict(state.preferences)
-        if "red-eye" in text or "red eye" in text or "红眼" in user_message:
-            preferences["avoid_red_eye"] = not any(
-                phrase in text for phrase in ("allow red-eye", "allow red eye")
-            )
-        if "near subway" in text or "靠近地铁" in user_message:
-            preferences["hotel_near_subway"] = True
-        if "relaxed" in text or "轻松" in user_message:
-            preferences["travel_style"] = "relaxed"
+        preferences.update(self.preference_parser(user_message))
         if preferences:
             updates["preferences"] = preferences
         return state.model_copy(update=updates, deep=True)

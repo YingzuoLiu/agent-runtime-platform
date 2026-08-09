@@ -35,6 +35,9 @@ class RuntimePermission(str, Enum):
     RUNS_CANCEL = "runs:cancel"
     RUN_EVENTS_READ = "run-events:read"
     THREAD_STATE_READ = "thread-state:read"
+    MEMORY_READ = "memory:read"
+    MEMORY_WRITE = "memory:write"
+    MEMORY_DELETE = "memory:delete"
 
 
 class Authenticator(Protocol):
@@ -103,6 +106,7 @@ class RoleAuthorizer:
             RuntimePermission.RUNS_READ,
             RuntimePermission.RUN_EVENTS_READ,
             RuntimePermission.THREAD_STATE_READ,
+            RuntimePermission.MEMORY_READ,
         }
     )
     _OPERATOR_PERMISSIONS = _VIEWER_PERMISSIONS | frozenset(
@@ -111,6 +115,8 @@ class RoleAuthorizer:
             RuntimePermission.AGENT_MESSAGE_EXECUTE,
             RuntimePermission.RUNS_CREATE,
             RuntimePermission.RUNS_CANCEL,
+            RuntimePermission.MEMORY_WRITE,
+            RuntimePermission.MEMORY_DELETE,
         }
     )
     _PERMISSIONS_BY_ROLE = {

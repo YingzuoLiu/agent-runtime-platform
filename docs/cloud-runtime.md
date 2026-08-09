@@ -1,6 +1,6 @@
 # Cloud Runtime Upgrade
 
-Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery. Version `0.8.0` adds fail-closed API-key authentication and tenant-qualified control-plane persistence. Version `0.9.0` adds a typed default-deny Viewer/Operator authorization boundary.
+Version `0.3.0` adds a self-hosted execution-management layer around the travel application runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains. Version `0.7.0` adds `release-validation:1.1.0`, a static validated DAG and immutable selective-replay child runs, while retaining `release-validation:1.0.0` for pinned fixed-order recovery. Version `0.8.0` adds fail-closed API-key authentication and tenant-qualified control-plane persistence. Version `0.9.0` adds a typed default-deny Viewer/Operator authorization boundary. Platform version `1.0.0` adds the policy-governed dynamic tool loop, and `1.1.0` adds governed subject-scoped cross-thread memory with sealed run snapshots.
 
 ## Architecture
 
