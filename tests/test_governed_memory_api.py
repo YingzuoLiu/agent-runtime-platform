@@ -394,3 +394,75 @@ def test_current_message_overrides_snapshot_and_supersedes_active_memory(tmp_pat
             if event["event_type"] == "memory.retrieved"
         )
         assert latest_memory_event["payload"]["memories"][0]["version"] == 2
+
+
+def test_explicit_reverse_preferences_supersede_memory_without_negation_drift(tmp_path):
+    app = create_app(
+        database_path=tmp_path / "memory-negation.db",
+        authenticator=AUTHENTICATOR,
+    )
+    with TestClient(app, headers=headers(SUBJECT_A_KEY)) as client:
+        _, initial = submit_memory_run(
+            client,
+            "memory-negation-a",
+            (
+                "I want a 5-day Tokyo trip under 9000 SGD, avoid red-eye flights, "
+                "prefer a hotel near subway, and like relaxed travel."
+            ),
+        )
+        assert initial["state"]["itinerary"]["flight_type"] == "daytime"
+        assert {
+            record["key"]: (record["version"], record["value"])
+            for record in client.get("/memories").json()
+        } == {
+            "flight.avoid_red_eye": (1, True),
+            "hotel.near_subway": (1, True),
+            "travel.style": (1, "relaxed"),
+        }
+
+        update_run_id, updated = submit_memory_run(
+            client,
+            "memory-negation-b",
+            (
+                "I want a 5-day Tokyo trip under 9000 SGD. "
+                "I do not mind red-eye flights, I do not want a hotel near subway, "
+                "and I prefer NOT a relaxed travel style."
+            ),
+        )
+        assert updated["state"]["itinerary"]["flight_type"] == "red_eye"
+        arguments = search_arguments(
+            client,
+            update_run_id,
+            api_key=SUBJECT_A_KEY,
+        )
+        assert {
+            key: arguments[key]
+            for key in ("avoid_red_eye", "hotel_near_subway", "travel_style")
+        } == {
+            "avoid_red_eye": False,
+            "hotel_near_subway": False,
+            "travel_style": "balanced",
+        }
+        assert {
+            record["key"]: (record["version"], record["value"])
+            for record in client.get("/memories").json()
+        } == {
+            "flight.avoid_red_eye": (2, False),
+            "hotel.near_subway": (2, False),
+            "travel.style": (2, "balanced"),
+        }
+        assert {event["event_type"] for event in client.get(
+            f"/runs/{update_run_id}/events"
+        ).json()} >= {"memory.superseded", "memory.created"}
+
+        latest_run_id, latest = submit_memory_run(
+            client,
+            "memory-negation-c",
+            "I want a 5-day Tokyo trip under 9000 SGD.",
+        )
+        assert latest["state"]["itinerary"]["flight_type"] == "red_eye"
+        assert search_arguments(
+            client,
+            latest_run_id,
+            api_key=SUBJECT_A_KEY,
+        )["travel_style"] == "balanced"

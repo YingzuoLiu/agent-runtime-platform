@@ -1,4 +1,7 @@
+import pytest
+
 from domains.travel.memory import TravelMemoryPolicy
+from domains.travel.preferences import parse_explicit_travel_preferences
 from domains.travel.state import AgentState
 from runtime_service.memory import RetrievedMemory
 
@@ -43,3 +46,38 @@ def test_travel_memory_allowlist_extracts_applies_and_removes_execution_overlay(
         original_preferences=original.preferences,
     )
     assert restored.preferences == {"meal_preference": "vegetarian"}
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("I do not mind red-eye flights.", {"avoid_red_eye": False}),
+        ("I do not want red-eye flights.", {"avoid_red_eye": True}),
+        (
+            "I do not want a hotel near subway.",
+            {"hotel_near_subway": False},
+        ),
+        (
+            "I prefer NOT a relaxed travel style.",
+            {"travel_style": "balanced"},
+        ),
+        ("I allow red-eye flights.", {"avoid_red_eye": False}),
+        ("I avoid red-eye flights.", {"avoid_red_eye": True}),
+        ("I prefer a hotel near subway.", {"hotel_near_subway": True}),
+        ("I like relaxed travel.", {"travel_style": "relaxed"}),
+    ],
+)
+def test_explicit_travel_preference_parser_handles_intent_direction(message, expected):
+    assert parse_explicit_travel_preferences(message) == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Do you offer red-eye flights?",
+        "Tell me about a hotel near subway.",
+        "What does a relaxed travel style mean?",
+    ],
+)
+def test_explicit_travel_preference_parser_fails_closed_on_ambiguous_mentions(message):
+    assert parse_explicit_travel_preferences(message) == {}

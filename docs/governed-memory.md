@@ -130,6 +130,8 @@ The Phase 6A tests prove:
 - the same tenant's other subject and another tenant retrieve no record and cannot delete it;
 - Viewer can read but cannot forget, while Operator can read, write through execution, and forget;
 - conflicting writes create ordered versions and append non-value audit evidence;
+- current-run and persisted preference updates share one explicit-intent parser; supported
+  negative intent supersedes prior values, while ambiguous keyword mentions fail closed;
 - an invalid stored value fails before the Planner can act on it;
 - empty and non-empty run snapshots remain sealed across later writes;
 - retry mirroring repairs a committed mutation/run-event gap without duplicate evidence;

@@ -15,6 +15,7 @@ from runtime_service.memory import GovernedMemory
 from runtime_service.planner import FinishDecision, ToolObservation
 
 from .memory import TravelMemoryPolicy
+from .preferences import parse_explicit_travel_preferences
 from .reducer import append_trace
 from .runtime import TravelMessageInput
 from .state import AgentState, TravelPlan
@@ -325,14 +326,7 @@ class DynamicTravelRuntime:
                 break
 
         preferences = dict(state.preferences)
-        if "red-eye" in text or "red eye" in text or "红眼" in user_message:
-            preferences["avoid_red_eye"] = not any(
-                phrase in text for phrase in ("allow red-eye", "allow red eye")
-            )
-        if "near subway" in text or "靠近地铁" in user_message:
-            preferences["hotel_near_subway"] = True
-        if "relaxed" in text or "轻松" in user_message:
-            preferences["travel_style"] = "relaxed"
+        preferences.update(parse_explicit_travel_preferences(user_message))
         if preferences:
             updates["preferences"] = preferences
         return state.model_copy(update=updates, deep=True)

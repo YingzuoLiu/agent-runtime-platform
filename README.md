@@ -53,7 +53,7 @@ See [`FINDINGS.md`](FINDINGS.md) for the scenarios, traces, and ablation results
 | Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
 | Domains | Four Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
 | Evidence | Typed REST/SSE events for Planner, policy, tool, recovery, and terminal outcomes | [`tests/test_dynamic_travel_api.py`](tests/test_dynamic_travel_api.py) |
-| Verification | 310 tests; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
+| Verification | 322 tests; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
 
 ## Quick start
 
