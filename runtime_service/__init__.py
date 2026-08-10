@@ -19,6 +19,16 @@ from .dynamic_loop import (
     DynamicToolLoop,
     FinishEvaluation,
 )
+from .external_actions import (
+    AmbiguousExternalActionError,
+    DefinitiveExternalActionError,
+    ExternalActionDispatcher,
+    ExternalActionProvider,
+    ExternalActionProviderRegistry,
+    ExternalActionProviderResult,
+    ExternalActionRequest,
+)
+from .http_external_action import HttpExternalActionProvider
 from .manager import ReferencedRunNotFoundError, RuntimeManager
 from .memory import (
     GovernedMemory,
@@ -46,12 +56,14 @@ from .planner import (
 )
 from .registry import AgentRegistry, build_default_registry
 from .sandbox import (
+    ToolEffect,
     ToolDescriptor,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolExecutionStatus,
     ToolPolicy,
     ToolRegistry,
+    ToolRetryMode,
     ToolSandbox,
     ToolSpec,
 )
@@ -83,9 +95,17 @@ __all__ = [
     "DynamicLoopOutcome",
     "DynamicLoopResult",
     "DynamicToolLoop",
+    "ExternalActionDispatcher",
+    "ExternalActionProvider",
+    "ExternalActionProviderRegistry",
+    "ExternalActionProviderResult",
+    "ExternalActionRequest",
+    "AmbiguousExternalActionError",
+    "DefinitiveExternalActionError",
     "FinishDecision",
     "FinishEvaluation",
     "GovernedMemory",
+    "HttpExternalActionProvider",
     "MemoryEvent",
     "MemoryKind",
     "MemoryMutationAction",
@@ -115,11 +135,13 @@ __all__ = [
     "StaticApiKeyAuthenticator",
     "TenantContext",
     "ToolDescriptor",
+    "ToolEffect",
     "ToolExecutionRequest",
     "ToolExecutionResult",
     "ToolExecutionStatus",
     "ToolPolicy",
     "ToolRegistry",
+    "ToolRetryMode",
     "ToolSandbox",
     "ToolSpec",
     "ToolObservation",

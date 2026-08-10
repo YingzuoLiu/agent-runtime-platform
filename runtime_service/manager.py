@@ -4,6 +4,7 @@ import queue
 import sqlite3
 import threading
 import traceback
+from collections.abc import Callable
 from uuid import uuid4
 
 from agent.contracts import (
@@ -25,13 +26,21 @@ class ReferencedRunNotFoundError(KeyError):
 class RuntimeManager:
     """Durable run lifecycle manager with an in-process worker pool."""
 
-    def __init__(self, store: SQLiteRunStore, registry: AgentRegistry, *, worker_count: int = 1) -> None:
+    def __init__(
+        self,
+        store: SQLiteRunStore,
+        registry: AgentRegistry,
+        *,
+        worker_count: int = 1,
+        recovery_reconciliation_required: Callable[[str], bool] | None = None,
+    ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be at least 1")
         self.store = store
         self.registry = registry
         self.store.bind_state_registry(registry)
         self.worker_count = worker_count
+        self._recovery_reconciliation_required = recovery_reconciliation_required
         self._queue: queue.Queue[tuple[str, bool] | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._started = False
@@ -190,7 +199,12 @@ class RuntimeManager:
         run = self._require_run(run_id)
         if run.status.is_terminal:
             return
-        if run.cancel_requested:
+        reconcile_before_cancelling = (
+            recovered_after_restart
+            and self._recovery_reconciliation_required is not None
+            and self._recovery_reconciliation_required(run_id)
+        )
+        if run.cancel_requested and not reconcile_before_cancelling:
             self._mark_cancelled(run, reason="cancelled_before_start")
             return
         run.status = RunStatus.RUNNING
@@ -247,7 +261,15 @@ class RuntimeManager:
                 return
         except Exception as exc:  # pragma: no cover
             run = self._require_run(run_id)
-            if run.cancel_requested:
+            external_action_safety_failure = (
+                isinstance(exc, RuntimeExecutionError)
+                and exc.code
+                in {
+                    "external_action_outcome_unknown",
+                    "external_action_evidence_incomplete",
+                }
+            )
+            if run.cancel_requested and not external_action_safety_failure:
                 self._mark_cancelled(run, reason="cancelled_during_failure_boundary")
                 return
             run.status = RunStatus.FAILED

@@ -1,7 +1,11 @@
 import threading
 import time
 
-from agent.contracts import RuntimeResponse
+from agent.contracts import (
+    RuntimeExecutionContext,
+    RuntimeExecutionError,
+    RuntimeResponse,
+)
 from domains.release_validation.models import (
     ReleaseManifest,
     ReleaseValidationInput,
@@ -96,6 +100,28 @@ class CountingBlockingRuntime(TravelAgentRuntime):
         return super().handle_user_message(state, user_message)
 
 
+class BlockingUncertainActionRuntime(TravelAgentRuntime):
+    def __init__(self, started: threading.Event, release: threading.Event):
+        super().__init__()
+        self.started = started
+        self.release = release
+
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del state, runtime_input, context
+        self.started.set()
+        if not self.release.wait(timeout=10):
+            raise TimeoutError("test release event was not set")
+        raise RuntimeExecutionError(
+            "external_action_outcome_unknown",
+            "External action provider outcome is unknown.",
+        )
+
+
 def blocking_registry(started: threading.Event, release: threading.Event) -> AgentRegistry:
     registry = AgentRegistry()
     registry.register(
@@ -103,6 +129,22 @@ def blocking_registry(started: threading.Event, release: threading.Event) -> Age
         "0.3.0",
         lambda: BlockingRuntime(started, release),
         description="Blocking test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def uncertain_action_registry(
+    started: threading.Event,
+    release: threading.Event,
+) -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        lambda: BlockingUncertainActionRuntime(started, release),
+        description="Uncertain external-action test runtime",
         input_model=TravelMessageInput,
         state_model=AgentState,
     )
@@ -208,6 +250,86 @@ def test_cancelled_after_execution_boundary(tmp_path):
     finally:
         release.set()
         manager.stop()
+
+
+def test_outcome_unknown_is_not_hidden_by_concurrent_cancellation(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    manager = RuntimeManager(store, uncertain_action_registry(started, release))
+    manager.start()
+    try:
+        submitted = submit_run(
+            manager,
+            RunCreateRequest(
+                thread_id="uncertain-action-cancel",
+                agent_version="1.2.0",
+                user_message="Create the test action.",
+            ),
+        )
+        assert started.wait(timeout=5)
+        manager.request_cancel(submitted.run_id, tenant_context=TENANT_CONTEXT)
+        release.set()
+        result = wait_for_terminal(manager, submitted.run_id)
+    finally:
+        release.set()
+        manager.stop()
+
+    assert result.status == RunStatus.FAILED
+    assert result.error_code == "external_action_outcome_unknown"
+    event_types = [event.event_type for event in store.list_events(submitted.run_id)]
+    assert "run.cancel_requested" in event_types
+    assert "run.failed" in event_types
+    assert "run.cancelled" not in event_types
+
+
+def test_recovered_inflight_action_is_reconciled_before_persisted_cancel(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    store.create_run(
+        RunRecord(
+            run_id="run_reconcile_before_cancel",
+            thread_id="reconcile-before-cancel",
+            agent_id="travel-agent",
+            agent_version="1.2.0",
+            domain_id="travel",
+            schema_version="1",
+            status=RunStatus.RUNNING,
+            input=TravelMessageInput(
+                user_message="Create the test action."
+            ).model_dump(mode="json"),
+            cancel_requested=True,
+            attempt=1,
+        )
+    )
+    started = threading.Event()
+    release = threading.Event()
+    release.set()
+    manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        uncertain_action_registry(started, release),
+        recovery_reconciliation_required=(
+            lambda run_id: run_id == "run_reconcile_before_cancel"
+        ),
+    )
+
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, "run_reconcile_before_cancel")
+    finally:
+        manager.stop()
+
+    assert started.is_set()
+    assert result.status == RunStatus.FAILED
+    assert result.error_code == "external_action_outcome_unknown"
+    event_types = [
+        event.event_type
+        for event in manager.store.list_events("run_reconcile_before_cancel")
+    ]
+    assert "run.recovered" in event_types
+    assert "run.started" in event_types
+    assert "run.failed" in event_types
+    assert "run.cancelled" not in event_types
 
 
 def test_running_run_is_recovered_after_restart(tmp_path):

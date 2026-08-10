@@ -219,6 +219,7 @@ def test_viewer_role_allows_only_read_permissions(permission):
     "permission",
     [
         RuntimePermission.TOOLS_EXECUTE,
+        RuntimePermission.EXTERNAL_ACTIONS_EXECUTE,
         RuntimePermission.AGENT_MESSAGE_EXECUTE,
         RuntimePermission.RUNS_CREATE,
         RuntimePermission.RUNS_CANCEL,

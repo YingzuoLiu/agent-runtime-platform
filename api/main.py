@@ -15,6 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from domains.release_validation.runtime import ReleaseValidationWorkflow
 from domains.release_validation.tools import build_release_validation_tool_registry
 from domains.travel.dynamic_runtime import DynamicTravelRuntime
+from domains.travel.external_action_runtime import (
+    DurableActionTravelPlanner,
+    DurableActionTravelRuntime,
+)
 from domains.travel.memory import TravelMemoryPolicy
 from domains.travel.planner import build_travel_planner_from_environment
 from domains.travel.preferences import (
@@ -23,7 +27,11 @@ from domains.travel.preferences import (
 )
 from domains.travel.state import AgentState
 from domains.travel.runtime import TravelAgentRuntime
-from domains.travel.tools import build_travel_tool_registry
+from domains.travel.tools import (
+    SQLiteTripHoldProvider,
+    build_travel_external_action_tool_registry,
+    build_travel_tool_registry,
+)
 from runtime_service import (
     AgentDescriptor,
     AuthenticationError,
@@ -32,6 +40,7 @@ from runtime_service import (
     Authorizer,
     DynamicToolLoop,
     GovernedMemory,
+    HttpExternalActionProvider,
     MemoryKind,
     MemoryRecord,
     Planner,
@@ -48,11 +57,17 @@ from runtime_service import (
     StaticApiKeyAuthenticator,
     TenantContext,
     ToolDescriptor,
+    ToolEffect,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolSandbox,
     build_default_registry,
     effective_execution_authority,
+)
+from runtime_service.external_actions import (
+    ExternalActionDispatcher,
+    ExternalActionProvider,
+    ExternalActionProviderRegistry,
 )
 from runtime_service.workflow_store import SQLiteWorkflowStore
 
@@ -81,6 +96,7 @@ def create_app(
     authenticator: Authenticator | None = None,
     authorizer: Authorizer | None = None,
     travel_planner: Planner | None = None,
+    travel_action_provider: ExternalActionProvider | None = None,
 ) -> FastAPI:
     database_value = database_path
     if database_value is None:
@@ -98,7 +114,9 @@ def create_app(
         if travel_planner is not None
         else build_travel_planner_from_environment()
     )
-    tool_registry = build_travel_tool_registry()
+    legacy_travel_tool_registry = build_travel_tool_registry()
+    governed_memory_tool_registry = build_travel_tool_registry()
+    external_action_tool_registry = build_travel_external_action_tool_registry()
     bearer_scheme = HTTPBearer(auto_error=False)
 
     @asynccontextmanager
@@ -111,10 +129,51 @@ def create_app(
             workflow_store,
             ToolSandbox(build_release_validation_tool_registry()),
         )
+        provider_registry = ExternalActionProviderRegistry()
+        if travel_action_provider is not None:
+            resolved_action_provider = travel_action_provider
+        elif action_provider_url := os.getenv("RUNTIME_TRAVEL_ACTION_PROVIDER_URL"):
+            action_provider_identity = os.getenv(
+                "RUNTIME_TRAVEL_ACTION_PROVIDER_IDENTITY"
+            )
+            if action_provider_identity is None:
+                raise ValueError(
+                    "RUNTIME_TRAVEL_ACTION_PROVIDER_IDENTITY is required "
+                    "when the HTTP external-action provider is configured"
+                )
+            resolved_action_provider = HttpExternalActionProvider(
+                endpoint=action_provider_url,
+                provider_identity=action_provider_identity,
+                bearer_token=os.getenv(
+                    "RUNTIME_TRAVEL_ACTION_PROVIDER_BEARER_TOKEN"
+                ),
+                allow_insecure_localhost=(
+                    os.getenv(
+                        "RUNTIME_TRAVEL_ACTION_PROVIDER_ALLOW_INSECURE_LOCALHOST",
+                        "",
+                    ).strip().lower()
+                    == "true"
+                ),
+                supports_idempotency=(
+                    os.getenv(
+                        "RUNTIME_TRAVEL_ACTION_PROVIDER_SUPPORTS_IDEMPOTENCY",
+                        "",
+                    ).strip().lower()
+                    == "true"
+                ),
+            )
+        else:
+            resolved_action_provider = SQLiteTripHoldProvider(
+                resolved_database_path.with_name(
+                    f"{resolved_database_path.name}.trip-hold-provider"
+                )
+            )
+        provider_registry.register("travel-trip-hold", resolved_action_provider)
+        action_dispatcher = ExternalActionDispatcher(provider_registry)
         dynamic_travel_loop = DynamicToolLoop(
             planner=resolved_travel_planner,
-            tool_registry=tool_registry,
-            tool_sandbox=ToolSandbox(tool_registry),
+            tool_registry=legacy_travel_tool_registry,
+            tool_sandbox=ToolSandbox(legacy_travel_tool_registry),
             workflow_store=workflow_store,
             run_event_sink=store,
             workflow_type="dynamic-tool-loop:travel-agent:1.0.0",
@@ -122,12 +181,22 @@ def create_app(
         )
         governed_memory_travel_loop = DynamicToolLoop(
             planner=resolved_travel_planner,
-            tool_registry=tool_registry,
-            tool_sandbox=ToolSandbox(tool_registry),
+            tool_registry=governed_memory_tool_registry,
+            tool_sandbox=ToolSandbox(governed_memory_tool_registry),
             workflow_store=workflow_store,
             run_event_sink=store,
             workflow_type="dynamic-tool-loop:travel-agent:1.1.0",
             max_tool_calls=3,
+        )
+        external_action_travel_loop = DynamicToolLoop(
+            planner=DurableActionTravelPlanner(resolved_travel_planner),
+            tool_registry=external_action_tool_registry,
+            tool_sandbox=ToolSandbox(external_action_tool_registry),
+            workflow_store=workflow_store,
+            run_event_sink=store,
+            workflow_type="dynamic-tool-loop:travel-agent:1.2.0",
+            max_tool_calls=4,
+            external_action_dispatcher=action_dispatcher,
         )
         registry = build_default_registry(
             release_validation_workflow=release_workflow,
@@ -145,20 +214,36 @@ def create_app(
                     preference_parser=parse_explicit_travel_preferences,
                 )
             ),
+            external_action_travel_runtime_factory=(
+                lambda: DurableActionTravelRuntime(
+                    external_action_travel_loop,
+                    governed_memory=governed_memory,
+                    memory_policy=TravelMemoryPolicy(),
+                    preference_parser=parse_explicit_travel_preferences,
+                )
+            ),
         )
         store.bind_state_registry(registry)
         manager = RuntimeManager(
             store=store,
             registry=registry,
             worker_count=resolved_worker_count,
+            recovery_reconciliation_required=(
+                workflow_store.has_external_action_requiring_reconciliation
+            ),
         )
         manager.start()
         app.state.run_store = store
         app.state.memory_store = memory_store
         app.state.runtime_manager = manager
         app.state.agent_registry = registry
-        app.state.tool_registry = tool_registry
-        app.state.tool_sandbox = ToolSandbox(tool_registry)
+        # Preserve the published direct-sandbox catalog: external writes are
+        # reachable only through the version-pinned 1.2 durable run loop.
+        app.state.tool_registry = legacy_travel_tool_registry
+        app.state.tool_sandbox = ToolSandbox(legacy_travel_tool_registry)
+        app.state.external_action_tool_registry = external_action_tool_registry
+        app.state.workflow_store = workflow_store
+        app.state.travel_action_provider = resolved_action_provider
         app.state.authenticator = resolved_authenticator
         app.state.authorizer = resolved_authorizer
         yield
@@ -168,9 +253,10 @@ def create_app(
         title="Agent Runtime Reliability Platform",
         description=(
             "Typed domain runtimes sharing one durable run lifecycle and unified API, "
-            "plus policy-enforced tools and governed cross-thread memory."
+            "plus policy-enforced tools, governed cross-thread memory and durable "
+            "external actions."
         ),
-        version="1.1.0",
+        version="1.2.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -215,6 +301,7 @@ def create_app(
     def ready(request: Request) -> dict[str, str]:
         request.app.state.run_store.ping()
         request.app.state.memory_store.ping()
+        request.app.state.workflow_store.ping()
         return {"status": "ready"}
 
     @app.get("/agents", response_model=list[AgentDescriptor])
@@ -247,6 +334,16 @@ def create_app(
         ):
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.TOOLS_EXECUTE)
+        spec = request.app.state.external_action_tool_registry.resolve(tool_name)
+        if spec is not None and spec.effect == ToolEffect.EXTERNAL_WRITE:
+            require_permission(
+                principal,
+                RuntimePermission.EXTERNAL_ACTIONS_EXECUTE,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="External-write tools require the durable run lifecycle",
+            )
         if payload.run_id is not None:
             store.append_event(
                 payload.run_id,
