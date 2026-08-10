@@ -341,6 +341,152 @@ class SQLiteRunStore:
                 raise KeyError(f"Run not found: {run.run_id}")
         return run
 
+    def mark_reconciliation_pending(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        error_code: str,
+        error: str,
+    ) -> RunRecord:
+        """Persist a non-terminal recovery marker without overwriting races.
+
+        In particular, this narrow UPDATE must not copy a stale
+        ``cancel_requested`` value back over a cancellation CAS that committed
+        while the worker was unwinding its runtime call.
+        """
+
+        updated_at = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE runs SET
+                    error_code = ?, error = ?, completed_at = NULL, updated_at = ?
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                """,
+                (
+                    error_code,
+                    error,
+                    updated_at,
+                    run_id,
+                    tenant_id,
+                    RunStatus.RUNNING.value,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Run not found: {run_id}")
+        return self._row_to_run(row)
+
+    def claim_run_start(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
+        """Atomically claim one QUEUED Run without overwriting cancellation.
+
+        The narrow UPDATE preserves ``cancel_requested`` if its CAS commits
+        before or during this claim.  The returned row is read in the same
+        transaction and ``run.started`` is appended only for the winning
+        claim, so the Manager can arbitrate that latest cancellation before it
+        invokes domain code.
+        """
+
+        started_at = utc_now()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    status = ?, started_at = ?, attempt = attempt + 1,
+                    updated_at = ?
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                """,
+                (
+                    RunStatus.RUNNING.value,
+                    started_at,
+                    started_at,
+                    run_id,
+                    tenant_id,
+                    RunStatus.QUEUED.value,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            if cursor.rowcount != 1:
+                return None
+            run = self._row_to_run(row)
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "run.started",
+                {"attempt": run.attempt},
+            )
+        return run
+
+    def recover_run_for_restart(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        reconciliation_pending_code: str,
+    ) -> RunRecord | None:
+        """Atomically return one interrupted RUNNING Run to QUEUED.
+
+        The transition preserves the database's current cancellation flag,
+        rather than copying a stale row returned by ``list_recoverable_runs``.
+        A reconciliation marker survives; unrelated transient errors are
+        cleared.  The recovery event commits in the same transaction.
+        """
+
+        updated_at = utc_now()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    status = ?, started_at = NULL,
+                    error = CASE WHEN error_code = ? THEN error ELSE NULL END,
+                    error_code = CASE
+                        WHEN error_code = ? THEN error_code ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                """,
+                (
+                    RunStatus.QUEUED.value,
+                    reconciliation_pending_code,
+                    reconciliation_pending_code,
+                    updated_at,
+                    run_id,
+                    tenant_id,
+                    RunStatus.RUNNING.value,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            if cursor.rowcount != 1:
+                return None
+            run = self._row_to_run(row)
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "run.recovered",
+                {
+                    "reason": (
+                        reconciliation_pending_code
+                        if run.error_code == reconciliation_pending_code
+                        else "runtime_restart"
+                    )
+                },
+            )
+        return run
+
     def request_cancel_atomically(self, run_id: str, *, tenant_id: str) -> RunRecord:
         """Atomically flip `cancel_requested` 0 -> 1 for a QUEUED/RUNNING run.
 
@@ -439,7 +585,8 @@ class SQLiteRunStore:
                 """
                 UPDATE runs SET
                     status = ?, state_json = ?, output_message = ?,
-                    validation_errors_json = ?, completed_at = ?, updated_at = ?
+                    validation_errors_json = ?, error_code = NULL, error = NULL,
+                    completed_at = ?, updated_at = ?
                 WHERE run_id = ? AND tenant_id = ?
                     AND status = ? AND cancel_requested = 0
                 """,
@@ -495,6 +642,8 @@ class SQLiteRunStore:
             )
 
         run.status = RunStatus.COMPLETED
+        run.error_code = None
+        run.error = None
         run.completed_at = completed_at
         run.updated_at = completed_at
         return True
@@ -520,8 +669,9 @@ class SQLiteRunStore:
           would still be caught if `cancel_requested` were ever 0 here,
           though that combination should not occur given the call sites.
 
-        Every mutable column other than `status`/`cancel_requested`/`completed_at`/
-        `updated_at` is written exactly as it currently stands on `run`. The
+        Every mutable column other than terminal `error_code`/`error` is
+        written exactly as it currently stands on `run`. Cancellation clears
+        any transient execution or reconciliation error marker. The
         persisted `tenant_id` is deliberately immutable and is part of the
         UPDATE predicate instead of its SET list. Therefore,
         each existing call site's semantics survive unchanged: a
@@ -529,9 +679,8 @@ class SQLiteRunStore:
         state alone (the caller never overwrote `run.state`), while an
         after-execution-boundary cancellation carries over the
         just-computed result state (the caller set `run.state` to it before
-        calling this) -- `output_message`/`validation_errors`/`error`/
-        `attempt` follow whatever the caller set on `run`, matching
-        `_mark_cancelled`'s previous full-row `update_run` semantics.
+        calling this) -- `output_message`/`validation_errors`/`attempt` follow
+        whatever the caller set on `run`.
 
         If the UPDATE does not affect exactly one row -- already cancelled,
         already completed/failed by a concurrent finalize, or (defensively)
@@ -554,7 +703,8 @@ class SQLiteRunStore:
                     agent_version = ?, domain_id = ?,
                     schema_version = ?, status = ?, input_message = ?, input_json = ?,
                     state_json = ?, output_message = ?,
-                    validation_errors_json = ?, error_code = ?, error = ?, attempt = ?,
+                    validation_errors_json = ?, error_code = NULL, error = NULL,
+                    attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
                     updated_at = ?, started_at = ?, completed_at = ?
                 WHERE run_id = ? AND tenant_id = ?
@@ -577,8 +727,6 @@ class SQLiteRunStore:
                     state_json,
                     run.output_message,
                     validation_errors_json,
-                    run.error_code,
-                    run.error,
                     run.attempt,
                     1,
                     run.client_request_id,
@@ -604,6 +752,8 @@ class SQLiteRunStore:
 
         run.status = RunStatus.CANCELLED
         run.cancel_requested = True
+        run.error_code = None
+        run.error = None
         run.completed_at = completed_at
         run.updated_at = completed_at
         return True

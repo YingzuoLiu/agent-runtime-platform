@@ -348,6 +348,7 @@ execution claim is made.
 - cancellation arbitration before first dispatch;
 - fail-closed post-dispatch reconciliation for identity, provider, capability, permission, and
   schema drift;
+- crash-equivalent recovery when uncertain-outcome terminalization itself cannot be committed;
 - stable `external_action_evidence_incomplete` reporting without undoing a succeeded action.
 
 The external-action claim is intentionally narrow. The bundled write is a deterministic

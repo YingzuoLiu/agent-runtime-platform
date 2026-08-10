@@ -149,6 +149,15 @@ action state and registered retry mode:
 | `failed` | Preserve the definitive failure; do not silently retry it. |
 | `outcome_unknown` | Preserve the uncertainty as `external_action_outcome_unknown`; do not convert it to success, ordinary failure, or cancellation. |
 
+If the local transaction that should finalize an uncertain action cannot be
+proven committed, the runtime does not mark the Workflow or Run terminal while
+the action is still `dispatching`. The Run remains `running` as a
+crash-equivalent recovery candidate with a non-terminal reconciliation marker;
+the next process start re-enters the same fenced recovery path, even if a
+cancellation was requested meanwhile. Phase 7A does not include a continuously running
+reconciliation scanner, so this rare local persistence outage requires a
+runtime restart to make progress.
+
 Recovery also checks the persisted dispatch against the current execution boundary. Once
 `dispatch_count > 0`, drift in thread-state/workflow identity, the server-owned runtime-input
 gate, registered tool effect or input schema, persisted permission, provider

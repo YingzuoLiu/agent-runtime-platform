@@ -14,6 +14,7 @@ from .external_actions import (
     DefinitiveExternalActionError,
     ExternalActionDispatcher,
     ExternalActionProviderResult,
+    ExternalActionReconciliationPendingError,
     ExternalActionRequest,
 )
 from .planner import (
@@ -185,6 +186,8 @@ class DynamicToolLoop:
                 finish_evaluator=finish_evaluator,
             )
         except Exception as exc:
+            if isinstance(exc, ExternalActionReconciliationPendingError):
+                raise
             if (
                 isinstance(exc, RuntimeExecutionError)
                 and exc.code
@@ -721,13 +724,13 @@ class DynamicToolLoop:
             pass
         if action.status == ExternalActionStatus.DISPATCHING:
             step = self.workflow_store.get_step(context.run_id, action.step_id)
-            if step is not None:
-                self._fail_external_dispatch_binding(
-                    context=context,
-                    step=step,
-                    action=action,
-                )
-            code = "external_action_outcome_unknown"
+            if step is None:
+                raise ExternalActionReconciliationPendingError()
+            self._fail_external_dispatch_binding(
+                context=context,
+                step=step,
+                action=action,
+            )
         elif action.status == ExternalActionStatus.OUTCOME_UNKNOWN:
             code = "external_action_outcome_unknown"
         elif action.status == ExternalActionStatus.SUCCEEDED:
@@ -736,8 +739,9 @@ class DynamicToolLoop:
             code = "external_action_failed"
         else:
             # PREPARED with dispatch_count > 0 is corrupt and cannot prove that
-            # a provider call did not happen.
-            code = "external_action_outcome_unknown"
+            # a provider call did not happen.  It also cannot be fenced into a
+            # terminal outcome, so keep the Run recoverable for reconciliation.
+            raise ExternalActionReconciliationPendingError()
 
         try:
             self._fail(
@@ -976,11 +980,7 @@ class DynamicToolLoop:
                     "External action is already running without a recovery boundary.",
                 )
             if existing.attempt_token is None:
-                self._fail(
-                    context.run_id,
-                    "invalid_planner_decision",
-                    "Running external action step has no attempt token.",
-                )
+                raise ExternalActionReconciliationPendingError()
             step = existing
             attempt_token = existing.attempt_token
             recovered_dispatch = True
@@ -1044,11 +1044,10 @@ class DynamicToolLoop:
             )
         except Exception:
             if recovered_dispatch:
-                self._fail(
-                    context.run_id,
-                    "external_action_outcome_unknown",
-                    "Recovered external action state could not be validated.",
-                )
+                # The existing RUNNING step may already own a DISPATCHING
+                # action.  If its ledger row cannot be read or validated, keep
+                # both Workflow and Run non-terminal for startup recovery.
+                raise ExternalActionReconciliationPendingError() from None
             self._fail(
                 context.run_id,
                 "invalid_planner_decision",
@@ -1200,15 +1199,13 @@ class DynamicToolLoop:
     ) -> ToolObservation:
         dispatch_token = action.dispatch_token
         if dispatch_token is None:
-            self._fail(
-                context.run_id,
-                "invalid_planner_decision",
-                "Dispatching external action has no dispatch token.",
-            )
+            raise ExternalActionReconciliationPendingError()
         if spec.retry_mode == ToolRetryMode.UNSAFE:
             self._raise_external_outcome_unknown(
                 context=context,
                 step=step,
+                dispatch_token=dispatch_token,
+                attempt_token=attempt_token,
                 finalizer=lambda: self.workflow_store.finalize_unsafe_interrupted_action(
                     context.run_id,
                     step.step_id,
@@ -1324,6 +1321,8 @@ class DynamicToolLoop:
                         self._raise_external_outcome_unknown(
                             context=context,
                             step=step,
+                            dispatch_token=dispatch_token,
+                            attempt_token=attempt_token,
                             finalizer=lambda: (
                                 self.workflow_store.finalize_external_action_outcome_unknown(
                                     context.run_id,
@@ -1423,6 +1422,8 @@ class DynamicToolLoop:
                     self._raise_external_outcome_unknown(
                         context=context,
                         step=step,
+                        dispatch_token=dispatch_token,
+                        attempt_token=attempt_token,
                         finalizer=lambda: (
                             self.workflow_store.finalize_external_action_outcome_unknown(
                                 context.run_id,
@@ -1500,6 +1501,8 @@ class DynamicToolLoop:
         self._raise_external_outcome_unknown(
             context=context,
             step=step,
+            dispatch_token=dispatch_token,
+            attempt_token=attempt_token,
             finalizer=lambda: self.workflow_store.finalize_external_action_outcome_unknown(
                 context.run_id,
                 step.step_id,
@@ -1714,28 +1717,34 @@ class DynamicToolLoop:
         *,
         context: RuntimeExecutionContext,
         step: ToolCallRecord,
+        dispatch_token: str,
+        attempt_token: str,
         finalizer: Callable[[], Any],
     ) -> NoReturn:
-        finalized = False
         try:
             finalizer()
-            finalized = True
         except Exception:
-            # The provider may have applied the action even when its terminal
-            # ledger write fails. Never allow that local exception to become a
-            # generic retryable runtime failure.
-            finalized = False
-        if finalized:
-            try:
-                self._mirror_evidence(context.run_id)
-                self._record_tool_failure(
-                    context.run_id,
-                    step.step_id,
-                    step.tool_name,
-                    "external_action_outcome_unknown",
-                )
-            except Exception:
-                pass
+            # A wrapper or connection cleanup can raise after SQLite committed.
+            # Trust only an exact terminal read-back.  If the action is still
+            # DISPATCHING, do not terminalize the Workflow: doing so would make
+            # the in-flight action unreachable by startup recovery.
+            if not self._external_outcome_unknown_was_committed(
+                context=context,
+                step=step,
+                dispatch_token=dispatch_token,
+                attempt_token=attempt_token,
+            ):
+                raise ExternalActionReconciliationPendingError() from None
+        try:
+            self._mirror_evidence(context.run_id)
+            self._record_tool_failure(
+                context.run_id,
+                step.step_id,
+                step.tool_name,
+                "external_action_outcome_unknown",
+            )
+        except Exception:
+            pass
         try:
             self._fail(
                 context.run_id,
@@ -1750,6 +1759,49 @@ class DynamicToolLoop:
         raise RuntimeExecutionError(
             "external_action_outcome_unknown",
             self._FAILURE_MESSAGES["external_action_outcome_unknown"],
+        )
+
+    def _external_outcome_unknown_was_committed(
+        self,
+        *,
+        context: RuntimeExecutionContext,
+        step: ToolCallRecord,
+        dispatch_token: str,
+        attempt_token: str,
+    ) -> bool:
+        """Recognize an exception raised after the unknown terminal commit."""
+
+        try:
+            action = self.workflow_store.get_external_action(
+                context.run_id,
+                step.step_id,
+            )
+            current_step = self.workflow_store.get_step(
+                context.run_id,
+                step.step_id,
+            )
+        except Exception:
+            return False
+        return bool(
+            action is not None
+            and current_step is not None
+            and action.run_id == context.run_id
+            and action.step_id == step.step_id
+            and action.tool_name == step.tool_name
+            and action.input_hash == step.input_hash
+            and action.status == ExternalActionStatus.OUTCOME_UNKNOWN
+            and action.dispatch_token == dispatch_token
+            and action.provider_reference is None
+            and action.result_json is None
+            and action.error_code == "external_action_outcome_unknown"
+            and current_step.run_id == context.run_id
+            and current_step.step_id == step.step_id
+            and current_step.tool_name == step.tool_name
+            and current_step.input_hash == step.input_hash
+            and current_step.status == ToolCallStatus.FAILED
+            and current_step.attempt_token == attempt_token
+            and current_step.result_json is None
+            and current_step.error_code == "external_action_outcome_unknown"
         )
 
     def _handle_external_terminal(
@@ -2054,15 +2106,14 @@ class DynamicToolLoop:
         # Even corrupt identity metadata must therefore fail as unknown, never
         # as an ordinary validation error that cancellation could mask.
         if action.dispatch_token is None or step.attempt_token is None:
-            raise RuntimeExecutionError(
-                "external_action_outcome_unknown",
-                self._FAILURE_MESSAGES["external_action_outcome_unknown"],
-            )
+            raise ExternalActionReconciliationPendingError()
         dispatch_token = action.dispatch_token
         attempt_token = step.attempt_token
         self._raise_external_outcome_unknown(
             context=context,
             step=step,
+            dispatch_token=dispatch_token,
+            attempt_token=attempt_token,
             finalizer=lambda: self.workflow_store.finalize_external_action_outcome_unknown(
                 context.run_id,
                 step.step_id,

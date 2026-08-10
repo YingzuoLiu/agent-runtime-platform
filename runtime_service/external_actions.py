@@ -4,6 +4,8 @@ from typing import Any, ClassVar, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agent.contracts import RuntimeExecutionError
+
 from .sandbox import ToolRetryMode
 
 
@@ -64,6 +66,23 @@ class AmbiguousExternalActionError(ExternalActionProviderError):
 
     code = "external_action_outcome_unknown"
     safe_message = "External action provider outcome is unknown."
+
+
+class ExternalActionReconciliationPendingError(RuntimeExecutionError):
+    """Internal signal that a dispatched action is not terminal locally yet.
+
+    This is deliberately not a terminal external-action outcome.  The caller
+    must leave the Workflow and Run recoverable so restart recovery can retry
+    only the existing, fenced reconciliation path.
+    """
+
+    CODE: ClassVar[str] = "external_action_reconciliation_pending"
+
+    def __init__(self) -> None:
+        super().__init__(
+            self.CODE,
+            "External action reconciliation requires restart recovery.",
+        )
 
 
 class ExternalActionProvider(Protocol):

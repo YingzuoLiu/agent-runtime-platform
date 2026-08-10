@@ -23,6 +23,7 @@ from runtime_service.external_actions import (
     ExternalActionDispatcher,
     ExternalActionProviderRegistry,
     ExternalActionProviderResult,
+    ExternalActionReconciliationPendingError,
     ExternalActionRequest,
 )
 from runtime_service.models import RunRecord, RunStatus
@@ -620,6 +621,378 @@ def test_provider_success_with_terminal_write_failure_becomes_outcome_unknown(
     step = workflow_store.get_step(context.run_id, "call-0001")
     assert action is not None and action.status == ExternalActionStatus.OUTCOME_UNKNOWN
     assert step is not None and step.status == ToolCallStatus.FAILED
+
+
+def test_success_and_unknown_terminal_writes_fail_precommit_stay_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = execution_context("run-external-terminal-writes-fail-precommit")
+    database_path = tmp_path / "runtime.db"
+    run_store, workflow_store = initialize_stores(database_path, context)
+    provider = SuccessProvider()
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(provider),
+    )
+
+    def fail_terminal_write(*_args, **_kwargs):
+        raise sqlite3.OperationalError("injected pre-commit terminal write failure")
+
+    monkeypatch.setattr(
+        workflow_store,
+        "finalize_external_action_succeeded",
+        fail_terminal_write,
+    )
+    monkeypatch.setattr(
+        workflow_store,
+        "finalize_external_action_outcome_unknown",
+        fail_terminal_write,
+    )
+
+    with pytest.raises(ExternalActionReconciliationPendingError) as raised:
+        execute_loop(loop, context)
+
+    assert raised.value.code == "external_action_reconciliation_pending"
+    assert len(provider.requests) == 1
+    action = workflow_store.get_external_action(context.run_id, "call-0001")
+    step = workflow_store.get_step(context.run_id, "call-0001")
+    execution = workflow_store.get_execution(context.run_id)
+    assert action is not None and action.status == ExternalActionStatus.DISPATCHING
+    assert action.dispatch_count == 1
+    assert step is not None and step.status == ToolCallStatus.RUNNING
+    assert execution is not None and execution.status == WorkflowStatus.RUNNING
+
+    workflow_event_types = [
+        event.event_type for event in workflow_store.list_events(context.run_id)
+    ]
+    run_event_types = [event.event_type for event in run_store.list_events(context.run_id)]
+    terminal_event_types = {
+        "external_action.succeeded",
+        "external_action.failed",
+        "external_action.outcome_unknown",
+        "step.completed",
+        "step.failed",
+        "tool.result",
+        "loop.outcome",
+        "workflow.ready",
+        "workflow.blocked",
+        "workflow.failed",
+    }
+    assert terminal_event_types.isdisjoint(workflow_event_types)
+    assert terminal_event_types.isdisjoint(run_event_types)
+    assert [
+        event_type
+        for event_type in workflow_event_types
+        if event_type.startswith("external_action.")
+    ] == ["external_action.prepared", "external_action.dispatch_started"]
+    assert [
+        event_type for event_type in workflow_event_types if event_type.startswith("step.")
+    ] == ["step.claimed"]
+
+    recovered_provider = NeverCalledProvider()
+    recovered_workflow_store = SQLiteWorkflowStore(database_path)
+    recovered_loop = build_external_loop(
+        planner=ScriptedPlanner(),
+        workflow_store=recovered_workflow_store,
+        run_store=SQLiteRunStore(database_path),
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(recovered_provider),
+    )
+
+    with pytest.raises(RuntimeExecutionError) as recovered:
+        execute_loop(
+            recovered_loop,
+            context.model_copy(update={"recovered_after_restart": True}),
+        )
+
+    assert recovered.value.code == "external_action_outcome_unknown"
+    assert recovered_provider.requests == []
+    recovered_action = recovered_workflow_store.get_external_action(
+        context.run_id,
+        "call-0001",
+    )
+    recovered_step = recovered_workflow_store.get_step(context.run_id, "call-0001")
+    recovered_execution = recovered_workflow_store.get_execution(context.run_id)
+    assert (
+        recovered_action is not None
+        and recovered_action.status == ExternalActionStatus.OUTCOME_UNKNOWN
+    )
+    assert recovered_step is not None and recovered_step.status == ToolCallStatus.FAILED
+    assert (
+        recovered_execution is not None
+        and recovered_execution.status == WorkflowStatus.FAILED
+    )
+    recovered_event_types = [
+        event.event_type
+        for event in recovered_workflow_store.list_events(context.run_id)
+    ]
+    assert recovered_event_types.count("external_action.outcome_unknown") == 1
+    assert recovered_event_types.count("step.failed") == 1
+    assert recovered_event_types.count("workflow.failed") == 1
+
+
+def test_recovery_prepare_failure_cannot_terminalize_dispatching_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = execution_context("run-external-recovery-prepare-failure")
+    database_path = tmp_path / "runtime.db"
+    run_store, workflow_store = initialize_stores(database_path, context)
+    crashing_provider = CrashProvider()
+    first_loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(crashing_provider),
+    )
+
+    with pytest.raises(ProcessCrash):
+        execute_loop(first_loop, context)
+
+    recovered_workflow_store = SQLiteWorkflowStore(database_path)
+    recovered_provider = NeverCalledProvider()
+    recovered_loop = build_external_loop(
+        planner=ScriptedPlanner(),
+        workflow_store=recovered_workflow_store,
+        run_store=SQLiteRunStore(database_path),
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(recovered_provider),
+    )
+
+    def fail_recovery_prepare(*_args, **_kwargs):
+        raise sqlite3.OperationalError("injected recovery preparation failure")
+
+    monkeypatch.setattr(
+        recovered_workflow_store,
+        "prepare_external_action",
+        fail_recovery_prepare,
+    )
+
+    with pytest.raises(ExternalActionReconciliationPendingError):
+        execute_loop(
+            recovered_loop,
+            context.model_copy(update={"recovered_after_restart": True}),
+        )
+
+    assert recovered_provider.requests == []
+    pending_action = recovered_workflow_store.get_external_action(
+        context.run_id,
+        "call-0001",
+    )
+    pending_step = recovered_workflow_store.get_step(context.run_id, "call-0001")
+    pending_execution = recovered_workflow_store.get_execution(context.run_id)
+    assert (
+        pending_action is not None
+        and pending_action.status == ExternalActionStatus.DISPATCHING
+    )
+    assert pending_step is not None and pending_step.status == ToolCallStatus.RUNNING
+    assert (
+        pending_execution is not None
+        and pending_execution.status == WorkflowStatus.RUNNING
+    )
+    pending_event_types = [
+        event.event_type
+        for event in recovered_workflow_store.list_events(context.run_id)
+    ]
+    assert "external_action.outcome_unknown" not in pending_event_types
+    assert "step.failed" not in pending_event_types
+    assert "loop.outcome" not in pending_event_types
+    assert "workflow.failed" not in pending_event_types
+
+    final_workflow_store = SQLiteWorkflowStore(database_path)
+    final_provider = NeverCalledProvider()
+    final_loop = build_external_loop(
+        planner=ScriptedPlanner(),
+        workflow_store=final_workflow_store,
+        run_store=SQLiteRunStore(database_path),
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(final_provider),
+    )
+    with pytest.raises(RuntimeExecutionError) as final:
+        execute_loop(
+            final_loop,
+            context.model_copy(update={"recovered_after_restart": True}),
+        )
+
+    assert final.value.code == "external_action_outcome_unknown"
+    assert final_provider.requests == []
+    final_action = final_workflow_store.get_external_action(
+        context.run_id,
+        "call-0001",
+    )
+    final_step = final_workflow_store.get_step(context.run_id, "call-0001")
+    final_execution = final_workflow_store.get_execution(context.run_id)
+    assert final_action is not None
+    assert final_action.status == ExternalActionStatus.OUTCOME_UNKNOWN
+    assert final_step is not None and final_step.status == ToolCallStatus.FAILED
+    assert final_execution is not None
+    assert final_execution.status == WorkflowStatus.FAILED
+
+
+@pytest.mark.parametrize("missing_token", ["dispatch", "attempt"])
+def test_recovery_missing_fence_token_remains_reconciliation_pending(
+    tmp_path: Path,
+    missing_token: str,
+):
+    context = execution_context(f"run-external-missing-{missing_token}-token")
+    database_path = tmp_path / f"{missing_token}.db"
+    run_store, workflow_store = initialize_stores(database_path, context)
+    first_loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(CrashProvider()),
+    )
+    with pytest.raises(ProcessCrash):
+        execute_loop(first_loop, context)
+
+    with sqlite3.connect(database_path) as connection:
+        if missing_token == "dispatch":
+            connection.execute(
+                """
+                UPDATE external_actions SET dispatch_token = NULL
+                WHERE run_id = ? AND step_id = ?
+                """,
+                (context.run_id, "call-0001"),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE tool_calls SET attempt_token = NULL
+                WHERE run_id = ? AND step_id = ?
+                """,
+                (context.run_id, "call-0001"),
+            )
+
+    recovered_workflow_store = SQLiteWorkflowStore(database_path)
+    recovered_provider = NeverCalledProvider()
+    recovered_loop = build_external_loop(
+        planner=ScriptedPlanner(),
+        workflow_store=recovered_workflow_store,
+        run_store=SQLiteRunStore(database_path),
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.UNSAFE,
+        dispatcher=dispatcher_for(recovered_provider),
+    )
+    with pytest.raises(ExternalActionReconciliationPendingError):
+        execute_loop(
+            recovered_loop,
+            context.model_copy(update={"recovered_after_restart": True}),
+        )
+
+    assert recovered_provider.requests == []
+    action = recovered_workflow_store.get_external_action(
+        context.run_id,
+        "call-0001",
+    )
+    execution = recovered_workflow_store.get_execution(context.run_id)
+    assert action is not None and action.status == ExternalActionStatus.DISPATCHING
+    assert execution is not None and execution.status == WorkflowStatus.RUNNING
+    event_types = [
+        event.event_type
+        for event in recovered_workflow_store.list_events(context.run_id)
+    ]
+    assert "loop.outcome" not in event_types
+    assert "workflow.failed" not in event_types
+
+
+def test_unknown_terminal_write_commit_then_raise_is_read_back_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = execution_context("run-external-unknown-post-commit-exception")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = SuccessProvider()
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+        dispatcher=dispatcher_for(provider),
+    )
+    original_unknown_finalize = workflow_store.finalize_external_action_outcome_unknown
+
+    def fail_success_write(*_args, **_kwargs):
+        raise sqlite3.OperationalError("injected pre-commit success write failure")
+
+    def commit_unknown_then_raise(*args, **kwargs):
+        original_unknown_finalize(*args, **kwargs)
+        raise sqlite3.OperationalError("injected exception after unknown commit")
+
+    monkeypatch.setattr(
+        workflow_store,
+        "finalize_external_action_succeeded",
+        fail_success_write,
+    )
+    monkeypatch.setattr(
+        workflow_store,
+        "finalize_external_action_outcome_unknown",
+        commit_unknown_then_raise,
+    )
+
+    with pytest.raises(RuntimeExecutionError) as raised:
+        execute_loop(loop, context)
+
+    assert raised.value.code == "external_action_outcome_unknown"
+    assert len(provider.requests) == 1
+    action = workflow_store.get_external_action(context.run_id, "call-0001")
+    step = workflow_store.get_step(context.run_id, "call-0001")
+    execution = workflow_store.get_execution(context.run_id)
+    assert action is not None and action.status == ExternalActionStatus.OUTCOME_UNKNOWN
+    assert step is not None and step.status == ToolCallStatus.FAILED
+    assert step.error_code == "external_action_outcome_unknown"
+    assert execution is not None and execution.status == WorkflowStatus.FAILED
+    assert execution.error_code == "external_action_outcome_unknown"
+
+    terminal_event_types = {
+        "external_action.succeeded",
+        "external_action.failed",
+        "external_action.outcome_unknown",
+        "step.completed",
+        "step.failed",
+        "tool.result",
+        "loop.outcome",
+        "workflow.ready",
+        "workflow.blocked",
+        "workflow.failed",
+    }
+    expected_terminal_sequence = [
+        "external_action.outcome_unknown",
+        "step.failed",
+        "tool.result",
+        "loop.outcome",
+        "workflow.failed",
+    ]
+    expected_run_terminal_sequence = [
+        "external_action.outcome_unknown",
+        "tool.result",
+        "loop.outcome",
+    ]
+    workflow_terminal_sequence = [
+        event.event_type
+        for event in workflow_store.list_events(context.run_id)
+        if event.event_type in terminal_event_types
+    ]
+    run_terminal_sequence = [
+        event.event_type
+        for event in run_store.list_events(context.run_id)
+        if event.event_type in terminal_event_types
+    ]
+    assert workflow_terminal_sequence == expected_terminal_sequence
+    assert run_terminal_sequence == expected_run_terminal_sequence
 
 
 def test_exception_after_success_commit_is_resolved_without_provider_replay(
