@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -22,6 +22,21 @@ class ToolExecutionStatus(str, Enum):
     INVALID_INPUT = "invalid_input"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
+
+
+class ToolEffect(str, Enum):
+    """Server-owned classification of whether a tool changes external state."""
+
+    READ_ONLY = "read_only"
+    EXTERNAL_WRITE = "external_write"
+
+
+class ToolRetryMode(str, Enum):
+    """Retry contract declared by the server-controlled tool registration."""
+
+    SAFE = "safe"
+    PROVIDER_IDEMPOTENT = "provider_idempotent"
+    UNSAFE = "unsafe"
 
 
 class ToolPolicy(BaseModel):
@@ -63,7 +78,12 @@ class ToolSpec:
     description: str
     input_model: type[BaseModel]
     policy: ToolPolicy
-    handler_entrypoint: str
+    handler_entrypoint: str | None = None
+    effect: ToolEffect = ToolEffect.READ_ONLY
+    retry_mode: ToolRetryMode = ToolRetryMode.SAFE
+    provider_name: str | None = None
+    output_model: type[BaseModel] | None = None
+    runtime_input_gate: Callable[[dict[str, Any]], bool] | None = None
 
 
 class ToolRegistry:
@@ -73,12 +93,57 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         if spec.name in self._tools:
             raise ValueError(f"Tool already registered: {spec.name}")
-        module_name, separator, function_name = spec.handler_entrypoint.partition(":")
-        if not separator or not module_name or not function_name or ":" in function_name:
+
+        if spec.effect == ToolEffect.READ_ONLY:
+            if spec.retry_mode != ToolRetryMode.SAFE:
+                raise ValueError("read-only tools must use retry_mode='safe'")
+            if spec.provider_name is not None:
+                raise ValueError("read-only tools cannot declare provider_name")
+            if spec.runtime_input_gate is not None:
+                raise ValueError("read-only tools cannot declare runtime_input_gate")
+            if not self._valid_handler_entrypoint(spec.handler_entrypoint):
+                raise ValueError(
+                    "handler_entrypoint must use the server-controlled "
+                    "'module:function' format"
+                )
+        elif spec.effect == ToolEffect.EXTERNAL_WRITE:
+            if spec.handler_entrypoint is not None:
+                raise ValueError(
+                    "external-write tools cannot declare a sandbox handler_entrypoint"
+                )
+            if spec.provider_name is None or not spec.provider_name.strip():
+                raise ValueError("external-write tools require a non-empty provider_name")
+            if spec.output_model is None:
+                raise ValueError("external-write tools require an output_model")
+            if spec.runtime_input_gate is not None and not callable(
+                spec.runtime_input_gate
+            ):
+                raise ValueError("runtime_input_gate must be callable")
+            if (
+                not isinstance(spec.output_model, type)
+                or not issubclass(spec.output_model, BaseModel)
+                or spec.output_model.model_config.get("extra") != "forbid"
+            ):
+                raise ValueError(
+                    "external-write output_model must be a BaseModel with extra='forbid'"
+                )
+        else:  # pragma: no cover - Enum typing makes this defensive only
             raise ValueError(
-                "handler_entrypoint must use the server-controlled 'module:function' format"
+                f"unsupported tool effect: {spec.effect!r}"
             )
         self._tools[spec.name] = spec
+
+    @staticmethod
+    def _valid_handler_entrypoint(handler_entrypoint: str | None) -> bool:
+        if handler_entrypoint is None:
+            return False
+        module_name, separator, function_name = handler_entrypoint.partition(":")
+        return bool(
+            separator
+            and module_name
+            and function_name
+            and ":" not in function_name
+        )
 
     def resolve(self, tool_name: str) -> ToolSpec | None:
         return self._tools.get(tool_name)
@@ -122,6 +187,18 @@ class ToolSandbox:
                 duration_ms=self._duration_ms(started),
             )
 
+        if spec.effect == ToolEffect.EXTERNAL_WRITE:
+            return ToolExecutionResult(
+                execution_id=execution_id,
+                tool_name=tool_name,
+                status=ToolExecutionStatus.DENIED,
+                error=(
+                    "External-write tools require the durable external-action "
+                    "execution path."
+                ),
+                duration_ms=self._duration_ms(started),
+            )
+
         try:
             validated = spec.input_model.model_validate(arguments)
         except ValidationError as exc:
@@ -133,6 +210,7 @@ class ToolSandbox:
                 duration_ms=self._duration_ms(started),
             )
 
+        assert spec.handler_entrypoint is not None
         command = [sys.executable, str(self._worker_path), spec.handler_entrypoint]
         environment = self._sanitized_environment(spec.policy)
 

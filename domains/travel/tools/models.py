@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
 class SearchTripOptionsInput(BaseModel):
@@ -91,3 +91,54 @@ class RankOptionsResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ranking: list[RankedTripOption]
+
+
+class CreateTripHoldInput(BaseModel):
+    """Typed request sent to the Travel reference hold provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    destination: str = Field(min_length=1, max_length=200)
+    selected_option_name: str = Field(min_length=1, max_length=200)
+    quoted_total: int = Field(ge=0, le=10_000_000)
+    hold_minutes: int = Field(default=15, ge=1, le=24 * 60)
+
+
+class CreateTripHoldResult(BaseModel):
+    """Sanitized provider evidence allowed into durable/public Travel state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["held"]
+    provider_reference: str = Field(
+        pattern=r"^hold_[A-Za-z0-9_-]{1,128}$",
+        max_length=133,
+    )
+    destination: str = Field(min_length=1, max_length=200)
+    selected_option_name: str = Field(min_length=1, max_length=200)
+    quoted_total: int = Field(ge=0, le=10_000_000)
+    hold_minutes: int = Field(ge=1, le=24 * 60)
+
+    @model_validator(mode="after")
+    def matches_prepared_arguments(self, info: ValidationInfo) -> "CreateTripHoldResult":
+        context = info.context
+        if not isinstance(context, dict):
+            return self
+        arguments = context.get("arguments")
+        if not isinstance(arguments, dict):
+            return self
+        expected = {
+            "destination": arguments.get("destination"),
+            "selected_option_name": arguments.get("selected_option_name"),
+            "quoted_total": arguments.get("quoted_total"),
+            "hold_minutes": arguments.get("hold_minutes"),
+        }
+        actual = {
+            "destination": self.destination,
+            "selected_option_name": self.selected_option_name,
+            "quoted_total": self.quoted_total,
+            "hold_minutes": self.hold_minutes,
+        }
+        if actual != expected:
+            raise ValueError("Trip hold result does not match prepared arguments")
+        return self

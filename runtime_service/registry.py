@@ -122,6 +122,7 @@ def build_default_registry(
     release_validation_workflow: Any | None = None,
     dynamic_travel_runtime_factory: RuntimeFactory | None = None,
     governed_memory_travel_runtime_factory: RuntimeFactory | None = None,
+    external_action_travel_runtime_factory: RuntimeFactory | None = None,
 ) -> AgentRegistry:
     from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
     from domains.travel.state import AgentState
@@ -157,6 +158,20 @@ def build_default_registry(
                 "sealed run snapshots and deterministic preference application."
             ),
             input_model=TravelMessageInput,
+            state_model=AgentState,
+        )
+    if external_action_travel_runtime_factory is not None:
+        from domains.travel.external_action_runtime import TravelExternalActionInput
+
+        registry.register(
+            "travel-agent",
+            "1.2.0",
+            external_action_travel_runtime_factory,
+            description=(
+                "Durable external Travel actions with server-derived idempotency, "
+                "provider evidence and explicit uncertain-outcome recovery."
+            ),
+            input_model=TravelExternalActionInput,
             state_model=AgentState,
         )
     registry.register(

@@ -5,12 +5,13 @@ import sqlite3
 import threading
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from agent.contracts import utc_now
+from .sandbox import ToolRetryMode
 
 
 class WorkflowStatus(str, Enum):
@@ -30,6 +31,23 @@ class ToolCallStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ExternalActionStatus(str, Enum):
+    PREPARED = "prepared"
+    DISPATCHING = "dispatching"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {self.SUCCEEDED, self.FAILED, self.OUTCOME_UNKNOWN}
+
+
+# Backward-compatible store-facing name while preserving one canonical retry
+# contract across ToolSpec declarations, provider dispatch and persistence.
+ExternalActionRetryMode: TypeAlias = ToolRetryMode
 
 
 class ClaimOutcome(str, Enum):
@@ -54,12 +72,39 @@ class StepReuseOutcome(str, Enum):
     NOT_REUSABLE = "not_reusable"
 
 
+class ExternalActionPrepareOutcome(str, Enum):
+    CREATED = "created"
+    EXISTING = "existing"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    TOOL_ATTEMPT_MISMATCH = "tool_attempt_mismatch"
+
+
+class ExternalActionDispatchOutcome(str, Enum):
+    CLAIMED = "claimed"
+    RETRY_CLAIMED = "retry_claimed"
+    ALREADY_DISPATCHING = "already_dispatching"
+    RETRY_UNSAFE = "retry_unsafe"
+    NOT_DISPATCHING = "not_dispatching"
+    RUN_CANCELLED = "run_cancelled"
+    TERMINAL = "terminal"
+
+
 class StaleAttemptError(Exception):
     """Raised when complete_step/fail_step target an attempt_token that no
     longer holds the row -- a newer attempt (a retry or an interrupted-step
     recovery) has already superseded it. The caller must discard its result
     rather than retry the write: silently succeeding here would let a dead
     attempt's output overwrite a live one's.
+    """
+
+
+class StaleDispatchError(Exception):
+    """Raised when a provider result belongs to an obsolete dispatch token.
+
+    A provider-idempotent action may be redispatched with the same stable
+    idempotency key after a restart or ambiguous transport result. Each
+    dispatch receives a fresh token so a late response from an older dispatch
+    cannot overwrite evidence from the current one.
     """
 
 
@@ -90,6 +135,32 @@ class ToolCallRecord(BaseModel):
     updated_at: str
 
 
+class ExternalActionRecord(BaseModel):
+    action_id: str
+    run_id: str
+    step_id: str
+    tenant_id: str
+    subject_id: str
+    workflow_type: str
+    tool_name: str
+    provider_name: str
+    provider_identity: str
+    input_hash: str
+    arguments_json: str
+    retry_mode: ExternalActionRetryMode
+    idempotency_key: str
+    status: ExternalActionStatus
+    dispatch_count: int
+    dispatch_token: str | None = None
+    provider_reference: str | None = None
+    result_json: str | None = None
+    error_code: str | None = None
+    created_at: str
+    updated_at: str
+    dispatched_at: str | None = None
+    finalized_at: str | None = None
+
+
 class WorkflowEvent(BaseModel):
     event_id: int | None = None
     run_id: str
@@ -115,10 +186,22 @@ class StepReuseResult(BaseModel):
     step: ToolCallRecord | None = None
 
 
+class ExternalActionPrepareResult(BaseModel):
+    outcome: ExternalActionPrepareOutcome
+    action: ExternalActionRecord | None = None
+
+
+class ExternalActionDispatchResult(BaseModel):
+    outcome: ExternalActionDispatchOutcome
+    action: ExternalActionRecord
+    dispatch_token: str | None = None
+
+
 class SQLiteWorkflowStore:
     """Durable persistence for a multi-step registered-tool
     workflow: one `workflow_executions` row per run, one `tool_calls` row
-    per step, and an append-only `workflow_events` log.
+    per step, at most one `external_actions` row per side-effecting step,
+    and an append-only `workflow_events` log.
 
     This lives in the same physical SQLite file as `SQLiteRunStore` but
     owns a completely separate schema and does not import a domain state,
@@ -176,6 +259,38 @@ class SQLiteWorkflowStore:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_run_id ON tool_calls(run_id);
+
+                CREATE TABLE IF NOT EXISTS external_actions (
+                    action_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    workflow_type TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    provider_identity TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    retry_mode TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    dispatch_count INTEGER NOT NULL DEFAULT 0,
+                    dispatch_token TEXT,
+                    provider_reference TEXT,
+                    result_json TEXT,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    dispatched_at TEXT,
+                    finalized_at TEXT,
+                    UNIQUE(run_id, step_id),
+                    FOREIGN KEY(run_id, step_id)
+                        REFERENCES tool_calls(run_id, step_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_external_actions_run_id
+                    ON external_actions(run_id);
 
                 CREATE TABLE IF NOT EXISTS workflow_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -422,6 +537,23 @@ class SQLiteWorkflowStore:
                 or source_step.input_hash != input_hash
                 or source_step.result_json is None
             ):
+                connection.rollback()
+                return StepReuseResult(
+                    outcome=StepReuseOutcome.NOT_REUSABLE,
+                    step=source_step,
+                )
+
+            # A completed external action is evidence that a side effect
+            # occurred for the source run. Copying only its tool result into a
+            # different run would falsely make the target look as if it owned
+            # that side effect, while copying the action itself would make two
+            # runs share one provider idempotency identity. External actions
+            # are therefore never eligible for selective replay.
+            source_action = connection.execute(
+                "SELECT action_id FROM external_actions WHERE run_id = ? AND step_id = ?",
+                (source_run_id, step_id),
+            ).fetchone()
+            if source_action is not None:
                 connection.rollback()
                 return StepReuseResult(
                     outcome=StepReuseOutcome.NOT_REUSABLE,
@@ -860,6 +992,805 @@ class SQLiteWorkflowStore:
             ).fetchall()
         return [self._row_to_step(row) for row in rows]
 
+    # ---- external actions ----
+
+    def prepare_external_action(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        tool_attempt_token: str,
+        tenant_id: str,
+        subject_id: str,
+        workflow_type: str,
+        tool_name: str,
+        provider_name: str,
+        provider_identity: str,
+        input_hash: str,
+        arguments_json: str,
+        retry_mode: ExternalActionRetryMode | str,
+        idempotency_key: str,
+    ) -> ExternalActionPrepareResult:
+        """Persist an exact external-write intent before provider dispatch.
+
+        Preparation is create-or-get, but an existing `(run_id, step_id)` is
+        reusable only when every authority, workflow, tool, provider, input,
+        retry and idempotency field matches. The current tool attempt token is
+        checked in the same `BEGIN IMMEDIATE` transaction so an obsolete
+        claimant cannot prepare an action after a newer step attempt has taken
+        ownership.
+        """
+
+        retry = ExternalActionRetryMode(retry_mode)
+        canonical_arguments = self._canonical_json_object(arguments_json)
+        identity_values = (
+            tenant_id,
+            subject_id,
+            workflow_type,
+            tool_name,
+            provider_name,
+            provider_identity,
+            input_hash,
+            canonical_arguments,
+            retry,
+            idempotency_key,
+        )
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                run_id,
+                step_id,
+                tool_attempt_token,
+                tenant_id,
+                subject_id,
+                workflow_type,
+                tool_name,
+                provider_name,
+                provider_identity,
+                input_hash,
+                idempotency_key,
+            )
+        ):
+            raise ValueError("External action identity fields must be non-empty strings")
+
+        connection = self._immediate_connection()
+        try:
+            run_row = connection.execute(
+                """
+                SELECT tenant_id, execution_authority_json
+                FROM runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            try:
+                execution_authority = json.loads(
+                    run_row["execution_authority_json"]
+                )
+            except (TypeError, json.JSONDecodeError):
+                execution_authority = None
+            if (
+                run_row["tenant_id"] != tenant_id
+                or not isinstance(execution_authority, dict)
+                or execution_authority.get("tenant_id") != tenant_id
+                or execution_authority.get("subject_id") != subject_id
+            ):
+                connection.rollback()
+                return ExternalActionPrepareResult(
+                    outcome=ExternalActionPrepareOutcome.IDENTITY_MISMATCH
+                )
+            execution_row = connection.execute(
+                "SELECT workflow_type FROM workflow_executions WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if execution_row is None:
+                raise KeyError(f"Workflow execution not found: {run_id}")
+            step_row = connection.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+            if step_row is None:
+                raise KeyError(f"Step not found: {run_id}/{step_id}")
+            step = self._row_to_step(step_row)
+
+            if (
+                execution_row["workflow_type"] != workflow_type
+                or step.tool_name != tool_name
+                or step.input_hash != input_hash
+            ):
+                connection.rollback()
+                return ExternalActionPrepareResult(
+                    outcome=ExternalActionPrepareOutcome.IDENTITY_MISMATCH
+                )
+            if step.status != ToolCallStatus.RUNNING or step.attempt_token != tool_attempt_token:
+                connection.rollback()
+                return ExternalActionPrepareResult(
+                    outcome=ExternalActionPrepareOutcome.TOOL_ATTEMPT_MISMATCH
+                )
+
+            existing_row = connection.execute(
+                "SELECT * FROM external_actions WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._row_to_external_action(existing_row)
+                connection.rollback()
+                if self._external_action_identity(existing) == identity_values:
+                    return ExternalActionPrepareResult(
+                        outcome=ExternalActionPrepareOutcome.EXISTING,
+                        action=existing,
+                    )
+                return ExternalActionPrepareResult(
+                    outcome=ExternalActionPrepareOutcome.IDENTITY_MISMATCH,
+                    action=existing,
+                )
+
+            key_owner = connection.execute(
+                "SELECT action_id FROM external_actions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if key_owner is not None:
+                connection.rollback()
+                return ExternalActionPrepareResult(
+                    outcome=ExternalActionPrepareOutcome.IDENTITY_MISMATCH
+                )
+
+            now = utc_now()
+            action = ExternalActionRecord(
+                action_id=f"action_{uuid4().hex}",
+                run_id=run_id,
+                step_id=step_id,
+                tenant_id=tenant_id,
+                subject_id=subject_id,
+                workflow_type=workflow_type,
+                tool_name=tool_name,
+                provider_name=provider_name,
+                provider_identity=provider_identity,
+                input_hash=input_hash,
+                arguments_json=canonical_arguments,
+                retry_mode=retry,
+                idempotency_key=idempotency_key,
+                status=ExternalActionStatus.PREPARED,
+                dispatch_count=0,
+                created_at=now,
+                updated_at=now,
+            )
+            connection.execute(
+                """
+                INSERT INTO external_actions (
+                    action_id, run_id, step_id, tenant_id, subject_id,
+                    workflow_type, tool_name, provider_name, provider_identity,
+                    input_hash, arguments_json, retry_mode, idempotency_key, status,
+                    dispatch_count, dispatch_token, provider_reference,
+                    result_json, error_code, created_at, updated_at,
+                    dispatched_at, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
+                          NULL, NULL, NULL, ?, ?, NULL, NULL)
+                """,
+                (
+                    action.action_id,
+                    action.run_id,
+                    action.step_id,
+                    action.tenant_id,
+                    action.subject_id,
+                    action.workflow_type,
+                    action.tool_name,
+                    action.provider_name,
+                    action.provider_identity,
+                    action.input_hash,
+                    action.arguments_json,
+                    action.retry_mode.value,
+                    action.idempotency_key,
+                    action.status.value,
+                    action.dispatch_count,
+                    action.created_at,
+                    action.updated_at,
+                ),
+            )
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "external_action.prepared",
+                {
+                    "evidence_id": f"action:{action.action_id}:prepared",
+                    "action_id": action.action_id,
+                    "step_id": step_id,
+                    "tool_name": tool_name,
+                    "provider_name": provider_name,
+                    "retry_mode": retry.value,
+                    "status": action.status.value,
+                },
+            )
+            connection.commit()
+            return ExternalActionPrepareResult(
+                outcome=ExternalActionPrepareOutcome.CREATED,
+                action=action,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def begin_external_action_dispatch(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        tool_attempt_token: str,
+    ) -> ExternalActionDispatchResult:
+        """Claim a PREPARED action for its first provider dispatch."""
+
+        connection = self._immediate_connection()
+        try:
+            row = self._require_external_action_row(connection, run_id, step_id)
+            action = self._row_to_external_action(row)
+            if action.status.is_terminal:
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.TERMINAL,
+                    action=action,
+                )
+            if action.status == ExternalActionStatus.DISPATCHING:
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.ALREADY_DISPATCHING,
+                    action=action,
+                    dispatch_token=action.dispatch_token,
+                )
+            run_row = connection.execute(
+                "SELECT status, cancel_requested FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            if run_row["status"] != "running" or bool(run_row["cancel_requested"]):
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.RUN_CANCELLED,
+                    action=action,
+                )
+            self._assert_current_tool_attempt(
+                connection,
+                run_id,
+                step_id,
+                tool_attempt_token,
+            )
+            token = f"dispatch_{uuid4().hex}"
+            now = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE external_actions SET
+                    status = ?, dispatch_count = dispatch_count + 1,
+                    dispatch_token = ?, updated_at = ?, dispatched_at = ?
+                WHERE run_id = ? AND step_id = ? AND status = ?
+                """,
+                (
+                    ExternalActionStatus.DISPATCHING.value,
+                    token,
+                    now,
+                    now,
+                    run_id,
+                    step_id,
+                    ExternalActionStatus.PREPARED.value,
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes writers
+                raise StaleDispatchError(
+                    f"External action changed before dispatch: {run_id}/{step_id}"
+                )
+            refreshed = self._row_to_external_action(
+                self._require_external_action_row(connection, run_id, step_id)
+            )
+            self._append_dispatch_event(connection, refreshed, retry=False)
+            connection.commit()
+            return ExternalActionDispatchResult(
+                outcome=ExternalActionDispatchOutcome.CLAIMED,
+                action=refreshed,
+                dispatch_token=token,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def retry_external_action_dispatch(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        previous_dispatch_token: str,
+        tool_attempt_token: str,
+    ) -> ExternalActionDispatchResult:
+        """Rotate the dispatch token for a safely retryable in-flight action."""
+
+        connection = self._immediate_connection()
+        try:
+            row = self._require_external_action_row(connection, run_id, step_id)
+            action = self._row_to_external_action(row)
+            if action.status.is_terminal:
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.TERMINAL,
+                    action=action,
+                )
+            if action.status != ExternalActionStatus.DISPATCHING:
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.NOT_DISPATCHING,
+                    action=action,
+                )
+            if action.retry_mode == ExternalActionRetryMode.UNSAFE:
+                connection.rollback()
+                return ExternalActionDispatchResult(
+                    outcome=ExternalActionDispatchOutcome.RETRY_UNSAFE,
+                    action=action,
+                    dispatch_token=action.dispatch_token,
+                )
+            if action.dispatch_token != previous_dispatch_token:
+                raise StaleDispatchError(
+                    f"dispatch_token does not currently hold {run_id}/{step_id}"
+                )
+            self._assert_current_tool_attempt(
+                connection,
+                run_id,
+                step_id,
+                tool_attempt_token,
+            )
+            token = f"dispatch_{uuid4().hex}"
+            now = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE external_actions SET
+                    dispatch_count = dispatch_count + 1,
+                    dispatch_token = ?, updated_at = ?, dispatched_at = ?
+                WHERE run_id = ? AND step_id = ? AND status = ?
+                    AND dispatch_token = ?
+                """,
+                (
+                    token,
+                    now,
+                    now,
+                    run_id,
+                    step_id,
+                    ExternalActionStatus.DISPATCHING.value,
+                    previous_dispatch_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleDispatchError(
+                    f"dispatch_token does not currently hold {run_id}/{step_id}"
+                )
+            refreshed = self._row_to_external_action(
+                self._require_external_action_row(connection, run_id, step_id)
+            )
+            self._append_dispatch_event(connection, refreshed, retry=True)
+            connection.commit()
+            return ExternalActionDispatchResult(
+                outcome=ExternalActionDispatchOutcome.RETRY_CLAIMED,
+                action=refreshed,
+                dispatch_token=token,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_external_action_succeeded(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        result_json: str,
+        provider_reference: str,
+        error_code: str | None = None,
+    ) -> ExternalActionRecord:
+        return self._finalize_external_action(
+            run_id,
+            step_id,
+            dispatch_token=dispatch_token,
+            tool_attempt_token=tool_attempt_token,
+            action_status=ExternalActionStatus.SUCCEEDED,
+            tool_status=ToolCallStatus.COMPLETED,
+            result_json=result_json,
+            provider_reference=provider_reference,
+            error_code=error_code,
+        )
+
+    def finalize_external_action_failed(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+    ) -> ExternalActionRecord:
+        return self._finalize_external_action(
+            run_id,
+            step_id,
+            dispatch_token=dispatch_token,
+            tool_attempt_token=tool_attempt_token,
+            action_status=ExternalActionStatus.FAILED,
+            tool_status=ToolCallStatus.FAILED,
+            result_json=None,
+            provider_reference=provider_reference,
+            error_code=error_code,
+        )
+
+    def finalize_external_action_outcome_unknown(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+    ) -> ExternalActionRecord:
+        return self._finalize_external_action(
+            run_id,
+            step_id,
+            dispatch_token=dispatch_token,
+            tool_attempt_token=tool_attempt_token,
+            action_status=ExternalActionStatus.OUTCOME_UNKNOWN,
+            tool_status=ToolCallStatus.FAILED,
+            result_json=None,
+            provider_reference=provider_reference,
+            error_code=error_code,
+        )
+
+    def finalize_unsafe_interrupted_action(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str = "external_action_outcome_unknown",
+    ) -> ExternalActionRecord:
+        """Fail closed after restart when an unsafe dispatch may have escaped."""
+
+        return self._finalize_external_action(
+            run_id,
+            step_id,
+            dispatch_token=dispatch_token,
+            tool_attempt_token=tool_attempt_token,
+            action_status=ExternalActionStatus.OUTCOME_UNKNOWN,
+            tool_status=ToolCallStatus.FAILED,
+            result_json=None,
+            provider_reference=None,
+            error_code=error_code,
+            required_retry_mode=ExternalActionRetryMode.UNSAFE,
+        )
+
+    def get_external_action(
+        self,
+        run_id: str,
+        step_id: str,
+    ) -> ExternalActionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM external_actions WHERE run_id = ? AND step_id = ?",
+                (run_id, step_id),
+            ).fetchone()
+        return self._row_to_external_action(row) if row is not None else None
+
+    def list_external_actions(self, run_id: str) -> list[ExternalActionRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM external_actions WHERE run_id = ? ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+        return [self._row_to_external_action(row) for row in rows]
+
+    def has_external_action_requiring_reconciliation(self, run_id: str) -> bool:
+        """Return whether restart recovery must reconcile a dispatched write.
+
+        A persisted cancellation may otherwise cause RuntimeManager to cancel a
+        recovered run before the external-action loop resolves an in-flight
+        request or mirrors an already-terminal provider outcome into run
+        evidence. PREPARED rows are excluded because no dispatch can have
+        occurred.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM external_actions
+                WHERE run_id = ? AND dispatch_count > 0
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        return row is not None
+
+    def _finalize_external_action(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        action_status: ExternalActionStatus,
+        tool_status: ToolCallStatus,
+        result_json: str | None,
+        provider_reference: str | None,
+        error_code: str | None,
+        required_retry_mode: ExternalActionRetryMode | None = None,
+    ) -> ExternalActionRecord:
+        if action_status not in {
+            ExternalActionStatus.SUCCEEDED,
+            ExternalActionStatus.FAILED,
+            ExternalActionStatus.OUTCOME_UNKNOWN,
+        }:
+            raise ValueError("External action final status must be terminal")
+        if action_status == ExternalActionStatus.SUCCEEDED:
+            if tool_status != ToolCallStatus.COMPLETED or result_json is None:
+                raise ValueError("A succeeded external action requires a completed tool result")
+            if not provider_reference:
+                raise ValueError("A succeeded external action requires a provider reference")
+            if error_code is not None:
+                raise ValueError("A succeeded external action cannot carry an error code")
+            canonical_result = self._canonical_json_object(result_json)
+        else:
+            if tool_status != ToolCallStatus.FAILED or not error_code:
+                raise ValueError("A failed or unknown external action requires an error code")
+            self._validate_error_code(error_code)
+            canonical_result = None
+
+        connection = self._immediate_connection()
+        try:
+            action_row = self._require_external_action_row(connection, run_id, step_id)
+            action = self._row_to_external_action(action_row)
+            if required_retry_mode is not None and action.retry_mode != required_retry_mode:
+                raise ValueError(
+                    f"External action {run_id}/{step_id} has retry mode "
+                    f"{action.retry_mode.value!r}, not {required_retry_mode.value!r}"
+                )
+            if action.status.is_terminal:
+                step_row = connection.execute(
+                    "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                    (run_id, step_id),
+                ).fetchone()
+                if step_row is None:
+                    raise RuntimeError("Terminal external action lost its parent tool call")
+                step = self._row_to_step(step_row)
+                exact_duplicate = (
+                    action.status == action_status
+                    and action.dispatch_token == dispatch_token
+                    and action.provider_reference == provider_reference
+                    and action.result_json == canonical_result
+                    and action.error_code == error_code
+                    and step.status == tool_status
+                    and step.attempt_token == tool_attempt_token
+                    and step.result_json == canonical_result
+                    and step.error_code == error_code
+                )
+                connection.rollback()
+                if exact_duplicate:
+                    return action
+                raise StaleDispatchError(
+                    f"External action {run_id}/{step_id} already has a different terminal outcome"
+                )
+            if (
+                action.status != ExternalActionStatus.DISPATCHING
+                or action.dispatch_token != dispatch_token
+            ):
+                raise StaleDispatchError(
+                    f"dispatch_token does not currently hold {run_id}/{step_id}"
+                )
+            self._assert_current_tool_attempt(
+                connection,
+                run_id,
+                step_id,
+                tool_attempt_token,
+            )
+
+            now = utc_now()
+            action_cursor = connection.execute(
+                """
+                UPDATE external_actions SET
+                    status = ?, provider_reference = ?, result_json = ?,
+                    error_code = ?, updated_at = ?, finalized_at = ?
+                WHERE run_id = ? AND step_id = ? AND status = ?
+                    AND dispatch_token = ?
+                """,
+                (
+                    action_status.value,
+                    provider_reference,
+                    canonical_result,
+                    error_code,
+                    now,
+                    now,
+                    run_id,
+                    step_id,
+                    ExternalActionStatus.DISPATCHING.value,
+                    dispatch_token,
+                ),
+            )
+            if action_cursor.rowcount != 1:
+                raise StaleDispatchError(
+                    f"dispatch_token does not currently hold {run_id}/{step_id}"
+                )
+            tool_cursor = connection.execute(
+                """
+                UPDATE tool_calls SET
+                    status = ?, result_json = ?, error_code = ?, updated_at = ?
+                WHERE run_id = ? AND step_id = ? AND status = ?
+                    AND attempt_token = ?
+                """,
+                (
+                    tool_status.value,
+                    canonical_result,
+                    error_code,
+                    now,
+                    run_id,
+                    step_id,
+                    ToolCallStatus.RUNNING.value,
+                    tool_attempt_token,
+                ),
+            )
+            if tool_cursor.rowcount != 1:
+                raise StaleAttemptError(
+                    f"attempt_token does not currently hold {run_id}/{step_id}; "
+                    "a newer attempt has already superseded it"
+                )
+
+            refreshed_action = self._row_to_external_action(
+                self._require_external_action_row(connection, run_id, step_id)
+            )
+            step = self._row_to_step(
+                connection.execute(
+                    "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+                    (run_id, step_id),
+                ).fetchone()
+            )
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                f"external_action.{action_status.value}",
+                {
+                    "evidence_id": f"action:{action.action_id}:outcome",
+                    "action_id": action.action_id,
+                    "step_id": step_id,
+                    "tool_name": action.tool_name,
+                    "provider_name": action.provider_name,
+                    "status": action_status.value,
+                    "dispatch_count": action.dispatch_count,
+                    "provider_reference": provider_reference,
+                    "error_code": error_code,
+                },
+            )
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "step.completed" if tool_status == ToolCallStatus.COMPLETED else "step.failed",
+                {
+                    "step_id": step_id,
+                    "tool_name": step.tool_name,
+                    "attempt_count": step.attempt_count,
+                    "error_code": step.error_code,
+                    "outcome": (
+                        "completed" if tool_status == ToolCallStatus.COMPLETED else "failed"
+                    ),
+                },
+            )
+            connection.commit()
+            return refreshed_action
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _immediate_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        return connection
+
+    @staticmethod
+    def _canonical_json_object(encoded: str) -> str:
+        try:
+            value = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise ValueError("External action JSON must be valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("External action JSON must encode an object")
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _validate_error_code(error_code: str) -> None:
+        if len(error_code) > 200 or not error_code[0].isalpha() or any(
+            not (character.isalnum() or character in "_.-")
+            for character in error_code
+        ):
+            raise ValueError("External action error_code must be a stable machine code")
+
+    @staticmethod
+    def _external_action_identity(
+        action: ExternalActionRecord,
+    ) -> tuple[str, str, str, str, str, str, str, str, ExternalActionRetryMode, str]:
+        return (
+            action.tenant_id,
+            action.subject_id,
+            action.workflow_type,
+            action.tool_name,
+            action.provider_name,
+            action.provider_identity,
+            action.input_hash,
+            action.arguments_json,
+            action.retry_mode,
+            action.idempotency_key,
+        )
+
+    @staticmethod
+    def _require_external_action_row(
+        connection: sqlite3.Connection,
+        run_id: str,
+        step_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM external_actions WHERE run_id = ? AND step_id = ?",
+            (run_id, step_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"External action not found: {run_id}/{step_id}")
+        return row
+
+    @staticmethod
+    def _assert_current_tool_attempt(
+        connection: sqlite3.Connection,
+        run_id: str,
+        step_id: str,
+        attempt_token: str,
+    ) -> ToolCallRecord:
+        row = connection.execute(
+            "SELECT * FROM tool_calls WHERE run_id = ? AND step_id = ?",
+            (run_id, step_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Step not found: {run_id}/{step_id}")
+        step = SQLiteWorkflowStore._row_to_step(row)
+        if step.status != ToolCallStatus.RUNNING or step.attempt_token != attempt_token:
+            raise StaleAttemptError(
+                f"attempt_token does not currently hold {run_id}/{step_id}; "
+                "a newer attempt has already superseded it"
+            )
+        return step
+
+    @staticmethod
+    def _append_dispatch_event(
+        connection: sqlite3.Connection,
+        action: ExternalActionRecord,
+        *,
+        retry: bool,
+    ) -> None:
+        SQLiteWorkflowStore._append_event_with_connection(
+            connection,
+            action.run_id,
+            "external_action.dispatch_started",
+            {
+                "evidence_id": (f"action:{action.action_id}:dispatch:{action.dispatch_count}"),
+                "action_id": action.action_id,
+                "step_id": action.step_id,
+                "tool_name": action.tool_name,
+                "provider_name": action.provider_name,
+                "status": action.status.value,
+                "dispatch_count": action.dispatch_count,
+                "retry": retry,
+            },
+        )
+
     # ---- events ----
 
     def append_event(
@@ -964,4 +1895,32 @@ class SQLiteWorkflowStore:
             error_code=row["error_code"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_external_action(row: sqlite3.Row) -> ExternalActionRecord:
+        return ExternalActionRecord(
+            action_id=row["action_id"],
+            run_id=row["run_id"],
+            step_id=row["step_id"],
+            tenant_id=row["tenant_id"],
+            subject_id=row["subject_id"],
+            workflow_type=row["workflow_type"],
+            tool_name=row["tool_name"],
+            provider_name=row["provider_name"],
+            provider_identity=row["provider_identity"],
+            input_hash=row["input_hash"],
+            arguments_json=row["arguments_json"],
+            retry_mode=ExternalActionRetryMode(row["retry_mode"]),
+            idempotency_key=row["idempotency_key"],
+            status=ExternalActionStatus(row["status"]),
+            dispatch_count=row["dispatch_count"],
+            dispatch_token=row["dispatch_token"],
+            provider_reference=row["provider_reference"],
+            result_json=row["result_json"],
+            error_code=row["error_code"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            dispatched_at=row["dispatched_at"],
+            finalized_at=row["finalized_at"],
         )

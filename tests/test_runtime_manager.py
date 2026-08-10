@@ -1,7 +1,11 @@
 import threading
 import time
 
-from agent.contracts import RuntimeResponse
+from agent.contracts import (
+    RuntimeExecutionContext,
+    RuntimeExecutionError,
+    RuntimeResponse,
+)
 from domains.release_validation.models import (
     ReleaseManifest,
     ReleaseValidationInput,
@@ -28,6 +32,9 @@ from runtime_service import (
     SQLiteRunStore,
     TenantContext,
     build_default_registry,
+)
+from runtime_service.external_actions import (
+    ExternalActionReconciliationPendingError,
 )
 from runtime_service.sandbox import ToolSandbox
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStatus
@@ -96,6 +103,74 @@ class CountingBlockingRuntime(TravelAgentRuntime):
         return super().handle_user_message(state, user_message)
 
 
+class BlockingUncertainActionRuntime(TravelAgentRuntime):
+    def __init__(self, started: threading.Event, release: threading.Event):
+        super().__init__()
+        self.started = started
+        self.release = release
+
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del state, runtime_input, context
+        self.started.set()
+        if not self.release.wait(timeout=10):
+            raise TimeoutError("test release event was not set")
+        raise RuntimeExecutionError(
+            "external_action_outcome_unknown",
+            "External action provider outcome is unknown.",
+        )
+
+
+class ReconciliationPendingRuntime(TravelAgentRuntime):
+    def __init__(self, attempted: threading.Event):
+        super().__init__()
+        self.attempted = attempted
+
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del state, runtime_input, context
+        self.attempted.set()
+        raise ExternalActionReconciliationPendingError()
+
+
+class ReconciliationSetupFailureRuntime(TravelAgentRuntime):
+    def __init__(self, attempted: threading.Event):
+        super().__init__()
+        self.attempted = attempted
+
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del state, runtime_input, context
+        self.attempted.set()
+        raise ValueError("injected recovery setup failure")
+
+
+class ReconciliationCancellationRuntime(TravelAgentRuntime):
+    def execute(
+        self,
+        state: AgentState,
+        runtime_input: TravelMessageInput,
+        context: RuntimeExecutionContext,
+    ) -> RuntimeResponse[AgentState]:
+        del state, runtime_input, context
+        raise RuntimeExecutionError(
+            "run_cancel_requested",
+            "Cancellation won before external action dispatch.",
+        )
+
+
 def blocking_registry(started: threading.Event, release: threading.Event) -> AgentRegistry:
     registry = AgentRegistry()
     registry.register(
@@ -103,6 +178,63 @@ def blocking_registry(started: threading.Event, release: threading.Event) -> Age
         "0.3.0",
         lambda: BlockingRuntime(started, release),
         description="Blocking test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def uncertain_action_registry(
+    started: threading.Event,
+    release: threading.Event,
+) -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        lambda: BlockingUncertainActionRuntime(started, release),
+        description="Uncertain external-action test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def reconciliation_pending_registry(attempted: threading.Event) -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        lambda: ReconciliationPendingRuntime(attempted),
+        description="Pending external-action reconciliation test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def reconciliation_setup_failure_registry(
+    attempted: threading.Event,
+) -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        lambda: ReconciliationSetupFailureRuntime(attempted),
+        description="External-action recovery setup failure test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def reconciliation_cancellation_registry() -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        ReconciliationCancellationRuntime,
+        description="External-action recovery cancellation test runtime",
         input_model=TravelMessageInput,
         state_model=AgentState,
     )
@@ -177,6 +309,98 @@ def test_cancelled_before_start(tmp_path):
         manager.stop()
 
 
+def test_cancel_cas_between_read_and_start_claim_is_not_overwritten(
+    tmp_path,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+    release.set()
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    manager = RuntimeManager(store, blocking_registry(started, release))
+    submitted = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="cancel-start-claim-race",
+            user_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
+    )
+    original_claim = store.claim_run_start
+
+    def cancel_then_claim(run_id: str, *, tenant_id: str):
+        store.request_cancel_atomically(run_id, tenant_id=tenant_id)
+        return original_claim(run_id, tenant_id=tenant_id)
+
+    monkeypatch.setattr(store, "claim_run_start", cancel_then_claim)
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, submitted.run_id)
+    finally:
+        manager.stop()
+
+    assert result.status == RunStatus.CANCELLED
+    assert result.cancel_requested
+    assert not started.is_set()
+    events = store.list_events(submitted.run_id)
+    event_types = [event.event_type for event in events]
+    assert event_types.count("run.cancel_requested") == 1
+    assert event_types.count("run.started") == 1
+    assert event_types.count("run.cancelled") == 1
+    cancelled_events = [
+        event for event in events if event.event_type == "run.cancelled"
+    ]
+    assert cancelled_events[0].payload == {
+        "reason": "cancelled_after_start_claim"
+    }
+
+
+def test_cancel_cas_after_recovery_scan_is_not_overwritten(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "runtime.db"
+    started = threading.Event()
+    release = threading.Event()
+    release.set()
+    store = SQLiteRunStore(database_path)
+    run = RunRecord(
+        run_id="run_recovery_cancel_scan_race",
+        thread_id="recovery-cancel-scan-race",
+        agent_id="travel-agent",
+        agent_version="0.3.0",
+        status=RunStatus.RUNNING,
+        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        attempt=1,
+    )
+    store.create_run(run)
+    store.append_event(run.run_id, "run.started", {"attempt": 1})
+    original_list = store.list_recoverable_runs
+
+    def list_then_cancel():
+        stale_rows = original_list()
+        store.request_cancel_atomically(run.run_id, tenant_id=run.tenant_id)
+        return stale_rows
+
+    monkeypatch.setattr(store, "list_recoverable_runs", list_then_cancel)
+    manager = RuntimeManager(store, blocking_registry(started, release))
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, run.run_id)
+    finally:
+        manager.stop()
+
+    assert result.status == RunStatus.CANCELLED
+    assert result.cancel_requested
+    assert result.attempt == 1
+    assert not started.is_set()
+    events = store.list_events(run.run_id)
+    event_types = [event.event_type for event in events]
+    assert event_types.count("run.cancel_requested") == 1
+    assert event_types.count("run.recovered") == 1
+    assert event_types.count("run.started") == 1
+    assert event_types.count("run.cancelled") == 1
+
+
 def test_cancelled_after_execution_boundary(tmp_path):
     started = threading.Event()
     release = threading.Event()
@@ -208,6 +432,290 @@ def test_cancelled_after_execution_boundary(tmp_path):
     finally:
         release.set()
         manager.stop()
+
+
+def test_outcome_unknown_is_not_hidden_by_concurrent_cancellation(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    manager = RuntimeManager(store, uncertain_action_registry(started, release))
+    manager.start()
+    try:
+        submitted = submit_run(
+            manager,
+            RunCreateRequest(
+                thread_id="uncertain-action-cancel",
+                agent_version="1.2.0",
+                user_message="Create the test action.",
+            ),
+        )
+        assert started.wait(timeout=5)
+        manager.request_cancel(submitted.run_id, tenant_context=TENANT_CONTEXT)
+        release.set()
+        result = wait_for_terminal(manager, submitted.run_id)
+    finally:
+        release.set()
+        manager.stop()
+
+    assert result.status == RunStatus.FAILED
+    assert result.error_code == "external_action_outcome_unknown"
+    event_types = [event.event_type for event in store.list_events(submitted.run_id)]
+    assert "run.cancel_requested" in event_types
+    assert "run.failed" in event_types
+    assert "run.cancelled" not in event_types
+
+
+def test_recovered_inflight_action_is_reconciled_before_persisted_cancel(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    store.create_run(
+        RunRecord(
+            run_id="run_reconcile_before_cancel",
+            thread_id="reconcile-before-cancel",
+            agent_id="travel-agent",
+            agent_version="1.2.0",
+            domain_id="travel",
+            schema_version="1",
+            status=RunStatus.RUNNING,
+            input=TravelMessageInput(
+                user_message="Create the test action."
+            ).model_dump(mode="json"),
+            cancel_requested=True,
+            attempt=1,
+        )
+    )
+    started = threading.Event()
+    release = threading.Event()
+    release.set()
+    manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        uncertain_action_registry(started, release),
+        recovery_reconciliation_required=(
+            lambda run_id: run_id == "run_reconcile_before_cancel"
+        ),
+    )
+
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, "run_reconcile_before_cancel")
+    finally:
+        manager.stop()
+
+    assert started.is_set()
+    assert result.status == RunStatus.FAILED
+    assert result.error_code == "external_action_outcome_unknown"
+    event_types = [
+        event.event_type
+        for event in manager.store.list_events("run_reconcile_before_cancel")
+    ]
+    assert "run.recovered" in event_types
+    assert "run.started" in event_types
+    assert "run.failed" in event_types
+    assert "run.cancelled" not in event_types
+
+
+def test_reconciliation_pending_run_remains_recoverable_across_restart(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    first_attempt = threading.Event()
+    first_manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        reconciliation_pending_registry(first_attempt),
+    )
+    first_manager.start()
+    try:
+        submitted = submit_run(
+            first_manager,
+            RunCreateRequest(
+                thread_id="reconciliation-pending",
+                agent_version="1.2.0",
+                user_message="Create the test action.",
+            ),
+        )
+        assert first_attempt.wait(timeout=5)
+    finally:
+        first_manager.stop()
+
+    persisted = first_manager.store.get_run_internal(submitted.run_id)
+    assert persisted is not None
+    assert persisted.status == RunStatus.RUNNING
+    assert persisted.attempt == 1
+    assert (
+        persisted.error_code
+        == ExternalActionReconciliationPendingError.CODE
+    )
+    first_event_types = [
+        event.event_type
+        for event in first_manager.store.list_events(submitted.run_id)
+    ]
+    assert "run.failed" not in first_event_types
+    assert "run.cancelled" not in first_event_types
+    assert "run.completed" not in first_event_types
+
+    cancelled = first_manager.request_cancel(
+        submitted.run_id,
+        tenant_context=TENANT_CONTEXT,
+    )
+    assert cancelled.cancel_requested
+
+    recovery_attempt = threading.Event()
+    recovered_manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        reconciliation_setup_failure_registry(recovery_attempt),
+    )
+    recovered_manager.start()
+    try:
+        assert recovery_attempt.wait(timeout=5)
+    finally:
+        recovered_manager.stop()
+
+    recovered = recovered_manager.store.get_run_internal(submitted.run_id)
+    assert recovered is not None
+    assert recovered.status == RunStatus.RUNNING
+    assert recovered.attempt == 2
+    assert recovered.cancel_requested
+    assert (
+        recovered.error_code
+        == ExternalActionReconciliationPendingError.CODE
+    )
+    event_types = [
+        event.event_type
+        for event in recovered_manager.store.list_events(submitted.run_id)
+    ]
+    assert event_types.count("run.recovered") == 1
+    assert event_types.count("run.started") == 2
+    recovered_events = [
+        event
+        for event in recovered_manager.store.list_events(submitted.run_id)
+        if event.event_type == "run.recovered"
+    ]
+    assert recovered_events[0].payload == {
+        "reason": "external_action_reconciliation_pending"
+    }
+    assert "run.failed" not in event_types
+    assert "run.cancelled" not in event_types
+    assert "run.completed" not in event_types
+
+
+def test_reconciliation_pending_cancel_resolution_clears_marker(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    store.create_run(
+        RunRecord(
+            run_id="run_pending_cancel_resolution",
+            thread_id="pending-cancel-resolution",
+            agent_id="travel-agent",
+            agent_version="1.2.0",
+            domain_id="travel",
+            schema_version="1",
+            status=RunStatus.RUNNING,
+            input=TravelMessageInput(
+                user_message="Create the test action."
+            ).model_dump(mode="json"),
+            error_code=ExternalActionReconciliationPendingError.CODE,
+            error="pending reconciliation",
+            cancel_requested=True,
+            attempt=1,
+        )
+    )
+    manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        reconciliation_cancellation_registry(),
+    )
+
+    manager.start()
+    try:
+        result = wait_for_terminal(manager, "run_pending_cancel_resolution")
+    finally:
+        manager.stop()
+
+    assert result.status == RunStatus.CANCELLED
+    assert result.error_code is None
+    assert result.error is None
+    event_types = [
+        event.event_type
+        for event in manager.store.list_events("run_pending_cancel_resolution")
+    ]
+    assert "run.recovered" in event_types
+    assert "run.cancelled" in event_types
+    assert "run.failed" not in event_types
+
+
+def test_unmarked_crash_recovery_setup_failure_persists_pending_marker(
+    tmp_path,
+):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    store.create_run(
+        RunRecord(
+            run_id="run_unmarked_crash_setup_failure",
+            thread_id="unmarked-crash-setup-failure",
+            agent_id="travel-agent",
+            agent_version="1.2.0",
+            domain_id="travel",
+            schema_version="1",
+            status=RunStatus.RUNNING,
+            input=TravelMessageInput(
+                user_message="Create the test action."
+            ).model_dump(mode="json"),
+            cancel_requested=True,
+            attempt=1,
+        )
+    )
+    attempted = threading.Event()
+    manager = RuntimeManager(
+        SQLiteRunStore(database_path),
+        reconciliation_setup_failure_registry(attempted),
+        recovery_reconciliation_required=lambda _run_id: True,
+    )
+
+    manager.start()
+    try:
+        assert attempted.wait(timeout=5)
+    finally:
+        manager.stop()
+
+    recovered = manager.store.get_run_internal("run_unmarked_crash_setup_failure")
+    assert recovered is not None
+    assert recovered.status == RunStatus.RUNNING
+    assert recovered.cancel_requested
+    assert recovered.attempt == 2
+    assert (
+        recovered.error_code
+        == ExternalActionReconciliationPendingError.CODE
+    )
+    event_types = [
+        event.event_type
+        for event in manager.store.list_events("run_unmarked_crash_setup_failure")
+    ]
+    assert "run.recovered" in event_types
+    assert "run.cancelled" not in event_types
+    assert "run.failed" not in event_types
+
+
+def test_reconciliation_marker_update_preserves_cancel_cas(tmp_path):
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    run = RunRecord(
+        run_id="run_pending_marker_cancel_race",
+        thread_id="pending-marker-cancel-race",
+        agent_id="travel-agent",
+        agent_version="1.2.0",
+        status=RunStatus.RUNNING,
+        input_message="Create the test action.",
+    )
+    store.create_run(run)
+    cancelled = store.request_cancel_atomically(run.run_id, tenant_id=run.tenant_id)
+    assert cancelled.cancel_requested
+
+    marked = store.mark_reconciliation_pending(
+        run.run_id,
+        tenant_id=run.tenant_id,
+        error_code=ExternalActionReconciliationPendingError.CODE,
+        error="pending reconciliation",
+    )
+
+    assert marked.status == RunStatus.RUNNING
+    assert marked.cancel_requested
+    assert marked.error_code == ExternalActionReconciliationPendingError.CODE
 
 
 def test_running_run_is_recovered_after_restart(tmp_path):
@@ -401,6 +909,8 @@ def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
         status=RunStatus.RUNNING,
         input_message="I want a 5-day Tokyo trip under 9000 SGD.",
         attempt=1,
+        error_code=ExternalActionReconciliationPendingError.CODE,
+        error="pending reconciliation",
     )
     store.create_run(run)
     run.state = AgentState(thread_id="finalize-thread", destination="Tokyo", days=5, budget=9000)
@@ -410,6 +920,12 @@ def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
     first = store.finalize_completed_run(run)
     assert first is True
     assert run.status == RunStatus.COMPLETED
+    assert run.error_code is None
+    assert run.error is None
+    persisted = store.get_run_internal(run.run_id)
+    assert persisted is not None
+    assert persisted.error_code is None
+    assert persisted.error is None
 
     events_after_first = store.list_events(run.run_id)
     event_types_after_first = [event.event_type for event in events_after_first]

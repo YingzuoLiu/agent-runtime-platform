@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from domains.travel.tools import build_travel_tool_registry
@@ -11,6 +12,7 @@ from runtime_service import (
     ToolSpec,
     build_default_tool_registry,
 )
+from runtime_service.sandbox import ToolEffect, ToolRetryMode
 
 
 class SleepInput(BaseModel):
@@ -23,6 +25,18 @@ class EnvironmentProbeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     keys: list[str] = Field(min_length=1, max_length=20)
+
+
+class ExternalWriteOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+
+
+class PermissiveExternalWriteOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool
 
 
 def test_registered_tool_executes_in_subprocess():
@@ -54,6 +68,190 @@ def test_unregistered_tool_is_denied_before_process_start():
 
     assert result.status == ToolExecutionStatus.DENIED
     assert result.exit_code is None
+
+
+def test_existing_read_only_specs_keep_legacy_defaults_and_descriptor_shape():
+    registry = build_travel_tool_registry()
+    spec = registry.resolve("search_trip_options")
+    assert spec is not None
+
+    assert spec.effect == ToolEffect.READ_ONLY
+    assert spec.retry_mode == ToolRetryMode.SAFE
+    assert spec.provider_name is None
+    assert set(registry.list_tools()[0].model_dump()) == {
+        "name",
+        "description",
+        "input_schema",
+        "policy",
+    }
+
+
+def test_legacy_fifth_positional_argument_still_binds_handler_entrypoint():
+    spec = ToolSpec(
+        "legacy-positional",
+        "Legacy positional construction.",
+        SleepInput,
+        ToolPolicy(),
+        "tests.sandbox_handlers:sleep_test",
+    )
+
+    ToolRegistry().register(spec)
+    assert spec.handler_entrypoint == "tests.sandbox_handlers:sleep_test"
+    assert spec.output_model is None
+
+
+@pytest.mark.parametrize("retry_mode", list(ToolRetryMode))
+def test_external_write_registration_accepts_every_explicit_retry_contract(retry_mode):
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="_external_write_test",
+            description="Test-only external action.",
+            input_model=SleepInput,
+            output_model=ExternalWriteOutput,
+            policy=ToolPolicy(),
+            effect=ToolEffect.EXTERNAL_WRITE,
+            retry_mode=retry_mode,
+            provider_name="test-provider",
+        )
+    )
+
+    spec = registry.resolve("_external_write_test")
+    assert spec is not None
+    assert spec.handler_entrypoint is None
+    assert spec.retry_mode == retry_mode
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        (
+            ToolSpec(
+                name="read-only-without-handler",
+                description="Invalid read-only tool.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+            ),
+            "handler_entrypoint",
+        ),
+        (
+            ToolSpec(
+                name="read-only-provider",
+                description="Invalid read-only tool.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                handler_entrypoint="tests.sandbox_handlers:sleep_test",
+                provider_name="unexpected",
+            ),
+            "provider_name",
+        ),
+        (
+            ToolSpec(
+                name="external-without-output-model",
+                description="Invalid external action.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                effect=ToolEffect.EXTERNAL_WRITE,
+                provider_name="test-provider",
+            ),
+            "output_model",
+        ),
+        (
+            ToolSpec(
+                name="external-with-permissive-output-model",
+                description="Invalid external action.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                effect=ToolEffect.EXTERNAL_WRITE,
+                provider_name="test-provider",
+                output_model=PermissiveExternalWriteOutput,
+            ),
+            "extra='forbid'",
+        ),
+        (
+            ToolSpec(
+                name="external-with-invalid-runtime-gate",
+                description="Invalid external action.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                effect=ToolEffect.EXTERNAL_WRITE,
+                provider_name="test-provider",
+                output_model=ExternalWriteOutput,
+                runtime_input_gate=True,  # type: ignore[arg-type]
+            ),
+            "runtime_input_gate",
+        ),
+        (
+            ToolSpec(
+                name="read-only-unsafe",
+                description="Invalid read-only tool.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                handler_entrypoint="tests.sandbox_handlers:sleep_test",
+                retry_mode=ToolRetryMode.UNSAFE,
+            ),
+            "retry_mode",
+        ),
+        (
+            ToolSpec(
+                name="external-with-handler",
+                description="Invalid external action.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                handler_entrypoint="tests.sandbox_handlers:sleep_test",
+                effect=ToolEffect.EXTERNAL_WRITE,
+                provider_name="test-provider",
+            ),
+            "handler_entrypoint",
+        ),
+        (
+            ToolSpec(
+                name="external-without-provider",
+                description="Invalid external action.",
+                input_model=SleepInput,
+                policy=ToolPolicy(),
+                effect=ToolEffect.EXTERNAL_WRITE,
+            ),
+            "provider_name",
+        ),
+    ],
+)
+def test_registry_rejects_incoherent_execution_metadata(spec, message):
+    with pytest.raises(ValueError, match=message):
+        ToolRegistry().register(spec)
+
+
+def test_sandbox_denies_external_write_before_validation_or_process_start(
+    monkeypatch,
+):
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="_external_write_test",
+            description="Test-only external action.",
+            input_model=SleepInput,
+            output_model=ExternalWriteOutput,
+            policy=ToolPolicy(),
+            effect=ToolEffect.EXTERNAL_WRITE,
+            retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+            provider_name="test-provider",
+        )
+    )
+
+    def unexpected_process_start(*_args, **_kwargs):
+        raise AssertionError("external-write tool started a subprocess")
+
+    monkeypatch.setattr("runtime_service.sandbox.subprocess.Popen", unexpected_process_start)
+    result = ToolSandbox(registry).execute(
+        "_external_write_test",
+        {"seconds": "this would fail schema validation"},
+    )
+
+    assert result.status == ToolExecutionStatus.DENIED
+    assert result.exit_code is None
+    assert result.error == (
+        "External-write tools require the durable external-action execution path."
+    )
 
 
 def test_invalid_arguments_are_rejected_by_schema():

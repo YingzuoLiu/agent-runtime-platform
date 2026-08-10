@@ -4,6 +4,7 @@ import queue
 import sqlite3
 import threading
 import traceback
+from collections.abc import Callable
 from uuid import uuid4
 
 from agent.contracts import (
@@ -13,6 +14,7 @@ from agent.contracts import (
     utc_now,
 )
 from .auth import TenantContext
+from .external_actions import ExternalActionReconciliationPendingError
 from .models import RunCreateRequest, RunRecord, RunStatus
 from .registry import AgentRegistry
 from .store import SQLiteRunStore
@@ -25,13 +27,21 @@ class ReferencedRunNotFoundError(KeyError):
 class RuntimeManager:
     """Durable run lifecycle manager with an in-process worker pool."""
 
-    def __init__(self, store: SQLiteRunStore, registry: AgentRegistry, *, worker_count: int = 1) -> None:
+    def __init__(
+        self,
+        store: SQLiteRunStore,
+        registry: AgentRegistry,
+        *,
+        worker_count: int = 1,
+        recovery_reconciliation_required: Callable[[str], bool] | None = None,
+    ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be at least 1")
         self.store = store
         self.registry = registry
         self.store.bind_state_registry(registry)
         self.worker_count = worker_count
+        self._recovery_reconciliation_required = recovery_reconciliation_required
         self._queue: queue.Queue[tuple[str, bool] | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._started = False
@@ -52,12 +62,16 @@ class RuntimeManager:
                 self._workers.append(worker)
             for run in self.store.list_recoverable_runs():
                 if run.status == RunStatus.RUNNING:
-                    run.status = RunStatus.QUEUED
-                    run.started_at = None
-                    run.error = None
-                    run.error_code = None
-                    self.store.update_run(run)
-                    self.store.append_event(run.run_id, "run.recovered", {"reason": "runtime_restart"})
+                    recovered = self.store.recover_run_for_restart(
+                        run.run_id,
+                        tenant_id=run.tenant_id,
+                        reconciliation_pending_code=(
+                            ExternalActionReconciliationPendingError.CODE
+                        ),
+                    )
+                    if recovered is None:
+                        continue
+                    run = recovered
                 self._queue.put((run.run_id, True))
 
     def stop(self) -> None:
@@ -190,14 +204,26 @@ class RuntimeManager:
         run = self._require_run(run_id)
         if run.status.is_terminal:
             return
-        if run.cancel_requested:
+        reconcile_before_cancelling = (
+            recovered_after_restart
+            and (
+                run.error_code == ExternalActionReconciliationPendingError.CODE
+                or (
+                    self._recovery_reconciliation_required is not None
+                    and self._recovery_reconciliation_required(run_id)
+                )
+            )
+        )
+        if run.cancel_requested and not reconcile_before_cancelling:
             self._mark_cancelled(run, reason="cancelled_before_start")
             return
-        run.status = RunStatus.RUNNING
-        run.started_at = utc_now()
-        run.attempt += 1
-        self.store.update_run(run)
-        self.store.append_event(run.run_id, "run.started", {"attempt": run.attempt})
+        claimed = self.store.claim_run_start(run_id, tenant_id=run.tenant_id)
+        if claimed is None:
+            return
+        run = claimed
+        if run.cancel_requested and not reconcile_before_cancelling:
+            self._mark_cancelled(run, reason="cancelled_after_start_claim")
+            return
         try:
             runtime = self.registry.resolve(run.agent_id, run.agent_version)
             registration = self.registry.registration(run.agent_id, run.agent_version)
@@ -240,14 +266,63 @@ class RuntimeManager:
             run.state = result.state
             run.output_message = result.message
             run.validation_errors = result.validation_errors
+            run.error_code = None
+            run.error = None
             if not self.store.finalize_completed_run(run):
                 latest = self._require_run(run_id)
                 latest.state = result.state
+                latest.error_code = None
+                latest.error = None
                 self._mark_cancelled(latest, reason="cancelled_after_execution_boundary")
                 return
+        except ExternalActionReconciliationPendingError as exc:
+            run = self._require_run(run_id)
+            # Persist a non-terminal recovery marker.  It is sufficient on its
+            # own to arbitrate restart-time cancellation even when a custom
+            # RuntimeManager composition omitted the optional ledger callback.
+            self.store.mark_reconciliation_pending(
+                run_id,
+                tenant_id=run.tenant_id,
+                error_code=exc.code,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
         except Exception as exc:  # pragma: no cover
             run = self._require_run(run_id)
-            if run.cancel_requested:
+            reconciliation_pending = (
+                run.error_code == ExternalActionReconciliationPendingError.CODE
+                or reconcile_before_cancelling
+            )
+            reconciliation_resolution_codes = {
+                "external_action_outcome_unknown",
+                "external_action_evidence_incomplete",
+                "external_action_failed",
+                "run_cancel_requested",
+            }
+            if reconciliation_pending and not (
+                isinstance(exc, RuntimeExecutionError)
+                and exc.code in reconciliation_resolution_codes
+            ):
+                # Setup, registry, input/state loading, or other local failures
+                # cannot supersede a still-pending external-action outcome.
+                pending = ExternalActionReconciliationPendingError()
+                self.store.mark_reconciliation_pending(
+                    run_id,
+                    tenant_id=run.tenant_id,
+                    error_code=pending.code,
+                    error=f"{type(pending).__name__}: {pending}",
+                )
+                return
+            external_action_safety_failure = (
+                isinstance(exc, RuntimeExecutionError)
+                and exc.code
+                in {
+                    "external_action_outcome_unknown",
+                    "external_action_evidence_incomplete",
+                    "external_action_failed",
+                }
+            )
+            if run.cancel_requested and not external_action_safety_failure:
                 self._mark_cancelled(run, reason="cancelled_during_failure_boundary")
                 return
             run.status = RunStatus.FAILED

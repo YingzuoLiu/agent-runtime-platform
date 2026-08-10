@@ -29,6 +29,7 @@ class RuntimePermission(str, Enum):
     AGENTS_READ = "agents:read"
     TOOLS_READ = "tools:read"
     TOOLS_EXECUTE = "tools:execute"
+    EXTERNAL_ACTIONS_EXECUTE = "external-actions:execute"
     AGENT_MESSAGE_EXECUTE = "agent-message:execute"
     RUNS_CREATE = "runs:create"
     RUNS_READ = "runs:read"
@@ -112,6 +113,7 @@ class RoleAuthorizer:
     _OPERATOR_PERMISSIONS = _VIEWER_PERMISSIONS | frozenset(
         {
             RuntimePermission.TOOLS_EXECUTE,
+            RuntimePermission.EXTERNAL_ACTIONS_EXECUTE,
             RuntimePermission.AGENT_MESSAGE_EXECUTE,
             RuntimePermission.RUNS_CREATE,
             RuntimePermission.RUNS_CANCEL,

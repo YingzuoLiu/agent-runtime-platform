@@ -12,11 +12,17 @@ deliberately separate from thread checkpoints:
 SQLite is the only storage dependency. Phase 6A does not add embeddings, vector search,
 conversation-history replay, inferred profile facts, summarization, or an external memory service.
 
+`travel-agent:1.2.0` inherits this same Phase 6A boundary: the same explicit preference parser,
+subject scoping, precedence, sealed per-run snapshot, audit evidence, and forgetting semantics.
+Its additional `requested_action` field and external-action ledger do not create a second memory
+model or make `1.0.0` memory-aware. The published `1.1.0` input schema remains unchanged.
+
 ## Supported vertical slice
 
 Only explicit Travel preferences on a fixed domain allowlist are extracted:
 
-The strict explicit-intent parser is pinned to `travel-agent:1.1.0`. The published
+The strict explicit-intent parser is pinned to `travel-agent:1.1.0` and inherited by
+`travel-agent:1.2.0`. The published
 `travel-agent:1.0.0` registration retains its Phase 5A compatibility parser, including its broader
 substring semantics, so recovery and replay do not silently change behavior for an existing
 version.
@@ -38,10 +44,10 @@ The precedence order is:
 3. the existing thread checkpoint.
 
 Retrieved values are an execution overlay. They influence Planner decisions, tool arguments, and
-deterministic validation, but values injected by `1.1.0` are not copied into the preference fields
-saved back to the thread checkpoint. This prevents a deleted or superseded memory overlay from
-being resurrected by a later turn on that thread. The run still retains its immutable result,
-trace, tool evidence, and memory snapshot.
+deterministic validation, but values injected by `1.1.0` or `1.2.0` are not copied into the
+preference fields saved back to the thread checkpoint. This prevents a deleted or superseded
+memory overlay from being resurrected by a later turn on that thread. The run still retains its
+immutable result, trace, tool evidence, and memory snapshot.
 
 ## Persistence model
 
@@ -70,7 +76,7 @@ worker always reuses that row even if active memory has changed since the first 
 
 ## Retrieval, update, and forgetting
 
-On the first `travel-agent:1.1.0` attempt, the worker:
+On the first `travel-agent:1.1.0` or `travel-agent:1.2.0` attempt, the worker:
 
 1. verifies the persisted execution authority includes `memory:read`;
 2. retrieves only allowlisted active, unexpired records for the authority's tenant and subject;
@@ -128,7 +134,7 @@ evidence; operational forgetting does not rewrite those historical records.
 
 ## Verification boundary
 
-The Phase 6A tests prove:
+The full memory-focused coverage proves:
 
 - an explicit preference in Thread A survives service restart and changes tool arguments in
   Thread B for the same subject;
@@ -144,4 +150,6 @@ The Phase 6A tests prove:
 - retry mirroring repairs a committed mutation/run-event gap without duplicate evidence;
 - deletion prevents future use even when continuing an existing memory-aware thread;
 - missing persisted `memory:read` or `memory:write` authority fails with a stable error code;
+- `travel-agent:1.2.0` reuses the `1.1.0` explicit parser and sealed retrieval semantics while
+  keeping its action request and action evidence separate from memory records;
 - `travel-agent:1.0.0` remains memory-free for pinned Phase 5A behavior.
