@@ -53,11 +53,11 @@ See [`FINDINGS.md`](FINDINGS.md) for the scenarios, traces, and ablation results
 | Policy | Fixed step-limit, allowlist, permission, and argument-schema checks before execution | [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) |
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
-| External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
+| External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Security | Fail-closed API-key auth, tenant isolation, Viewer/Operator RBAC, registered-tool sandboxing | [`runtime_service/auth.py`](runtime_service/auth.py), [`docs/cloud-runtime.md`](docs/cloud-runtime.md) |
 | Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
 | Domains | Five Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
-| Evidence | Typed REST/SSE events for Planner, policy, tools, actions, recovery, and terminal outcomes | [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
+| Evidence | Workflow-first projection for Planner, policy, tool, action, and loop-outcome evidence; manager recovery events remain direct | [`runtime_service/evidence.py`](runtime_service/evidence.py), [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
 | Verification | Full suite; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
 
 ## Quick start
@@ -171,11 +171,14 @@ flowchart TB
     R --> G[Static validated DAG]
     L --> P[Planner and policy gate]
     P -->|read_only| B[Registered-tool sandbox]
-    P -->|external_write| E[(External-action ledger)]
+    P -->|external_write| EC[ExternalActionCoordinator]
+    EC --> E[(External-action ledger)]
     E --> V[Registered provider boundary]
+    L --> O[EvidenceProjector]
     G --> B
     B --> S
     E --> S
+    O --> S
 ```
 
 Every protected request derives `Principal`, `TenantContext`, and `RuntimeRole` from a server-side

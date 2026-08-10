@@ -15,11 +15,15 @@ flowchart TD
     LOOP --> PLAN["Typed Planner"]
     PLAN --> DEC{"Decision"}
     DEC -->|CALL_TOOL| POLICY["Step / allowlist / permission / schema"]
-    POLICY --> LEDGER["SQLiteWorkflowStore claim"]
-    LEDGER -->|read_only| SANDBOX["Registered handler subprocess"]
-    LEDGER -->|external_write| ACTION["Prepare action, then provider"]
+    POLICY -->|read_only| LEDGER["SQLiteWorkflowStore claim"]
+    LEDGER --> SANDBOX["Registered handler subprocess"]
+    POLICY -->|external_write| COORD["ExternalActionCoordinator"]
+    COORD --> ACTION["Durable claim, prepare, dispatch, recover"]
     SANDBOX --> OBS["Durable observation"]
     ACTION --> OBS
+    LEDGER --> PROJECT["EvidenceProjector"]
+    ACTION --> PROJECT
+    PROJECT --> EVENTS["Public Run events"]
     OBS --> PLAN
     DEC -->|REQUEST_CLARIFICATION| OUTCOME["Completed run + question"]
     DEC -->|FINISH| VALIDATE["Domain final validator"]
@@ -31,6 +35,15 @@ and a domain callback that validates `FINISH`. It does not parse destinations,
 budgets, release manifests, or any other domain field. `ToolEffect` and
 `ToolRetryMode` are server-controlled properties of a registered tool, not fields a
 Planner or request body can choose.
+
+The loop owns Planner orchestration, policy order, and read-only sandbox routing.
+`ExternalActionCoordinator` owns the external-write state machine: durable prepare,
+dispatch fencing, provider retries, exact terminal read-back, and restart recovery.
+It is stateless between calls and uses the same workflow store and dispatcher supplied
+to the loop. `EvidenceProjector` keeps the workflow ledger authoritative, then mirrors
+the existing evidence allowlist into public Run events. These ownership boundaries do
+not change tool schemas, persisted states, event payloads, retry limits, or recovery
+semantics.
 
 Every `EXTERNAL_WRITE` `ToolSpec` also requires a server-owned Pydantic
 `output_model` configured with `extra="forbid"`. Provider output is normalized
@@ -134,9 +147,11 @@ Phase 5A reuses both SQLite stores:
 - `run_events` is the user-visible trace returned by REST and SSE.
 
 Each decision has a stable index and evidence id. Dynamic tool steps use
-`call-0001`, `call-0002`, and so on. The workflow ledger is written before its
-run-event mirror; startup recovery backfills a missing mirror if a process
-stopped between those commits.
+`call-0001`, `call-0002`, and so on. `EvidenceProjector` writes the workflow
+ledger before its run-event mirror; startup recovery backfills a missing mirror
+if a process stopped between those commits. It deduplicates by
+`(event_type, evidence_id)` and mirrors only Planner, policy, tool, loop-outcome,
+and `external_action.*` evidence.
 
 The visible sequence is:
 

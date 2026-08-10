@@ -376,6 +376,102 @@ def execute_loop(
     )
 
 
+def test_external_write_delegates_once_to_coordinator_and_skips_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = execution_context("run-external-coordinator-delegation")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = SuccessProvider(workflow_store)
+    sandbox = RecordingSandbox()
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold(), finish()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=sandbox,
+        retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+        dispatcher=dispatcher_for(provider),
+    )
+    coordinator_calls: list[dict[str, Any]] = []
+    original_execute = loop.external_action_coordinator.execute
+
+    def record_coordinator_call(**kwargs):
+        coordinator_calls.append(kwargs)
+        return original_execute(**kwargs)
+
+    monkeypatch.setattr(
+        loop.external_action_coordinator,
+        "execute",
+        record_coordinator_call,
+    )
+
+    result = execute_loop(loop, context)
+
+    assert result.outcome == DynamicLoopOutcome.FINISHED
+    assert len(coordinator_calls) == 1
+    assert coordinator_calls[0]["tool_name"] == "create_hold"
+    assert coordinator_calls[0]["step_id"] == "call-0001"
+    assert coordinator_calls[0]["normalized_arguments"] == {
+        "item_id": "item-42",
+        "quantity": 1,
+    }
+    assert len(provider.requests) == 1
+    assert sandbox.calls == []
+
+
+def test_dispatcher_removal_after_loop_construction_fails_closed_before_claim(
+    tmp_path: Path,
+):
+    context = execution_context("run-external-dispatcher-removed")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = SuccessProvider(workflow_store)
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+        dispatcher=dispatcher_for(provider),
+    )
+    loop.external_action_dispatcher = None
+
+    with pytest.raises(RuntimeExecutionError) as raised:
+        execute_loop(loop, context)
+
+    assert raised.value.code == "external_action_not_configured"
+    assert provider.requests == []
+    assert workflow_store.list_steps(context.run_id) == []
+    assert workflow_store.list_external_actions(context.run_id) == []
+
+
+def test_workflow_type_change_after_construction_reaches_action_and_provider(
+    tmp_path: Path,
+):
+    context = execution_context("run-external-workflow-type-change")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = SuccessProvider(workflow_store)
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold(), finish()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+        dispatcher=dispatcher_for(provider),
+    )
+    changed_workflow_type = "generic-external-action:9.9.9"
+    loop.workflow_type = changed_workflow_type
+
+    result = execute_loop(loop, context)
+
+    assert result.outcome == DynamicLoopOutcome.FINISHED
+    execution = workflow_store.get_execution(context.run_id)
+    action = workflow_store.get_external_action(context.run_id, "call-0001")
+    assert execution is not None and execution.workflow_type == changed_workflow_type
+    assert action is not None and action.workflow_type == changed_workflow_type
+    assert len(provider.requests) == 1
+    assert provider.requests[0].workflow_type == changed_workflow_type
+
+
 def test_external_action_is_prepared_before_provider_and_finalized_atomically(
     tmp_path: Path,
 ):
@@ -440,6 +536,32 @@ def test_provider_commit_then_ambiguous_retries_once_with_same_server_key(
     action = workflow_store.get_external_action(context.run_id, "call-0001")
     assert action is not None and action.status == ExternalActionStatus.SUCCEEDED
     assert action.dispatch_count == 2
+
+
+def test_runtime_retry_limit_change_is_honored_by_coordinator(
+    tmp_path: Path,
+):
+    context = execution_context("run-external-runtime-retry-limit")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = CommitThenAmbiguousProvider()
+    loop = build_external_loop(
+        planner=ScriptedPlanner(call_hold()),
+        workflow_store=workflow_store,
+        run_store=run_store,
+        sandbox=RecordingSandbox(),
+        retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
+        dispatcher=dispatcher_for(provider),
+    )
+    loop.MAX_EXTERNAL_ACTION_DISPATCHES = 1
+
+    with pytest.raises(RuntimeExecutionError) as raised:
+        execute_loop(loop, context)
+
+    assert raised.value.code == "external_action_outcome_unknown"
+    assert len(provider.requests) == 1
+    action = workflow_store.get_external_action(context.run_id, "call-0001")
+    assert action is not None and action.status == ExternalActionStatus.OUTCOME_UNKNOWN
+    assert action.dispatch_count == 1
 
 
 def test_provider_result_extras_are_never_persisted_or_exposed(
@@ -1315,7 +1437,11 @@ def test_cached_success_evidence_failure_is_not_generic_or_replayed(
     def fail_tool_result(*_args, **_kwargs):
         raise sqlite3.OperationalError("injected cached tool evidence failure")
 
-    monkeypatch.setattr(recovered_loop, "_record_tool_success", fail_tool_result)
+    monkeypatch.setattr(
+        recovered_loop.external_action_coordinator,
+        "_record_tool_success",
+        fail_tool_result,
+    )
 
     with pytest.raises(RuntimeExecutionError) as raised:
         execute_loop(
@@ -1573,7 +1699,7 @@ def test_terminal_failure_restore_spec_drift_preserves_definitive_failure(
         raise ProcessCrash()
 
     monkeypatch.setattr(
-        first_loop,
+        first_loop.external_action_coordinator,
         "_raise_external_terminal_failure",
         crash_after_terminal_failure,
     )
@@ -1892,6 +2018,7 @@ def test_cancelled_run_stops_after_prepare_without_dispatch(
 
 def test_read_only_loop_keeps_original_policy_payload_and_sandbox_path(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     context = execution_context(
         "run-read-only-compatibility",
@@ -1923,6 +2050,15 @@ def test_read_only_loop_keeps_original_policy_payload_and_sandbox_path(
         workflow_store=workflow_store,
         run_event_sink=run_store,
         workflow_type="generic-read-only:1.0.0",
+    )
+
+    def fail_if_coordinator_runs(**_kwargs):
+        raise AssertionError("Read-only tool reached ExternalActionCoordinator")
+
+    monkeypatch.setattr(
+        loop.external_action_coordinator,
+        "execute",
+        fail_if_coordinator_runs,
     )
 
     result = execute_loop(loop, context)
