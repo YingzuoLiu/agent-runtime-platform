@@ -379,6 +379,8 @@ def test_new_core_execution_modules_do_not_import_travel_or_release_domains():
     for relative_path in (
         "runtime_service/planner.py",
         "runtime_service/dynamic_loop.py",
+        "runtime_service/evidence.py",
+        "runtime_service/external_action_coordinator.py",
         "runtime_service/memory.py",
         "runtime_service/sandbox.py",
         "runtime_service/sandbox_worker.py",

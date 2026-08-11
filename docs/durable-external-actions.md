@@ -9,6 +9,12 @@ The implementation makes external intent, dispatch attempts, and outcomes durabl
 claim exactly-once execution, automatic compensation, human approval, or integration with live
 booking, payment, or inventory systems.
 
+`DynamicToolLoop` retains Planner orchestration and policy ordering. The stateless
+`ExternalActionCoordinator` owns prepare/dispatch/retry/recovery transitions, while
+`EvidenceProjector` keeps workflow evidence authoritative and repairs its public Run-event
+mirror. This separation is structural: it does not add states, events, retries, or provider
+capabilities.
+
 ## Version and tool boundary
 
 Published runtime versions keep separate contracts:
@@ -57,9 +63,10 @@ flowchart TD
     D --> F["Atomically finalize action and tool result"]
 ```
 
-For an allowed external write, the loop:
+For an allowed external write, the loop validates policy and delegates the durable
+transition sequence to the coordinator:
 
-1. validates the step limit, runtime allowlist, persisted permissions, server-owned runtime-input
+1. the loop validates the step limit, runtime allowlist, persisted permissions, server-owned runtime-input
    gate, provider configuration, stable provider identity, provider idempotency capability when
    required, and typed arguments;
 2. claims the durable tool step;

@@ -24,10 +24,13 @@ flowchart TB
     RM --> DAG["Serial validated DAG"]
     DL --> P["Planner and policy gate"]
     P -->|read_only| S["Registered-tool sandbox"]
-    P -->|external_write| E[("tool_calls and external_actions")]
+    P -->|external_write| EC["ExternalActionCoordinator"]
+    EC --> E[("tool_calls and external_actions")]
     E --> H["Registered provider boundary"]
+    DL --> EP["EvidenceProjector"]
     S --> RS
     E --> RS
+    EP --> RS
 ```
 
 Both Travel API paths use the same durable `thread_states` table. The generic
@@ -37,11 +40,13 @@ execution. Thread identifiers are scoped within a tenant: two tenants may reuse
 the same identifier independently, while reusing it for a different domain or
 schema inside one tenant fails explicitly instead of overwriting a checkpoint.
 
-External writes never enter the subprocess sandbox. The loop first prepares a
-durable action linked to its tool step, then invokes a server-registered provider
-through an injectable, configurable provider boundary. The bundled Travel
-provider is a deterministic SQLite test double in a separate file, not a live
-travel integration.
+External writes never enter the subprocess sandbox. The loop delegates their
+durable prepare, dispatch, retry, and recovery state machine to
+`ExternalActionCoordinator`, which invokes a server-registered provider through
+an injectable, configurable boundary. `EvidenceProjector` mirrors authoritative
+workflow evidence into the public Run stream without changing payloads or states.
+The bundled Travel provider is a deterministic SQLite test double in a separate
+file, not a live travel integration.
 
 ## Authentication, authorization, and tenant boundary
 
