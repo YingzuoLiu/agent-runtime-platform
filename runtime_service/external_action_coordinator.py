@@ -150,36 +150,43 @@ class ExternalActionCoordinator:
                 for candidate in self.workflow_store.list_external_actions(context.run_id)
                 if candidate.dispatch_count > 0
             ]
-            if any(
+            if not dispatched_actions:
+                return
+            reconciliation_pending = any(
                 candidate.status not in self._RECONCILE_PRIORITY
                 or candidate.status == ExternalActionStatus.PREPARED
                 for candidate in dispatched_actions
-            ):
-                raise ExternalActionReconciliationPendingError()
-            actions = [
-                candidate
-                for candidate in dispatched_actions
-                if include_terminal or not candidate.status.is_terminal
-            ]
-            if not actions:
-                return
-            action = min(
-                actions,
-                key=lambda candidate: self._RECONCILE_PRIORITY[candidate.status],
             )
+            if not reconciliation_pending:
+                actions = [
+                    candidate
+                    for candidate in dispatched_actions
+                    if include_terminal or not candidate.status.is_terminal
+                ]
+                if not actions:
+                    return
+                action = min(
+                    actions,
+                    key=lambda candidate: self._RECONCILE_PRIORITY[candidate.status],
+                )
         else:
-            if (
+            reconciliation_pending = (
                 action.status not in self._RECONCILE_PRIORITY
                 or action.status == ExternalActionStatus.PREPARED
+            )
+            if (
+                not reconciliation_pending
+                and action.status.is_terminal
+                and not include_terminal
             ):
-                raise ExternalActionReconciliationPendingError()
-            if action.status.is_terminal and not include_terminal:
                 return
 
         try:
             self._mirror_evidence(context.run_id)
         except Exception:
             pass
+        if reconciliation_pending or action is None:
+            raise ExternalActionReconciliationPendingError()
         if action.status == ExternalActionStatus.DISPATCHING:
             step = self.workflow_store.get_step(context.run_id, action.step_id)
             if step is None:

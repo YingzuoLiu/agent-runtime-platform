@@ -117,9 +117,16 @@ def test_every_action_status_is_explicitly_ranked_for_reconciliation():
 
 
 @pytest.mark.parametrize("explicit_action", [False, True])
-def test_unranked_action_status_stays_reconciliation_pending(explicit_action: bool):
+@pytest.mark.parametrize("include_terminal", [False, True])
+def test_unranked_action_status_mirrors_before_staying_reconciliation_pending(
+    explicit_action: bool,
+    include_terminal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
     action = dispatched_action("quarantined")
-    coordinator = build_coordinator(actions=[dispatched_action("quarantined")])
+    coordinator = build_coordinator(actions=[] if explicit_action else [action])
+    mirror_calls: list[str] = []
+    monkeypatch.setattr(coordinator, "_mirror_evidence", mirror_calls.append)
 
     # An unranked status cannot prove a safe terminal outcome, whether it is
     # discovered from the run ledger or supplied by an existing recovery path.
@@ -127,7 +134,9 @@ def test_unranked_action_status_stays_reconciliation_pending(explicit_action: bo
         coordinator.reconcile_dispatched_action(
             context=execution_context(),
             action=action if explicit_action else None,
+            include_terminal=include_terminal,
         )
+    assert mirror_calls == [RUN_ID]
 
 
 @pytest.mark.parametrize("include_terminal", [False, True])
@@ -140,6 +149,7 @@ def test_unreconcilable_status_blocks_a_terminal_sibling(
     include_terminal: bool,
     blocking_first: bool,
     blocking_status: ExternalActionStatus | str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     blocking = dispatched_action(blocking_status)
     terminal = dispatched_action(ExternalActionStatus.SUCCEEDED)
@@ -147,6 +157,8 @@ def test_unreconcilable_status_blocks_a_terminal_sibling(
     coordinator = build_coordinator(
         actions=actions,
     )
+    mirror_calls: list[str] = []
+    monkeypatch.setattr(coordinator, "_mirror_evidence", mirror_calls.append)
 
     # A known terminal sibling must not hide either a status the runtime cannot
     # understand or a PREPARED row that corruptly claims a dispatch occurred.
@@ -155,6 +167,63 @@ def test_unreconcilable_status_blocks_a_terminal_sibling(
             context=execution_context(),
             include_terminal=include_terminal,
         )
+    assert mirror_calls == [RUN_ID]
+
+
+@pytest.mark.parametrize("explicit_action", [False, True])
+def test_mirror_failure_cannot_replace_reconciliation_pending(
+    explicit_action: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    action = dispatched_action("quarantined")
+    coordinator = build_coordinator(actions=[] if explicit_action else [action])
+
+    def fail_mirror(_run_id: str) -> None:
+        raise OSError("public evidence unavailable")
+
+    monkeypatch.setattr(coordinator, "_mirror_evidence", fail_mirror)
+
+    with pytest.raises(ExternalActionReconciliationPendingError):
+        coordinator.reconcile_dispatched_action(
+            context=execution_context(),
+            action=action if explicit_action else None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("actions", "action", "include_terminal"),
+    [
+        (
+            [
+                dispatched_action(ExternalActionStatus.PREPARED).model_copy(
+                    update={"dispatch_count": 0, "dispatch_token": None}
+                )
+            ],
+            None,
+            True,
+        ),
+        ([dispatched_action(ExternalActionStatus.SUCCEEDED)], None, False),
+        ([], dispatched_action(ExternalActionStatus.SUCCEEDED), False),
+    ],
+)
+def test_reconciliation_early_returns_do_not_mirror(
+    actions: list[ExternalActionRecord],
+    action: ExternalActionRecord | None,
+    include_terminal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    coordinator = build_coordinator(actions=actions)
+
+    def unexpected_mirror(_run_id: str) -> None:
+        raise AssertionError("early-return reconciliation must not mirror")
+
+    monkeypatch.setattr(coordinator, "_mirror_evidence", unexpected_mirror)
+
+    coordinator.reconcile_dispatched_action(
+        context=execution_context(),
+        action=action,
+        include_terminal=include_terminal,
+    )
 
 
 def test_fail_restored_step_delegates_through_the_private_compatibility_hook():

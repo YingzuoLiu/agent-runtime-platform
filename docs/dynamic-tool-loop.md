@@ -53,9 +53,11 @@ The coordinator resolves its failure text through `failure_message()`, falling b
 table, and ranks known reconciliation candidates through `_RECONCILE_PRIORITY`. If any
 dispatched action has an unranked status, or remains `PREPARED` despite a non-zero
 dispatch count, reconciliation stops before selecting a sibling and keeps the Run
-pending. Both decisions sit on paths that run only after a provider call may already
-have been applied, so neither may raise `KeyError` or terminalize the Run without
-understanding every dispatched status.
+pending. Before raising that pending outcome, the coordinator best-effort repairs the
+public evidence mirror; projection failure cannot replace the fail-closed outcome.
+Both decisions sit on paths that run only after a provider call may already have been
+applied, so neither may raise `KeyError` or terminalize the Run without understanding
+every dispatched status.
 
 Every `EXTERNAL_WRITE` `ToolSpec` also requires a server-owned Pydantic
 `output_model` configured with `extra="forbid"`. Provider output is normalized
