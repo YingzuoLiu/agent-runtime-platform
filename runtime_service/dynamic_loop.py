@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from enum import Enum
-from hashlib import sha256
 from typing import Any, NoReturn, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent.contracts import RuntimeExecutionContext, RuntimeExecutionError
 
+from .canonical import decode_tool_result, stable_hash
 from .external_action_coordinator import ExternalActionCoordinator
 from .external_actions import (
     ExternalActionDispatcher,
@@ -1163,18 +1163,7 @@ class DynamicToolLoop:
         tool_name: str,
         result: dict[str, Any],
     ) -> None:
-        self._record_evidence(
-            run_id,
-            "tool.result",
-            {
-                "evidence_id": f"tool-result:{step_id}",
-                "step_id": step_id,
-                "tool_name": tool_name,
-                "status": "completed",
-                "result": result,
-                "error_code": None,
-            },
-        )
+        self.evidence_projector.record_tool_success(run_id, step_id, tool_name, result)
 
     def _record_tool_failure(
         self,
@@ -1183,18 +1172,7 @@ class DynamicToolLoop:
         tool_name: str,
         error_code: str,
     ) -> None:
-        self._record_evidence(
-            run_id,
-            "tool.result",
-            {
-                "evidence_id": f"tool-result:{step_id}",
-                "step_id": step_id,
-                "tool_name": tool_name,
-                "status": "failed",
-                "result": None,
-                "error_code": error_code,
-            },
-        )
+        self.evidence_projector.record_tool_failure(run_id, step_id, tool_name, error_code)
 
     def _record_evidence(
         self,
@@ -1235,12 +1213,12 @@ class DynamicToolLoop:
         code: str,
         detail: str,
     ) -> NoReturn:
-        if action is not None and action.dispatch_count > 0:
-            self.external_action_coordinator.reconcile_dispatched_action(
-                context=context,
-                action=action,
-            )
-        self._fail(context.run_id, code, detail)
+        self.external_action_coordinator.fail_restored_step(
+            context=context,
+            action=action,
+            code=code,
+            detail=detail,
+        )
 
     def _decision_payload_for_step(
         self,
@@ -1259,26 +1237,7 @@ class DynamicToolLoop:
             detail=f"Tool step {step_id} has no durable planner decision.",
         )
 
-    @staticmethod
-    def _decode_tool_result(step: ToolCallRecord) -> dict[str, Any]:
-        if step.result_json is None:
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Completed tool step {step.step_id} is missing its result.",
-            )
-        try:
-            value = json.loads(step.result_json)
-        except json.JSONDecodeError as exc:
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Tool step {step.step_id} persisted invalid JSON.",
-            ) from exc
-        if not isinstance(value, dict):
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Tool step {step.step_id} did not persist an object result.",
-            )
-        return value
+    _decode_tool_result = staticmethod(decode_tool_result)
 
     def _decode_tool_result_or_fail(
         self,
@@ -1290,15 +1249,7 @@ class DynamicToolLoop:
         except RuntimeExecutionError as exc:
             self._fail(run_id, exc.code, str(exc))
 
-    @staticmethod
-    def _stable_hash(payload: dict[str, Any]) -> str:
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+    _stable_hash = staticmethod(stable_hash)
 
     @staticmethod
     def _canonical_json(payload: dict[str, Any]) -> str:

@@ -137,6 +137,31 @@ def test_record_retry_does_not_duplicate_run_event_after_post_append_error(
     ]
 
 
+def test_mirror_retry_does_not_duplicate_run_event_after_post_append_error(
+    tmp_path: Path,
+):
+    workflow_store, sink, projector = build_projector(tmp_path)
+    first = {"evidence_id": "planner:1", "decision_index": 1}
+    second = {"evidence_id": "loop:outcome", "outcome": "finished"}
+    workflow_store.append_event(RUN_ID, "planner.decision", first)
+    workflow_store.append_event(RUN_ID, "loop.outcome", second)
+    sink.raise_after_append = True
+
+    with pytest.raises(OSError, match="post-append failure"):
+        projector.mirror(RUN_ID)
+
+    assert [(event.event_type, event.payload) for event in sink.events] == [
+        ("planner.decision", first)
+    ]
+
+    projector.mirror(RUN_ID)
+
+    assert [(event.event_type, event.payload) for event in sink.events] == [
+        ("planner.decision", first),
+        ("loop.outcome", second),
+    ]
+
+
 def test_mirror_preserves_source_order_and_filters_non_public_events(
     tmp_path: Path,
 ):
@@ -168,3 +193,103 @@ def test_mirror_preserves_source_order_and_filters_non_public_events(
         ("external_action.prepared", action_payload),
         ("loop.outcome", loop_payload),
     ]
+
+
+def test_mirror_reads_the_run_stream_once_regardless_of_event_count(
+    tmp_path: Path,
+):
+    workflow_store, sink, projector = build_projector(tmp_path)
+    for index in range(1, 13):
+        workflow_store.append_event(
+            RUN_ID,
+            "planner.decision",
+            {"evidence_id": f"planner:{index}", "decision_index": index},
+        )
+
+    reads: list[int] = []
+    original_list_events = sink.list_events
+
+    def counting_list_events(*args: Any, **kwargs: Any) -> list[RecordedEvent]:
+        reads.append(1)
+        return original_list_events(*args, **kwargs)
+
+    sink.list_events = counting_list_events  # type: ignore[method-assign]
+    projector.mirror(RUN_ID)
+
+    assert len(sink.events) == 12
+    # Read-repair must not rescan the public stream per candidate event.
+    assert len(reads) == 1
+
+    reads.clear()
+    projector.mirror(RUN_ID)
+
+    assert len(sink.events) == 12
+    assert len(reads) == 1
+
+
+def test_mirror_falls_back_to_value_comparison_for_non_string_evidence_ids(
+    tmp_path: Path,
+):
+    workflow_store, sink, projector = build_projector(tmp_path)
+    numeric_payload = {"evidence_id": 7, "decision_index": 7}
+    workflow_store.append_event(RUN_ID, "planner.decision", numeric_payload)
+
+    projector.mirror(RUN_ID)
+    projector.mirror(RUN_ID)
+
+    assert [(event.event_type, event.payload) for event in sink.events] == [
+        ("planner.decision", numeric_payload),
+    ]
+
+
+def test_record_tool_helpers_emit_the_canonical_tool_result_payloads(
+    tmp_path: Path,
+):
+    workflow_store, sink, projector = build_projector(tmp_path)
+
+    projector.record_tool_success(RUN_ID, "call-0001", "create_hold", {"ok": True})
+    projector.record_tool_failure(
+        RUN_ID,
+        "call-0002",
+        "create_hold",
+        "external_action_failed",
+    )
+
+    assert [(event.event_type, event.payload) for event in sink.events] == [
+        (
+            "tool.result",
+            {
+                "evidence_id": "tool-result:call-0001",
+                "step_id": "call-0001",
+                "tool_name": "create_hold",
+                "status": "completed",
+                "result": {"ok": True},
+                "error_code": None,
+            },
+        ),
+        (
+            "tool.result",
+            {
+                "evidence_id": "tool-result:call-0002",
+                "step_id": "call-0002",
+                "tool_name": "create_hold",
+                "status": "failed",
+                "result": None,
+                "error_code": "external_action_failed",
+            },
+        ),
+    ]
+    assert [event.event_type for event in workflow_store.list_events(RUN_ID)] == [
+        "tool.result",
+        "tool.result",
+    ]
+
+
+def test_record_rejects_drift_through_the_tool_result_helpers(tmp_path: Path):
+    _workflow_store, _sink, projector = build_projector(tmp_path)
+    projector.record_tool_success(RUN_ID, "call-0001", "create_hold", {"ok": True})
+
+    with pytest.raises(RuntimeExecutionError) as raised:
+        projector.record_tool_success(RUN_ID, "call-0001", "create_hold", {"ok": False})
+
+    assert raised.value.code == "invalid_planner_decision"

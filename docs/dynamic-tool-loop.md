@@ -41,9 +41,21 @@ The loop owns Planner orchestration, policy order, and read-only sandbox routing
 dispatch fencing, provider retries, exact terminal read-back, and restart recovery.
 It is stateless between calls and uses the same workflow store and dispatcher supplied
 to the loop. `EvidenceProjector` keeps the workflow ledger authoritative, then mirrors
-the existing evidence allowlist into public Run events. These ownership boundaries do
-not change tool schemas, persisted states, event payloads, retry limits, or recovery
-semantics.
+the existing evidence allowlist into public Run events. `runtime_service/canonical.py`
+holds the identity primitives both sides share — canonical JSON encoding, the stable
+hash built on it, and persisted tool-result decoding — so the two owners cannot drift
+apart on what makes two records the same record. These ownership boundaries do not
+change tool schemas, persisted states, event payloads, retry limits, or recovery
+semantics for the currently supported action states and host failure table.
+
+The coordinator resolves its failure text through `failure_message()`, falling back to
+`ExternalActionCoordinator.DEFAULT_FAILURE_MESSAGES` when a host supplies a narrower
+table, and ranks known reconciliation candidates through `_RECONCILE_PRIORITY`. If any
+dispatched action has an unranked status, or remains `PREPARED` despite a non-zero
+dispatch count, reconciliation stops before selecting a sibling and keeps the Run
+pending. Both decisions sit on paths that run only after a provider call may already
+have been applied, so neither may raise `KeyError` or terminalize the Run without
+understanding every dispatched status.
 
 Every `EXTERNAL_WRITE` `ToolSpec` also requires a server-owned Pydantic
 `output_model` configured with `extra="forbid"`. Provider output is normalized
@@ -151,7 +163,9 @@ Each decision has a stable index and evidence id. Dynamic tool steps use
 ledger before its run-event mirror; startup recovery backfills a missing mirror
 if a process stopped between those commits. It deduplicates by
 `(event_type, evidence_id)` and mirrors only Planner, policy, tool, loop-outcome,
-and `external_action.*` evidence.
+and `external_action.*` evidence. For the runtime's string evidence IDs, a mirror pass
+lists the public Run stream at most once and tracks its own appends, so scan work is
+linear in the workflow and public event counts rather than quadratic.
 
 The visible sequence is:
 

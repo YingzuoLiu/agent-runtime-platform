@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from hashlib import sha256
-from typing import Any, NoReturn
+from typing import Any, ClassVar, NoReturn
 
 from pydantic import ValidationError
 
 from agent.contracts import RuntimeExecutionContext, RuntimeExecutionError
 
+from .canonical import canonical_json, decode_tool_result, stable_hash
 from .evidence import EvidenceProjector
 from .external_actions import (
     DefinitiveExternalActionError,
@@ -40,6 +40,34 @@ class ExternalActionCoordinator:
     action identity and provider-dispatch semantics.
     """
 
+    # Every message the coordinator can surface, so a host that supplies a
+    # narrower table cannot turn a post-dispatch failure path into a KeyError.
+    DEFAULT_FAILURE_MESSAGES: ClassVar[Mapping[str, str]] = {
+        "external_action_failed": "External action failed definitively.",
+        "external_action_outcome_unknown": (
+            "External action outcome is unknown and was not retried again."
+        ),
+        "external_action_evidence_incomplete": (
+            "External action completed, but durable run evidence is incomplete."
+        ),
+        "run_cancel_requested": (
+            "Run cancellation was requested before external action dispatch."
+        ),
+    }
+
+    # Reconciliation prefers the least-proven known outcome, because a record
+    # that cannot prove a provider result must not be masked by a terminal
+    # sibling. Any unknown status, or a corrupt PREPARED row that claims a
+    # dispatch already occurred, blocks selection entirely and keeps the Run
+    # reconciliation-pending.
+    _RECONCILE_PRIORITY: ClassVar[Mapping[ExternalActionStatus, int]] = {
+        ExternalActionStatus.DISPATCHING: 0,
+        ExternalActionStatus.OUTCOME_UNKNOWN: 1,
+        ExternalActionStatus.SUCCEEDED: 2,
+        ExternalActionStatus.FAILED: 3,
+        ExternalActionStatus.PREPARED: 4,
+    }
+
     def __init__(
         self,
         *,
@@ -64,6 +92,19 @@ class ExternalActionCoordinator:
         if callable(self._failure_messages):
             return self._failure_messages()
         return self._failure_messages
+
+    def failure_message(self, code: str) -> str:
+        """Resolve a safe message, falling back before a failure path can raise.
+
+        These lookups happen only while terminalizing a run whose provider call
+        may already have been applied, so a host table missing a code must not
+        replace the outcome with a KeyError.
+        """
+
+        message = self.failure_messages.get(code)
+        if message is None:
+            return self.DEFAULT_FAILURE_MESSAGES.get(code, "External action failed.")
+        return message
 
     @property
     def max_dispatches(self) -> int:
@@ -104,27 +145,36 @@ class ExternalActionCoordinator:
         """
 
         if action is None:
-            actions = [
+            dispatched_actions = [
                 candidate
                 for candidate in self.workflow_store.list_external_actions(context.run_id)
                 if candidate.dispatch_count > 0
-                and (include_terminal or not candidate.status.is_terminal)
+            ]
+            if any(
+                candidate.status not in self._RECONCILE_PRIORITY
+                or candidate.status == ExternalActionStatus.PREPARED
+                for candidate in dispatched_actions
+            ):
+                raise ExternalActionReconciliationPendingError()
+            actions = [
+                candidate
+                for candidate in dispatched_actions
+                if include_terminal or not candidate.status.is_terminal
             ]
             if not actions:
                 return
-            priority = {
-                ExternalActionStatus.DISPATCHING: 0,
-                ExternalActionStatus.OUTCOME_UNKNOWN: 1,
-                ExternalActionStatus.SUCCEEDED: 2,
-                ExternalActionStatus.FAILED: 3,
-                ExternalActionStatus.PREPARED: 4,
-            }
-            action = sorted(
+            action = min(
                 actions,
-                key=lambda candidate: priority[candidate.status],
-            )[0]
-        elif action.status.is_terminal and not include_terminal:
-            return
+                key=lambda candidate: self._RECONCILE_PRIORITY[candidate.status],
+            )
+        else:
+            if (
+                action.status not in self._RECONCILE_PRIORITY
+                or action.status == ExternalActionStatus.PREPARED
+            ):
+                raise ExternalActionReconciliationPendingError()
+            if action.status.is_terminal and not include_terminal:
+                return
 
         try:
             self._mirror_evidence(context.run_id)
@@ -162,7 +212,7 @@ class ExternalActionCoordinator:
                 raise
         except Exception:
             pass
-        raise RuntimeExecutionError(code, self.failure_messages[code])
+        raise RuntimeExecutionError(code, self.failure_message(code))
 
     def execute(
         self,
@@ -365,7 +415,7 @@ class ExternalActionCoordinator:
             if dispatch.outcome == ExternalActionDispatchOutcome.RUN_CANCELLED:
                 raise RuntimeExecutionError(
                     "run_cancel_requested",
-                    self.failure_messages["run_cancel_requested"],
+                    self.failure_message("run_cancel_requested"),
                 )
             if dispatch.outcome == ExternalActionDispatchOutcome.TERMINAL:
                 return self._handle_external_terminal(
@@ -908,7 +958,7 @@ class ExternalActionCoordinator:
                 continue
         raise RuntimeExecutionError(
             "external_action_evidence_incomplete",
-            self.failure_messages["external_action_evidence_incomplete"],
+            self.failure_message("external_action_evidence_incomplete"),
         )
 
     def _raise_external_terminal_failure(
@@ -943,7 +993,7 @@ class ExternalActionCoordinator:
                 raise
         except Exception:
             pass
-        raise RuntimeExecutionError(error_code, self.failure_messages[error_code])
+        raise RuntimeExecutionError(error_code, self.failure_message(error_code))
 
     def _raise_external_outcome_unknown(
         self,
@@ -991,7 +1041,7 @@ class ExternalActionCoordinator:
             pass
         raise RuntimeExecutionError(
             "external_action_outcome_unknown",
-            self.failure_messages["external_action_outcome_unknown"],
+            self.failure_message("external_action_outcome_unknown"),
         )
 
     def _external_outcome_unknown_was_committed(
@@ -1117,7 +1167,7 @@ class ExternalActionCoordinator:
             or not action.provider_reference
             or action.error_code is not None
         ):
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
@@ -1126,14 +1176,14 @@ class ExternalActionCoordinator:
         try:
             result = self._decode_tool_result(step)
         except RuntimeExecutionError as exc:
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code=exc.code,
                 detail=str(exc),
             )
         if spec.output_model is None:  # pragma: no cover - registry invariant
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
@@ -1145,35 +1195,35 @@ class ExternalActionCoordinator:
                 context={"arguments": normalized_arguments},
             ).model_dump(mode="json")
         except ValidationError:
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
                 detail=("Persisted external action result no longer passes output validation."),
             )
         if normalized_result != result:
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
                 detail="Persisted external action result is not canonical.",
             )
         if self._contains_sensitive_text(result, idempotency_key):
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
                 detail="Persisted external action result contains its idempotency key.",
             )
         if action.result_json != self.canonical_json(result):
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
                 detail="External action result does not match its completed tool step.",
             )
         if result.get("provider_reference") != action.provider_reference:
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
@@ -1233,7 +1283,7 @@ class ExternalActionCoordinator:
             or action.result_json is not None
             or step.result_json is not None
         ):
-            self._fail_restored_step(
+            self.fail_restored_step(
                 context=context,
                 action=action,
                 code="invalid_planner_decision",
@@ -1394,14 +1444,7 @@ class ExternalActionCoordinator:
         )
         return f"external_action_{digest}"
 
-    @staticmethod
-    def canonical_json(payload: dict[str, Any]) -> str:
-        return json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
+    canonical_json = staticmethod(canonical_json)
 
     @staticmethod
     def _contains_sensitive_text(value: Any, sensitive_text: str) -> bool:
@@ -1448,18 +1491,7 @@ class ExternalActionCoordinator:
         tool_name: str,
         result: dict[str, Any],
     ) -> None:
-        self.evidence_projector.record(
-            run_id,
-            "tool.result",
-            {
-                "evidence_id": f"tool-result:{step_id}",
-                "step_id": step_id,
-                "tool_name": tool_name,
-                "status": "completed",
-                "result": result,
-                "error_code": None,
-            },
-        )
+        self.evidence_projector.record_tool_success(run_id, step_id, tool_name, result)
 
     def _record_tool_failure(
         self,
@@ -1468,18 +1500,7 @@ class ExternalActionCoordinator:
         tool_name: str,
         error_code: str,
     ) -> None:
-        self.evidence_projector.record(
-            run_id,
-            "tool.result",
-            {
-                "evidence_id": f"tool-result:{step_id}",
-                "step_id": step_id,
-                "tool_name": tool_name,
-                "status": "failed",
-                "result": None,
-                "error_code": error_code,
-            },
-        )
+        self.evidence_projector.record_tool_failure(run_id, step_id, tool_name, error_code)
 
     def _fail_restored_step(
         self,
@@ -1496,33 +1517,23 @@ class ExternalActionCoordinator:
             )
         self._fail(context.run_id, code, detail)
 
-    @staticmethod
-    def _decode_tool_result(step: ToolCallRecord) -> dict[str, Any]:
-        if step.result_json is None:
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Completed tool step {step.step_id} is missing its result.",
-            )
-        try:
-            value = json.loads(step.result_json)
-        except json.JSONDecodeError as exc:
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Tool step {step.step_id} persisted invalid JSON.",
-            ) from exc
-        if not isinstance(value, dict):
-            raise RuntimeExecutionError(
-                "tool_execution_failed",
-                f"Tool step {step.step_id} did not persist an object result.",
-            )
-        return value
+    def fail_restored_step(
+        self,
+        *,
+        context: RuntimeExecutionContext,
+        action: ExternalActionRecord | None,
+        code: str,
+        detail: str,
+    ) -> NoReturn:
+        """Delegate through the pre-extraction hook for compatibility."""
 
-    @staticmethod
-    def _stable_hash(payload: dict[str, Any]) -> str:
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+        self._fail_restored_step(
+            context=context,
+            action=action,
+            code=code,
+            detail=detail,
+        )
+
+    _decode_tool_result = staticmethod(decode_tool_result)
+
+    _stable_hash = staticmethod(stable_hash)
