@@ -11,8 +11,8 @@ from runtime_service.sandbox import ToolExecutionResult, ToolExecutionStatus, To
 from runtime_service.workflow_store import (
     ClaimOutcome,
     ExecutionOutcome,
-    SQLiteWorkflowStore,
     StepReuseOutcome,
+    WorkflowStore,
     WorkflowExecutionRecord,
     WorkflowStatus,
 )
@@ -326,14 +326,15 @@ def validate_release_readiness(step_results: Dict[str, Dict[str, Any]]) -> List[
 class ReleaseValidationWorkflow:
     """Dependency-aware, serial registered-tool workflow.
 
-    Uses `SQLiteWorkflowStore` and `ToolSandbox` directly. The workflow
-    itself has no manager or HTTP concerns; `ManagedReleaseValidationRuntime`
-    below is the explicit integration adapter.
+    Uses the structural `WorkflowStore` contract and `ToolSandbox` directly.
+    The service composition root supplies the SQLite implementation. The
+    workflow itself has no manager or HTTP concerns;
+    `ManagedReleaseValidationRuntime` below is the explicit integration adapter.
     """
 
     def __init__(
         self,
-        store: SQLiteWorkflowStore,
+        store: WorkflowStore,
         sandbox: ToolSandbox,
         *,
         is_transient_failure: Optional[TransientFailureClassifier] = None,

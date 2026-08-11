@@ -26,9 +26,9 @@ from .workflow_store import (
     ExternalActionPrepareOutcome,
     ExternalActionRecord,
     ExternalActionStatus,
-    SQLiteWorkflowStore,
     ToolCallRecord,
     ToolCallStatus,
+    WorkflowStore,
 )
 
 
@@ -71,7 +71,7 @@ class ExternalActionCoordinator:
     def __init__(
         self,
         *,
-        workflow_store: SQLiteWorkflowStore,
+        workflow_store: WorkflowStore,
         dispatcher: ExternalActionDispatcher | None,
         workflow_type: str,
         evidence_projector: EvidenceProjector,

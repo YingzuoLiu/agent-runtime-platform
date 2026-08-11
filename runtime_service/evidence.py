@@ -4,7 +4,7 @@ from typing import Any, Protocol
 
 from agent.contracts import RuntimeExecutionError
 
-from .workflow_store import SQLiteWorkflowStore
+from .workflow_store import WorkflowStore
 
 
 class RunEventSink(Protocol):
@@ -36,7 +36,7 @@ class EvidenceProjector:
     def __init__(
         self,
         *,
-        workflow_store: SQLiteWorkflowStore,
+        workflow_store: WorkflowStore,
         run_event_sink: RunEventSink,
     ) -> None:
         self.workflow_store = workflow_store

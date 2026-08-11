@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -195,6 +195,233 @@ class ExternalActionDispatchResult(BaseModel):
     outcome: ExternalActionDispatchOutcome
     action: ExternalActionRecord
     dispatch_token: str | None = None
+
+
+class WorkflowStore(Protocol):
+    """Structural persistence contract shared by durable workflow consumers.
+
+    Implementations must preserve more than these Python signatures. The
+    contract includes stable execution and step identity outcomes, attempt- and
+    dispatch-token fencing, prepare-before-dispatch ordering, atomic
+    state-transition/event commits, external-action/parent-tool finalization,
+    cancellation arbitration before first dispatch, append-only per-run event
+    ordering, and restart-visible committed writes.
+
+    ``SQLiteWorkflowStore`` is the only implementation composed by this
+    repository today. This protocol isolates runtime consumers from that
+    concrete class; it does not by itself make another backend semantically
+    interchangeable.
+    """
+
+    def ping(self) -> None:
+        ...
+
+    def create_or_get_execution(
+        self,
+        run_id: str,
+        workflow_type: str,
+        input_hash: str,
+    ) -> ExecutionClaimResult:
+        ...
+
+    def get_execution(self, run_id: str) -> WorkflowExecutionRecord | None:
+        ...
+
+    def mark_running(self, run_id: str) -> WorkflowExecutionRecord:
+        ...
+
+    def finalize_ready(
+        self,
+        run_id: str,
+        result_json: str,
+    ) -> WorkflowExecutionRecord:
+        ...
+
+    def finalize_blocked(
+        self,
+        run_id: str,
+        result_json: str,
+        error_code: str,
+    ) -> WorkflowExecutionRecord:
+        ...
+
+    def finalize_failed(
+        self,
+        run_id: str,
+        error_code: str,
+    ) -> WorkflowExecutionRecord:
+        ...
+
+    def reuse_completed_step(
+        self,
+        source_run_id: str,
+        target_run_id: str,
+        step_id: str,
+        tool_name: str,
+        input_hash: str,
+    ) -> StepReuseResult:
+        ...
+
+    def claim_step(
+        self,
+        run_id: str,
+        step_id: str,
+        tool_name: str,
+        input_hash: str,
+        *,
+        max_attempts: int,
+    ) -> ClaimResult:
+        ...
+
+    def complete_step(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt_token: str,
+        result_json: str,
+    ) -> ToolCallRecord:
+        ...
+
+    def fail_step(
+        self,
+        run_id: str,
+        step_id: str,
+        attempt_token: str,
+        error_code: str,
+    ) -> ToolCallRecord:
+        ...
+
+    def recover_interrupted_step(
+        self,
+        run_id: str,
+        step_id: str,
+    ) -> ToolCallRecord:
+        ...
+
+    def get_step(
+        self,
+        run_id: str,
+        step_id: str,
+    ) -> ToolCallRecord | None:
+        ...
+
+    def list_steps(self, run_id: str) -> list[ToolCallRecord]:
+        ...
+
+    def prepare_external_action(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        tool_attempt_token: str,
+        tenant_id: str,
+        subject_id: str,
+        workflow_type: str,
+        tool_name: str,
+        provider_name: str,
+        provider_identity: str,
+        input_hash: str,
+        arguments_json: str,
+        retry_mode: ExternalActionRetryMode | str,
+        idempotency_key: str,
+    ) -> ExternalActionPrepareResult:
+        ...
+
+    def begin_external_action_dispatch(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        tool_attempt_token: str,
+    ) -> ExternalActionDispatchResult:
+        ...
+
+    def retry_external_action_dispatch(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        previous_dispatch_token: str,
+        tool_attempt_token: str,
+    ) -> ExternalActionDispatchResult:
+        ...
+
+    def finalize_external_action_succeeded(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        result_json: str,
+        provider_reference: str,
+        error_code: str | None = None,
+    ) -> ExternalActionRecord:
+        ...
+
+    def finalize_external_action_failed(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+    ) -> ExternalActionRecord:
+        ...
+
+    def finalize_external_action_outcome_unknown(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+    ) -> ExternalActionRecord:
+        ...
+
+    def finalize_unsafe_interrupted_action(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str = "external_action_outcome_unknown",
+    ) -> ExternalActionRecord:
+        ...
+
+    def get_external_action(
+        self,
+        run_id: str,
+        step_id: str,
+    ) -> ExternalActionRecord | None:
+        ...
+
+    def list_external_actions(self, run_id: str) -> list[ExternalActionRecord]:
+        ...
+
+    def has_external_action_requiring_reconciliation(self, run_id: str) -> bool:
+        ...
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> WorkflowEvent:
+        ...
+
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> list[WorkflowEvent]:
+        ...
 
 
 class SQLiteWorkflowStore:

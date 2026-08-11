@@ -37,9 +37,9 @@ from .workflow_store import (
     ClaimOutcome,
     ExecutionOutcome,
     ExternalActionRecord,
-    SQLiteWorkflowStore,
     ToolCallRecord,
     ToolCallStatus,
+    WorkflowStore,
     WorkflowStatus,
 )
 
@@ -134,7 +134,7 @@ class DynamicToolLoop:
         planner: Planner,
         tool_registry: ToolRegistry,
         tool_sandbox: ToolSandbox,
-        workflow_store: SQLiteWorkflowStore,
+        workflow_store: WorkflowStore,
         run_event_sink: RunEventSink,
         workflow_type: str,
         max_tool_calls: int = 4,
@@ -165,11 +165,11 @@ class DynamicToolLoop:
         )
 
     @property
-    def workflow_store(self) -> SQLiteWorkflowStore:
+    def workflow_store(self) -> WorkflowStore:
         return self._workflow_store
 
     @workflow_store.setter
-    def workflow_store(self, store: SQLiteWorkflowStore) -> None:
+    def workflow_store(self, store: WorkflowStore) -> None:
         self._workflow_store = store
         evidence_projector = getattr(self, "evidence_projector", None)
         if evidence_projector is not None:

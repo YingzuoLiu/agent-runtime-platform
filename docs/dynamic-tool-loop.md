@@ -15,7 +15,7 @@ flowchart TD
     LOOP --> PLAN["Typed Planner"]
     PLAN --> DEC{"Decision"}
     DEC -->|CALL_TOOL| POLICY["Step / allowlist / permission / schema"]
-    POLICY -->|read_only| LEDGER["SQLiteWorkflowStore claim"]
+    POLICY -->|read_only| LEDGER["WorkflowStore claim"]
     LEDGER --> SANDBOX["Registered handler subprocess"]
     POLICY -->|external_write| COORD["ExternalActionCoordinator"]
     COORD --> ACTION["Durable claim, prepare, dispatch, recover"]
@@ -39,8 +39,9 @@ Planner or request body can choose.
 The loop owns Planner orchestration, policy order, and read-only sandbox routing.
 `ExternalActionCoordinator` owns the external-write state machine: durable prepare,
 dispatch fencing, provider retries, exact terminal read-back, and restart recovery.
-It is stateless between calls and uses the same workflow store and dispatcher supplied
-to the loop. `EvidenceProjector` keeps the workflow ledger authoritative, then mirrors
+It is stateless between calls and uses the same `WorkflowStore` contract and dispatcher supplied
+to the loop. The service composition root still provides `SQLiteWorkflowStore`, the only backend
+implemented here. `EvidenceProjector` keeps the workflow ledger authoritative, then mirrors
 the existing evidence allowlist into public Run events. `runtime_service/canonical.py`
 holds the identity primitives both sides share — canonical JSON encoding, the stable
 hash built on it, and persisted tool-result decoding — so the two owners cannot drift
