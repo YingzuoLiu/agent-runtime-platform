@@ -1,8 +1,9 @@
 # Release-Validation DAG and Selective Replay
 
 A synthetic, offline registered-tool workflow built on the same durable
-`SQLiteWorkflowStore`, `RuntimeManager`, and `ToolSandbox` used elsewhere in
-the repository. It is independent of Travel and does not import `AgentState`.
+`WorkflowStore` contract, `RuntimeManager`, and `ToolSandbox` used elsewhere in
+the repository. The service currently supplies `SQLiteWorkflowStore` as the only
+implementation. The workflow is independent of Travel and does not import `AgentState`.
 
 All manifests, artifacts, test results, and compatibility data are synthetic
 fixtures. This is not a real release pipeline and does not represent any

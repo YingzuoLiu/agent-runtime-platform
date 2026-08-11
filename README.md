@@ -580,6 +580,11 @@ Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest ar
 SQLite and the in-process queue keep the project self-contained, but they are not horizontally
 scalable.
 
+Durable workflow consumers target the structural `WorkflowStore` contract, while the service
+composition root still supplies the repository's only implementation, `SQLiteWorkflowStore`.
+This separates runtime typing from SQLite without claiming that another backend already preserves
+the required cross-ledger transactions, fencing, ordering, and restart-recovery semantics.
+
 Before increasing replicas, the architecture would need:
 
 ```text

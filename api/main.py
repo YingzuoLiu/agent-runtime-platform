@@ -69,7 +69,7 @@ from runtime_service.external_actions import (
     ExternalActionProvider,
     ExternalActionProviderRegistry,
 )
-from runtime_service.workflow_store import SQLiteWorkflowStore
+from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
 
 
 class AgentMessageRequest(BaseModel):
@@ -124,7 +124,7 @@ def create_app(
         store = SQLiteRunStore(resolved_database_path)
         memory_store = SQLiteMemoryStore(resolved_database_path)
         governed_memory = GovernedMemory(memory_store, store)
-        workflow_store = SQLiteWorkflowStore(resolved_database_path)
+        workflow_store: WorkflowStore = SQLiteWorkflowStore(resolved_database_path)
         release_workflow = ReleaseValidationWorkflow(
             workflow_store,
             ToolSandbox(build_release_validation_tool_registry()),
