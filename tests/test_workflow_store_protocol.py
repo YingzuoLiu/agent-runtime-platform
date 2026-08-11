@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Mypy checks structural assignability; these tests additionally pin the reflected method
+# contract: declared method names plus SQLite parameter names, kinds, defaults, and annotations.
+
 from inspect import signature
 from typing import get_type_hints
 
