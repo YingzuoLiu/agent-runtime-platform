@@ -472,7 +472,7 @@ networking or create a private mount namespace.
 | Endpoint | Purpose | Viewer | Operator |
 | --- | --- | ---: | ---: |
 | `GET /health`, `GET /ready` | Liveness and readiness | public | public |
-| `GET /demo`, `GET /demo/session` | Local console and ephemeral browser bootstrap; registered only in explicit demo mode | demo-only | demo-only |
+| `GET /`, `GET /demo`, `GET /demo/session` | Root redirect, local console, and ephemeral browser bootstrap; registered only in explicit demo mode | demo-only | demo-only |
 | `GET /agents`, `GET /tools` | Discover Agent contracts and the three-tool public read-only catalog | yes | yes |
 | `GET /runs/{id}` | Read one tenant-scoped run | yes | yes |
 | `GET /runs/{id}/events` | Read durable events | yes | yes |

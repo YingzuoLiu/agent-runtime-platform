@@ -104,9 +104,6 @@ def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
         assert stylesheet.status_code == 200
         assert script.headers["cache-control"] == "no-store"
         assert stylesheet.headers["cache-control"] == "no-store"
-        assert "after_sequence=${renderedSequence}" in script.text
-        assert "Run did not reach a terminal state within 60s." in script.text
-        assert "EventSource cannot attach the Bearer token" in script.text
 
         session_response = client.get("/demo/session")
         assert session_response.status_code == 200
@@ -150,6 +147,13 @@ def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
         )
         assert events_response.status_code == 200
         events = events_response.json()
+        cursor = events[len(events) // 2]["sequence"]
+        incremental_response = client.get(
+            f"/runs/{run_id}/events?after_sequence={cursor}",
+            headers=authorization_headers(session["api_key"]),
+        )
+        assert incremental_response.status_code == 200
+        incremental_events = incremental_response.json()
 
     assert result["status"] == "completed"
     assert result["state"]["itinerary"] == {
@@ -192,6 +196,10 @@ def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
         "rank_trip_options",
         "route_cost_summary",
     ]
+    assert incremental_events == [
+        event for event in events if event["sequence"] > cursor
+    ]
+    assert all(event["sequence"] > cursor for event in incremental_events)
     persisted = SQLiteRunStore(database_path).list_events(run_id)
     assert [event.model_dump(mode="json") for event in persisted] == events
 

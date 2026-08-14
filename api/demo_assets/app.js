@@ -231,7 +231,9 @@ async function pollRun(runId) {
     }
     await delay(POLL_INTERVAL_MS);
   }
-  throw new Error("Run did not reach a terminal state within 60s.");
+  throw new Error(
+    `Run did not reach a terminal state within ${RUN_TIMEOUT_MS / 1000}s.`,
+  );
 }
 
 async function submitRequest(event) {
