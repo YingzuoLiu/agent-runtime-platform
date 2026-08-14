@@ -2,11 +2,12 @@ services:
   runtime:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       RUNTIME_DB_PATH: /app/runtime_data/runtime.db
       RUNTIME_WORKER_COUNT: "1"
-      RUNTIME_API_KEYS_JSON: "${RUNTIME_API_KEYS_JSON:?set RUNTIME_API_KEYS_JSON before starting the runtime}"
+      RUNTIME_PLANNER_PROVIDER: scripted
+      RUNTIME_DEMO_MODE: "true"
     volumes:
       - runtime-data:/app/runtime_data
     restart: unless-stopped

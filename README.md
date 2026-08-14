@@ -1,32 +1,41 @@
-# Agent Runtime Reliability Platform
+# Agent Runtime Platform
 
 [![CI](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)
-![Status](https://img.shields.io/badge/status-Phase%207A%20complete-2ea44f)
+![Status](https://img.shields.io/badge/status-Phase%207B%20complete-2ea44f)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A production-oriented reference implementation for reliable Agent execution: typed Planner
-decisions, policy-governed registered tools, durable state and events, restart-safe recovery,
-multi-tenant authorization, governed cross-thread memory, and explicit failure semantics.
-Phase 7A adds prepare-before-dispatch durable external actions with server-derived
-idempotency, provider references, and explicit uncertain-outcome recovery.
+Many Agent projects focus on deciding what the Agent should do next. This project focuses on what
+happens after that decision: executing Agent work durably, safely, recoverably, and observably.
 
-Travel is the first reference application, not the architecture boundary. A separate
-release-validation domain exercises the same runtime through a deterministic DAG and selective
+Agent Runtime Platform is an execution layer between typed Agent decisions and real-world actions.
+It owns durable state, policy-governed tools, recovery, tenant and memory boundaries, deterministic
+validation, and evidence of what actually happened.
+
+Travel is the main reference application, not the product boundary. A separate
+`release-validation` domain exercises the same runtime through a deterministic DAG and selective
 replay.
 
-The default path is deterministic and offline: no LLM key, Redis, PostgreSQL, or Kubernetes is
-required. An optional OpenAI Responses adapter drives the same typed loop with live model
-decisions. The three Travel planning tools use synthetic, read-only data. The opt-in
-`travel-agent:1.2.0` action writes only to a deterministic local trip-hold provider test double;
-this repository does not search live inventory, book travel, take payment, or claim an official
-vendor sandbox.
+## Why an Agent Runtime?
 
-## Why this project exists
+An Agent can make the right decision and still fail during execution:
 
-Agent failures are not only model-quality problems. They also come from state drift, silently
-skipped constraints, duplicate execution, cancellation races, restart recovery, and unsafe tool
-boundaries.
+```text
+Agent makes a decision
+        ↓
+real execution begins
+        ↓
+What if the process crashes?
+What if a tool runs twice?
+What if an external write succeeded but its response was lost?
+What if cancellation races with dispatch?
+What if this user or Agent lacks permission?
+What if memory crosses a subject boundary?
+What if the Planner says FINISH but constraints were violated?
+What durable evidence tells us what happened?
+```
+
+Those are runtime problems rather than prompt-engineering problems.
 
 An early ablation in this repository produced a useful warning:
 
@@ -45,6 +54,81 @@ That finding became the design rule for the platform:
 
 See [`FINDINGS.md`](FINDINGS.md) for the scenarios, traces, and ablation results.
 
+## Who this is for
+
+This repository is for engineers evaluating how to move an Agent from an application-level loop to
+an explicit execution boundary. It is also a runnable reference for discussions about tool safety,
+durability, recovery, memory isolation, validation, and external side effects.
+
+It is not a Travel product. Travel keeps the behavior concrete enough to run and inspect without
+requiring live inventory, payment, Redis, PostgreSQL, Kubernetes, or an LLM key.
+
+## See it work
+
+```bash
+git clone https://github.com/YingzuoLiu/agent-runtime-platform.git
+cd agent-runtime-platform
+docker compose up --build
+```
+
+Open [http://localhost:8000/demo](http://localhost:8000/demo), keep the example request, and select
+**Run through Runtime**.
+
+The console submits directly through the existing authenticated `POST /runs` API, polls the durable
+Run and Event resources, and renders only evidence returned by the runtime. A normal offline run
+shows the actual execution sequence, including:
+
+```text
+planner.decision → policy.decision → search_trip_options
+planner.decision → policy.decision → rank_trip_options
+planner.decision → policy.decision → route_cost_summary
+planner.decision → loop.outcome → checkpoint.saved → run.completed
+```
+
+The result panel is populated only after deterministic Travel validation accepts the selected
+synthetic option. Expand any event to inspect its persisted payload.
+
+The default Compose file is deliberately local-only: it binds to `127.0.0.1`, forces the scripted
+offline Planner, and enables an ephemeral demo Operator session. Do not publish this mode. Without
+`RUNTIME_DEMO_MODE=true`, `/demo` and its browser session endpoint do not exist, and protected API
+routes remain fail-closed.
+
+### Fallback without Docker
+
+```bash
+python -m venv .venv
+source .venv/bin/activate       # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+RUNTIME_DEMO_MODE=true RUNTIME_PLANNER_PROVIDER=scripted \
+  uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:RUNTIME_DEMO_MODE = "true"
+$env:RUNTIME_PLANNER_PROVIDER = "scripted"
+uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+## What happens during execution?
+
+```mermaid
+flowchart TB
+    A["Agent / Planner"] -->|typed decision| R["Agent Runtime Platform"]
+    R --> P["Policy and permissions"]
+    R --> D["Durable state and recovery"]
+    R --> T["Registered tools and actions"]
+    R --> V["Validation and evidence"]
+```
+
+The Agent or domain owns intent, Planner context, and final domain validation. The Runtime owns the
+execution lifecycle: it persists authority and state, checks each tool call, prevents unsafe direct
+writes, recovers pinned work, and exposes the same evidence through REST and SSE.
+
 ## At a glance
 
 | Concern | Implemented behavior | Where to inspect |
@@ -58,9 +142,10 @@ See [`FINDINGS.md`](FINDINGS.md) for the scenarios, traces, and ablation results
 | Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
 | Domains | Five Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
 | Evidence | Workflow-first projection for Planner, policy, tool, action, and loop-outcome evidence; manager recovery events remain direct | [`runtime_service/evidence.py`](runtime_service/evidence.py), [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
+| Product surface | Local Runtime Console over the same authenticated Run and Event APIs | [`api/demo_assets`](api/demo_assets), [`tests/test_demo_console.py`](tests/test_demo_console.py) |
 | Verification | Full suite; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
 
-## Quick start
+## API development setup
 
 ```bash
 python -m venv .venv
@@ -85,8 +170,7 @@ $env:RUNTIME_API_KEYS_JSON = '[{"credential_id":"local-demo","api_key":"replace-
 uvicorn api.main:app --reload
 ```
 
-Open [the interactive API docs](http://127.0.0.1:8000/docs), or verify the public health
-endpoints:
+Verify the public health endpoints:
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -384,6 +468,7 @@ networking or create a private mount namespace.
 | Endpoint | Purpose | Viewer | Operator |
 | --- | --- | ---: | ---: |
 | `GET /health`, `GET /ready` | Liveness and readiness | public | public |
+| `GET /demo`, `GET /demo/session` | Local console and ephemeral browser bootstrap; registered only in explicit demo mode | demo-only | demo-only |
 | `GET /agents`, `GET /tools` | Discover Agent contracts and the three-tool public read-only catalog | yes | yes |
 | `GET /runs/{id}` | Read one tenant-scoped run | yes | yes |
 | `GET /runs/{id}/events` | Read durable events | yes | yes |
@@ -401,11 +486,16 @@ to the private `travel-agent:1.2.0` durable registry. The direct POST route stil
 recognizes that name so an authorized attempt receives `409` instead of falling
 through to sandbox execution.
 
-`RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
+Outside explicit demo mode, `RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
 `viewer` or `operator`; missing or unknown roles fail configuration loading without retaining the
 plaintext key in the validation exception chain. Plaintext keys are hashed when loaded and are not
 retained by the authenticator. If the variable is absent or empty, every protected endpoint fails
 closed with `401`.
+
+`RUNTIME_DEMO_MODE=true` is a separate, mutually exclusive local path. It creates one ephemeral
+Operator key at process start and exposes it to the local console through a no-store bootstrap
+response. It cannot be combined with configured production credentials. The bundled Compose file
+limits that mode to the host loopback interface; deployments must not expose it.
 
 This is deliberately small static RBAC, not a general policy platform.
 
@@ -571,6 +661,9 @@ unsafe unknown outcomes, cancellation/dispatch arbitration, direct-endpoint bloc
 references, post-dispatch drift reconciliation, unrecoverable run-evidence gaps,
 provider-identity continuity, strict output filtering, HTTPS/loopback policy,
 HTTP-boundary sanitization, and action-event REST/SSE parity.
+Phase 7B covers demo-route isolation, ephemeral local credentials, direct submission through the
+existing Run API, validated result rendering inputs, and equality between API-visible and persisted
+Runtime evidence.
 
 GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
 
@@ -596,9 +689,10 @@ PostgreSQL runs/checkpoints/events/memories/external_actions
 + container-backed sandbox workers
 ```
 
-Docker Compose requires `RUNTIME_API_KEYS_JSON` from the caller environment. The Kubernetes
-manifest expects the same JSON in Secret `travel-agent-runtime-auth`, key `api-keys.json`; the
-repository does not contain or generate credential material.
+The default Docker Compose path is the loopback-only local demo described above. Running the image
+without `RUNTIME_DEMO_MODE=true` preserves the normal fail-closed credential behavior. The
+Kubernetes manifest expects `RUNTIME_API_KEYS_JSON` in Secret `travel-agent-runtime-auth`, key
+`api-keys.json`; the repository does not contain or generate deployment credential material.
 
 ## Deliberate limitations
 
@@ -617,16 +711,19 @@ platform.
 - the optional HTTP provider is a configurable transport boundary, not a validated live Travel
   provider;
 - no OpenTelemetry backend or evaluation dashboard;
+- the Runtime Console is a local demonstration surface, not an account, tenant, Agent, or memory
+  administration dashboard;
 - no prompt-injection detector beyond typed decisions, policy checks, and registered tools;
 - memory is limited to explicit allowlisted preferences, without embeddings, inferred facts, or
   erasure of immutable historical run evidence;
 - no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
   reconciliation for unknown external-action outcomes.
 
-Phase 7A is the completed portfolio milestone. Human approval, semantic memory retrieval, bounded
-parallel read-only calls, a live read-only Travel adapter, multi-model fallback, and durable
-multi-Agent delegation are possible follow-up slices, not prerequisites for the runtime
-demonstrated here.
+Phase 7B is the current portfolio product-surface milestone. A Bring Your Own Agent / Domain guide
+is planned as a separate phase after the real extension seam is validated; it is not implemented or
+claimed here. Human approval, semantic memory retrieval, bounded parallel read-only calls, a live
+read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain possible
+follow-up slices rather than prerequisites for the runtime demonstrated here.
 
 ## License
 

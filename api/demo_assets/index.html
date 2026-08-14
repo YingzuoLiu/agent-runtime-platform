@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A local console for observing durable, policy-governed Agent execution."
+    />
+    <title>Agent Runtime Platform — Local Runtime Console</title>
+    <link rel="stylesheet" href="/demo-assets/styles.css" />
+    <script src="/demo-assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#runtime-workspace">Skip to runtime workspace</a>
+
+    <main class="shell">
+      <header class="masthead">
+        <a class="brand" href="/demo" aria-label="Agent Runtime Platform home">
+          <span class="brand-mark" aria-hidden="true"><span></span></span>
+          <span>
+            <strong>Agent Runtime Platform</strong>
+            <small>Local Runtime Console</small>
+          </span>
+        </a>
+        <div class="mode-badges" aria-label="Demo environment">
+          <span><i class="status-dot"></i> Offline</span>
+          <span>Synthetic data</span>
+          <span>Plan only</span>
+        </div>
+      </header>
+
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">DECISIONS ARE ONLY THE BEGINNING</p>
+        <h1 id="page-title">See what happens after an Agent decides.</h1>
+        <p class="hero-copy">
+          The Planner chooses the next action. The Runtime makes that work durable,
+          policy-governed, recoverable, validated, and observable.
+        </p>
+        <div class="ownership-line" aria-label="Execution boundary">
+          <span>Your Agent / Planner</span>
+          <i aria-hidden="true"></i>
+          <strong>Agent Runtime Platform</strong>
+          <i aria-hidden="true"></i>
+          <span>Durable evidence</span>
+        </div>
+      </section>
+
+      <section class="request-card" aria-labelledby="request-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">REFERENCE REQUEST</p>
+            <h2 id="request-title">Run the offline Travel Agent</h2>
+          </div>
+          <span class="version-chip" id="runtime-version">travel-agent:1.2.0</span>
+        </div>
+
+        <form id="request-form">
+          <label class="sr-only" for="request-input">Travel request</label>
+          <textarea
+            id="request-input"
+            name="request"
+            rows="3"
+            required
+            aria-describedby="request-help"
+          ></textarea>
+          <div class="request-actions">
+            <p id="request-help">Deterministic tools · no model key · no network calls</p>
+            <button id="run-button" type="submit">
+              <span>Run through Runtime</span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section id="runtime-workspace" class="workspace" aria-label="Runtime output">
+        <article class="panel result-panel" aria-labelledby="result-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">APPLICATION RESULT</p>
+              <h2 id="result-title">Validated plan</h2>
+            </div>
+            <span id="run-status" class="run-status idle">Ready</span>
+          </div>
+
+          <div id="result-empty" class="empty-state">
+            <span class="empty-index">01</span>
+            <h3>The result will appear here.</h3>
+            <p>
+              It is committed only after the Planner finishes and deterministic
+              Travel validation accepts the selected option.
+            </p>
+          </div>
+
+          <div id="result-content" class="result-content" hidden>
+            <p id="result-message" class="result-message"></p>
+            <dl class="plan-grid">
+              <div>
+                <dt>Destination</dt>
+                <dd id="plan-destination">—</dd>
+              </div>
+              <div>
+                <dt>Duration</dt>
+                <dd id="plan-days">—</dd>
+              </div>
+              <div>
+                <dt>Total</dt>
+                <dd id="plan-cost">—</dd>
+              </div>
+              <div>
+                <dt>Flight</dt>
+                <dd id="plan-flight">—</dd>
+              </div>
+              <div class="wide">
+                <dt>Hotel</dt>
+                <dd id="plan-hotel">—</dd>
+              </div>
+              <div class="wide">
+                <dt>Itinerary style</dt>
+                <dd id="plan-style">—</dd>
+              </div>
+            </dl>
+            <div class="evidence-note">
+              <span aria-hidden="true">✓</span>
+              <p>
+                <strong>Validator accepted persisted tool evidence.</strong>
+                This catalog is synthetic and does not represent live inventory.
+              </p>
+            </div>
+          </div>
+
+          <div id="result-error" class="result-error" hidden role="alert">
+            <strong>Run did not complete.</strong>
+            <p id="error-message"></p>
+          </div>
+        </article>
+
+        <article class="panel evidence-panel" aria-labelledby="evidence-title">
+          <div class="panel-heading evidence-heading">
+            <div>
+              <p class="section-kicker">RUNTIME EXECUTION</p>
+              <h2 id="evidence-title">Durable evidence</h2>
+            </div>
+            <span id="event-count" class="event-count">0 events</span>
+          </div>
+
+          <div id="evidence-empty" class="empty-state compact">
+            <span class="empty-index">02</span>
+            <h3>No simulated timeline.</h3>
+            <p>
+              Rows appear only after the API returns events persisted by the Runtime.
+            </p>
+          </div>
+
+          <ol id="event-list" class="event-list" aria-live="polite"></ol>
+        </article>
+      </section>
+
+      <footer>
+        <p>Local portfolio demo · the same authenticated Runtime API remains available to clients.</p>
+        <a href="https://github.com/YingzuoLiu/agent-runtime-platform">View source on GitHub</a>
+      </footer>
+    </main>
+  </body>
+</html>

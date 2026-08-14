@@ -7,11 +7,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from api.demo import (
+    DemoSession,
+    build_demo_authenticator,
+    create_demo_session,
+    demo_assets_path,
+    resolve_demo_mode,
+)
 from domains.release_validation.runtime import ReleaseValidationWorkflow
 from domains.release_validation.tools import build_release_validation_tool_registry
 from domains.travel.dynamic_runtime import DynamicTravelRuntime
@@ -97,17 +105,33 @@ def create_app(
     authorizer: Authorizer | None = None,
     travel_planner: Planner | None = None,
     travel_action_provider: ExternalActionProvider | None = None,
+    demo_mode: bool | None = None,
+    demo_api_key: str | None = None,
 ) -> FastAPI:
     database_value = database_path
     if database_value is None:
         database_value = os.getenv("RUNTIME_DB_PATH") or "runtime_data/runtime.db"
     resolved_database_path = Path(database_value)
     resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
-    resolved_authenticator = (
-        authenticator
-        if authenticator is not None
-        else StaticApiKeyAuthenticator.from_environment()
-    )
+    resolved_demo_mode = resolve_demo_mode(demo_mode)
+    demo_session: DemoSession | None = None
+    if resolved_demo_mode:
+        if authenticator is not None:
+            raise ValueError("demo mode cannot be combined with an injected authenticator")
+        if os.getenv("RUNTIME_API_KEYS_JSON", "").strip():
+            raise ValueError(
+                "RUNTIME_DEMO_MODE cannot be combined with RUNTIME_API_KEYS_JSON"
+            )
+        demo_session = create_demo_session(demo_api_key)
+        resolved_authenticator = build_demo_authenticator(demo_session)
+    else:
+        if demo_api_key is not None:
+            raise ValueError("demo_api_key requires demo mode")
+        resolved_authenticator = (
+            authenticator
+            if authenticator is not None
+            else StaticApiKeyAuthenticator.from_environment()
+        )
     resolved_authorizer = authorizer if authorizer is not None else RoleAuthorizer()
     resolved_travel_planner = (
         travel_planner
@@ -303,6 +327,32 @@ def create_app(
         request.app.state.memory_store.ping()
         request.app.state.workflow_store.ping()
         return {"status": "ready"}
+
+    if demo_session is not None:
+        assets_path = demo_assets_path()
+
+        @app.get("/demo", include_in_schema=False)
+        def runtime_console() -> FileResponse:
+            return FileResponse(
+                assets_path / "index.html",
+                media_type="text/html",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.get(
+            "/demo/session",
+            response_model=DemoSession,
+            include_in_schema=False,
+        )
+        def demo_browser_session(response: Response) -> DemoSession:
+            response.headers["Cache-Control"] = "no-store"
+            return demo_session
+
+        app.mount(
+            "/demo-assets",
+            StaticFiles(directory=assets_path),
+            name="demo-assets",
+        )
 
     @app.get("/agents", response_model=list[AgentDescriptor])
     def list_agents(
