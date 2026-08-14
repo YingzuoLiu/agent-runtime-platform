@@ -196,12 +196,107 @@ def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
         "rank_trip_options",
         "route_cost_summary",
     ]
+    tool_results = {
+        event["payload"]["tool_name"]: event["payload"]["result"]
+        for event in evidence
+        if event["event_type"] == "tool.result"
+    }
+    selected = tool_results["search_trip_options"]["options"][0]
+    assert tool_results["search_trip_options"]["source"] == (
+        "synthetic_reference_catalog"
+    )
+    assert selected == {
+        "index": 0,
+        "name": "Tokyo value itinerary",
+        "cost": 7800.0,
+        "duration_hours": 10.5,
+        "transport_cost": 2300,
+        "hotel_cost": 3250,
+        "activity_cost": 2250,
+        "flight_type": "daytime",
+        "hotel_tier": "standard hotel",
+        "poi_style": "balanced itinerary",
+    }
+    assert tool_results["rank_trip_options"]["ranking"][0] == {
+        "index": 0,
+        "name": "Tokyo value itinerary",
+        "score": 0.106522,
+    }
+    assert tool_results["route_cost_summary"] == {
+        "total_cost": 7800,
+        "budget": 9000,
+        "remaining_budget": 1200,
+        "within_budget": True,
+    }
+    rank_call = next(
+        event["payload"]["decision"]
+        for event in evidence
+        if event["event_type"] == "planner.decision"
+        and event["payload"]["decision"].get("tool_name") == "rank_trip_options"
+    )
+    assert rank_call["arguments"]["cost_weight"] == 0.7
+    assert rank_call["arguments"]["duration_weight"] == 0.3
     assert incremental_events == [
         event for event in events if event["sequence"] > cursor
     ]
     assert all(event["sequence"] > cursor for event in incremental_events)
     persisted = SQLiteRunStore(database_path).list_events(run_id)
     assert [event.model_dump(mode="json") for event in persisted] == events
+
+
+def test_demo_clarification_is_a_completed_turn_without_an_itinerary(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("RUNTIME_DEMO_MODE", "true")
+    monkeypatch.delenv("RUNTIME_API_KEYS_JSON", raising=False)
+    app = create_app(
+        database_path=tmp_path / "clarification-runtime.db",
+        demo_api_key=DEMO_API_KEY,
+    )
+
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/runs",
+            headers=authorization_headers(DEMO_API_KEY),
+            json={
+                "thread_id": "phase7b-clarification-console",
+                "client_request_id": "phase7b-clarification-request",
+                "agent_id": "travel-agent",
+                "agent_version": "1.2.0",
+                "input": {
+                    "user_message": (
+                        "Plan a 5-day Tokyo trip under 7000 SGD and avoid red-eye flights."
+                    ),
+                    "requested_action": "plan_only",
+                },
+            },
+        )
+        assert submitted.status_code == 202, submitted.text
+        run_id = submitted.json()["run_id"]
+        result = wait_for_terminal(client, run_id, api_key=DEMO_API_KEY)
+        events_response = client.get(
+            f"/runs/{run_id}/events",
+            headers=authorization_headers(DEMO_API_KEY),
+        )
+        assert events_response.status_code == 200
+        events = events_response.json()
+
+    assert result["status"] == "completed"
+    assert result["state"]["itinerary"] is None
+    assert "above the budget of 7000" in result["output_message"]
+    planner_decisions = [
+        event["payload"]["decision"]["decision_type"]
+        for event in events
+        if event["event_type"] == "planner.decision"
+    ]
+    assert planner_decisions[-1] == "REQUEST_CLARIFICATION"
+    assert [
+        event["payload"]["outcome"]
+        for event in events
+        if event["event_type"] == "loop.outcome"
+    ] == ["clarification"]
+    assert all(event["event_type"] != "run.failed" for event in events)
 
 
 def test_demo_mode_is_explicit_and_cannot_mix_with_production_credentials(
