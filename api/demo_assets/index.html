@@ -5,70 +5,80 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="A local console for observing durable, policy-governed Agent execution."
+      content="A local console for inspecting durable, policy-governed Agent execution."
     />
-    <title>Agent Runtime Platform — Local Runtime Console</title>
+    <title>Runtime Console — Agent Runtime Platform</title>
     <link rel="stylesheet" href="/demo-assets/styles.css" />
     <script src="/demo-assets/app.js" defer></script>
   </head>
   <body>
-    <a class="skip-link" href="#runtime-workspace">Skip to runtime workspace</a>
+    <a class="skip-link" href="#runtime-workspace">Skip to runtime output</a>
 
-    <main class="shell">
-      <header class="masthead">
-        <a class="brand" href="/demo" aria-label="Agent Runtime Platform home">
-          <span class="brand-mark" aria-hidden="true"><span></span></span>
-          <span>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="product-link" href="/demo" aria-label="Agent Runtime Platform home">
+          <span class="product-symbol" aria-hidden="true">AR</span>
+          <span class="product-name">
             <strong>Agent Runtime Platform</strong>
-            <small>Local Runtime Console</small>
+            <small>Runtime Console</small>
           </span>
         </a>
-        <div class="mode-badges" aria-label="Demo environment">
-          <span><i class="status-dot"></i> Offline</span>
-          <span>Synthetic data</span>
-          <span>Plan only</span>
-        </div>
-      </header>
 
-      <section class="hero" aria-labelledby="page-title">
-        <p class="eyebrow">DECISIONS ARE ONLY THE BEGINNING</p>
-        <h1 id="page-title">See what happens after an Agent decides.</h1>
-        <p class="hero-copy">
-          The Planner chooses the next action. The Runtime makes that work durable,
-          policy-governed, recoverable, validated, and observable.
-        </p>
-        <div class="ownership-line" aria-label="Execution boundary">
-          <span>Your Agent / Planner</span>
-          <i aria-hidden="true"></i>
-          <strong>Agent Runtime Platform</strong>
-          <i aria-hidden="true"></i>
-          <span>Durable evidence</span>
+        <div class="environment-strip" aria-label="Demo environment">
+          <span class="environment-status"><i aria-hidden="true"></i>Local runtime</span>
+          <span>Offline</span>
+          <span>Synthetic data</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="console">
+      <section class="intro" aria-labelledby="page-title">
+        <div class="intro-copy">
+          <p class="context-label">Local execution inspector</p>
+          <h1 id="page-title">From planner decision to durable evidence.</h1>
+          <p>
+            Submit a request, inspect each policy and tool boundary, and verify the
+            state committed by the Runtime.
+          </p>
+        </div>
+
+        <div class="execution-path" aria-label="Execution ownership">
+          <span>Planner</span>
+          <b aria-hidden="true">→</b>
+          <strong>Runtime</strong>
+          <b aria-hidden="true">→</b>
+          <span>Evidence</span>
         </div>
       </section>
 
-      <section class="request-card" aria-labelledby="request-title">
-        <div class="section-heading">
+      <section class="request-panel" aria-labelledby="request-title">
+        <div class="request-heading">
           <div>
-            <p class="section-kicker">REFERENCE REQUEST</p>
-            <h2 id="request-title">Run the offline Travel Agent</h2>
+            <h2 id="request-title">Run reference agent</h2>
+            <p>Deterministic Travel workflow using the authenticated Runtime API.</p>
           </div>
-          <span class="version-chip" id="runtime-version">travel-agent:1.2.0</span>
+          <code id="runtime-version">travel-agent:1.2.0</code>
         </div>
 
         <form id="request-form">
-          <label class="sr-only" for="request-input">Travel request</label>
+          <label for="request-input">Request</label>
           <textarea
             id="request-input"
             name="request"
-            rows="3"
+            rows="2"
             required
             aria-describedby="request-help"
           ></textarea>
           <div class="request-actions">
-            <p id="request-help">Deterministic tools · no model key · no network calls</p>
+            <p id="request-help">
+              <span>No model key</span>
+              <span>No network calls</span>
+              <span>Plan only</span>
+            </p>
             <button id="run-button" type="submit">
-              <span>Run through Runtime</span>
-              <span class="button-arrow" aria-hidden="true">→</span>
+              Run agent
+              <span aria-hidden="true">→</span>
             </button>
           </div>
         </form>
@@ -78,19 +88,16 @@
         <article class="panel result-panel" aria-labelledby="result-title">
           <div class="panel-heading">
             <div>
-              <p class="section-kicker">APPLICATION RESULT</p>
-              <h2 id="result-title">Validated plan</h2>
+              <p class="panel-label">Application output</p>
+              <h2 id="result-title">Result</h2>
             </div>
             <span id="run-status" class="run-status idle">Ready</span>
           </div>
 
-          <div id="result-empty" class="empty-state">
-            <span class="empty-index">01</span>
-            <h3>The result will appear here.</h3>
-            <p>
-              It is committed only after the Planner finishes and deterministic
-              Travel validation accepts the selected option.
-            </p>
+          <div id="result-empty" class="result-empty">
+            <div class="empty-symbol" aria-hidden="true"></div>
+            <h3>Waiting for a run</h3>
+            <p>A validated reference plan or clarification request will appear here.</p>
           </div>
 
           <div id="result-content" class="result-content" hidden>
@@ -105,7 +112,7 @@
                 <dd id="plan-days">—</dd>
               </div>
               <div>
-                <dt>Total</dt>
+                <dt>Total cost</dt>
                 <dd id="plan-cost">—</dd>
               </div>
               <div>
@@ -121,45 +128,100 @@
                 <dd id="plan-style">—</dd>
               </div>
             </dl>
-            <div class="evidence-note">
+
+            <section class="plan-evidence" aria-labelledby="plan-evidence-title">
+              <div class="plan-evidence-heading">
+                <div>
+                  <p>How this plan was formed</p>
+                  <h3 id="plan-evidence-title">
+                    <span id="plan-option">Selected reference option</span>
+                  </h3>
+                </div>
+                <span id="plan-source" class="source-badge">Offline synthetic catalog</span>
+              </div>
+
+              <dl class="cost-breakdown">
+                <div>
+                  <dt>Transport</dt>
+                  <dd id="cost-transport">—</dd>
+                </div>
+                <div>
+                  <dt>Hotel</dt>
+                  <dd id="cost-hotel">—</dd>
+                </div>
+                <div>
+                  <dt>Activities</dt>
+                  <dd id="cost-activities">—</dd>
+                </div>
+                <div class="cost-total">
+                  <dt>Total</dt>
+                  <dd id="cost-total">—</dd>
+                </div>
+              </dl>
+
+              <p class="ranking-rule">
+                Ranked by
+                <strong>cost <span id="rank-cost-weight">—</span></strong>
+                <span aria-hidden="true">·</span>
+                <strong>duration <span id="rank-duration-weight">—</span></strong>
+              </p>
+            </section>
+
+            <div class="result-note success-note">
               <span aria-hidden="true">✓</span>
               <p>
-                <strong>Validator accepted persisted tool evidence.</strong>
-                This catalog is synthetic and does not represent live inventory.
+                <strong>Validation passed</strong>
+                Reference plan committed from persisted tool evidence.
               </p>
+            </div>
+            <p class="catalog-note">No live inventory, pricing, or booking</p>
+          </div>
+
+          <div id="result-clarification" class="result-state clarification-state" hidden>
+            <span class="state-icon" aria-hidden="true">?</span>
+            <div>
+              <strong>Planner needs more input</strong>
+              <p id="clarification-message"></p>
+              <small>Runtime status: completed · no itinerary committed</small>
             </div>
           </div>
 
-          <div id="result-error" class="result-error" hidden role="alert">
-            <strong>Run did not complete.</strong>
-            <p id="error-message"></p>
+          <div id="result-error" class="result-state error-state" hidden role="alert">
+            <span class="state-icon" aria-hidden="true">!</span>
+            <div>
+              <strong>Execution failed</strong>
+              <p id="error-message"></p>
+            </div>
           </div>
         </article>
 
         <article class="panel evidence-panel" aria-labelledby="evidence-title">
           <div class="panel-heading evidence-heading">
             <div>
-              <p class="section-kicker">RUNTIME EXECUTION</p>
-              <h2 id="evidence-title">Durable evidence</h2>
+              <p class="panel-label">Persisted event stream</p>
+              <h2 id="evidence-title">Execution log</h2>
             </div>
             <span id="event-count" class="event-count">0 events</span>
           </div>
 
-          <div id="evidence-empty" class="empty-state compact">
-            <span class="empty-index">02</span>
-            <h3>No simulated timeline.</h3>
-            <p>
-              Rows appear only after the API returns events persisted by the Runtime.
-            </p>
+          <div class="evidence-legend" aria-label="Event categories">
+            <span class="planner-key">Planner</span>
+            <span class="policy-key">Policy</span>
+            <span class="tool-key">Tool</span>
+            <span class="state-key">State</span>
+          </div>
+
+          <div id="evidence-empty" class="evidence-empty">
+            <p>Events appear here only after the Runtime persists them.</p>
           </div>
 
           <ol id="event-list" class="event-list" aria-live="polite"></ol>
         </article>
       </section>
 
-      <footer>
-        <p>Local portfolio demo · the same authenticated Runtime API remains available to clients.</p>
-        <a href="https://github.com/YingzuoLiu/agent-runtime-platform">View source on GitHub</a>
+      <footer class="console-footer">
+        <p>Local portfolio demo · authenticated Runtime API · persisted evidence</p>
+        <a href="https://github.com/YingzuoLiu/agent-runtime-platform">GitHub source</a>
       </footer>
     </main>
   </body>
