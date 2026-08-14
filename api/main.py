@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import Scope
 
 from api.demo import (
     DemoSession,
@@ -80,6 +82,18 @@ from runtime_service.external_actions import (
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
 
 
+logger = logging.getLogger(__name__)
+
+
+class NoStoreStaticFiles(StaticFiles):
+    """Serve local demo assets without retaining stale frontend code."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 class AgentMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -124,6 +138,11 @@ def create_app(
             )
         demo_session = create_demo_session(demo_api_key)
         resolved_authenticator = build_demo_authenticator(demo_session)
+        logger.warning(
+            "RUNTIME_DEMO_MODE is enabled: /demo/session exposes an ephemeral "
+            "Operator credential without authentication. Keep this server bound "
+            "to localhost and do not deploy it."
+        )
     else:
         if demo_api_key is not None:
             raise ValueError("demo_api_key requires demo mode")
@@ -331,6 +350,10 @@ def create_app(
     if demo_session is not None:
         assets_path = demo_assets_path()
 
+        @app.get("/", include_in_schema=False)
+        def demo_root() -> RedirectResponse:
+            return RedirectResponse("/demo")
+
         @app.get("/demo", include_in_schema=False)
         def runtime_console() -> FileResponse:
             return FileResponse(
@@ -350,7 +373,7 @@ def create_app(
 
         app.mount(
             "/demo-assets",
-            StaticFiles(directory=assets_path),
+            NoStoreStaticFiles(directory=assets_path),
             name="demo-assets",
         )
 

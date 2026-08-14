@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from runtime_service import SQLiteRunStore
 
 
 DEMO_API_KEY = "phase7b-demo-test-key"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def authorization_headers(api_key: str) -> dict[str, str]:
@@ -47,6 +49,7 @@ def test_normal_runtime_does_not_expose_or_enable_demo_credentials(
     app = create_app(database_path=tmp_path / "normal-runtime.db")
 
     with TestClient(app) as client:
+        assert client.get("/").status_code == 404
         assert client.get("/demo").status_code == 404
         assert client.get("/demo/session").status_code == 404
         assert client.get("/demo-assets/app.js").status_code == 404
@@ -70,16 +73,26 @@ def test_normal_runtime_does_not_expose_or_enable_demo_credentials(
 def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
     tmp_path,
     monkeypatch,
+    caplog,
 ):
     database_path = tmp_path / "demo-runtime.db"
     monkeypatch.setenv("RUNTIME_DEMO_MODE", "true")
     monkeypatch.delenv("RUNTIME_API_KEYS_JSON", raising=False)
-    app = create_app(
-        database_path=database_path,
-        demo_api_key=DEMO_API_KEY,
-    )
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        app = create_app(
+            database_path=database_path,
+            demo_api_key=DEMO_API_KEY,
+        )
+
+    assert "RUNTIME_DEMO_MODE is enabled" in caplog.text
+    assert "/demo/session exposes an ephemeral Operator credential" in caplog.text
+    assert DEMO_API_KEY not in caplog.text
 
     with TestClient(app) as client:
+        root = client.get("/", follow_redirects=False)
+        assert root.status_code == 307
+        assert root.headers["location"] == "/demo"
+
         console = client.get("/demo")
         assert console.status_code == 200
         assert console.headers["cache-control"] == "no-store"
@@ -89,6 +102,11 @@ def test_demo_console_submits_through_runtime_and_reads_persisted_evidence(
         stylesheet = client.get("/demo-assets/styles.css")
         assert script.status_code == 200
         assert stylesheet.status_code == 200
+        assert script.headers["cache-control"] == "no-store"
+        assert stylesheet.headers["cache-control"] == "no-store"
+        assert "after_sequence=${renderedSequence}" in script.text
+        assert "Run did not reach a terminal state within 60s." in script.text
+        assert "EventSource cannot attach the Bearer token" in script.text
 
         session_response = client.get("/demo/session")
         assert session_response.status_code == 200
@@ -201,8 +219,11 @@ def test_demo_mode_is_explicit_and_cannot_mix_with_production_credentials(
         )
 
 
-def test_compose_enables_only_the_loopback_local_demo():
-    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+def test_compose_enables_only_the_loopback_local_demo(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    compose_path = REPOSITORY_ROOT / "docker-compose.yml"
+    compose = compose_path.read_text(encoding="utf-8")
+    assert compose.startswith("# LOCAL DEMO ONLY")
     assert '"127.0.0.1:8000:8000"' in compose
     assert 'RUNTIME_DEMO_MODE: "true"' in compose
     assert "RUNTIME_API_KEYS_JSON" not in compose

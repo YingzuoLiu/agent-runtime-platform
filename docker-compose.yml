@@ -1,3 +1,4 @@
+# LOCAL DEMO ONLY — unauthenticated Operator session on 127.0.0.1. Do not deploy.
 services:
   runtime:
     build: .

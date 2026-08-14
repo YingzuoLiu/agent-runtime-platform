@@ -23,6 +23,8 @@ const planFields = {
 
 let session = null;
 let renderedSequence = 0;
+const RUN_TIMEOUT_MS = 60_000;
+const POLL_INTERVAL_MS = 220;
 
 function delay(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -205,11 +207,17 @@ function showFailure(message) {
   errorMessage.textContent = message;
 }
 
+// Native EventSource cannot attach the Bearer token required by the Runtime SSE endpoint,
+// so the local console uses bounded cursor-based polling over the same persisted event store.
 async function pollRun(runId) {
-  while (true) {
+  const deadline = Date.now() + RUN_TIMEOUT_MS;
+  const encodedRunId = encodeURIComponent(runId);
+  while (Date.now() < deadline) {
     const [run, events] = await Promise.all([
-      runtimeFetch(`/runs/${encodeURIComponent(runId)}`),
-      runtimeFetch(`/runs/${encodeURIComponent(runId)}/events`),
+      runtimeFetch(`/runs/${encodedRunId}`),
+      runtimeFetch(
+        `/runs/${encodedRunId}/events?after_sequence=${renderedSequence}`,
+      ),
     ]);
     renderEvents(events);
     setStatus(run.status);
@@ -221,8 +229,9 @@ async function pollRun(runId) {
       }
       return;
     }
-    await delay(220);
+    await delay(POLL_INTERVAL_MS);
   }
+  throw new Error("Run did not reach a terminal state within 60s.");
 }
 
 async function submitRequest(event) {

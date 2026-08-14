@@ -71,8 +71,12 @@ cd agent-runtime-platform
 docker compose up --build
 ```
 
-Open [http://localhost:8000/demo](http://localhost:8000/demo), keep the example request, and select
+Open [http://localhost:8000](http://localhost:8000), keep the example request, and select
 **Run through Runtime**.
+
+The first start builds the local image and may take several minutes while Python dependencies are
+installed. Before an interview, run the command once to warm the Docker cache; later starts can use
+`docker compose up` and reuse the built image.
 
 The console submits directly through the existing authenticated `POST /runs` API, polls the durable
 Run and Event resources, and renders only evidence returned by the runtime. A normal offline run
