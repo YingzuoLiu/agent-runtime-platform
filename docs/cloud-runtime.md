@@ -58,10 +58,17 @@ The API passes only the principal's derived `TenantContext` into
 `RuntimeManager`; request models reject extra fields, so a client cannot select or override
 `tenant_id` in JSON. With no configured credentials, protected endpoints fail closed.
 
-Only `/health` and `/ready` are public. `/agents`, `/tools`, tool execution, the synchronous
-compatibility endpoint, runs, cancellation, event history/SSE, and thread checkpoints require
-`Authorization: Bearer <api-key>`. Missing and invalid keys share one `401` response. Resource
-lookups that are unknown or owned by another tenant share one `404` response.
+In normal runtime mode, only `/health` and `/ready` are public. `/agents`, `/tools`, tool
+execution, the synchronous compatibility endpoint, runs, cancellation, event history/SSE, and
+thread checkpoints require `Authorization: Bearer <api-key>`. Missing and invalid keys share one
+`401` response. Resource lookups that are unknown or owned by another tenant share one `404`
+response.
+
+`RUNTIME_DEMO_MODE=true` is an explicit local-only exception. It is mutually exclusive with
+`RUNTIME_API_KEYS_JSON`, registers `/demo` plus a no-store `/demo/session` bootstrap response, and
+creates one ephemeral Operator credential for that browser console. The default Compose port is
+bound to `127.0.0.1`; demo mode must not be exposed as a deployment authentication mechanism.
+Without the switch, those two routes are absent and the normal fail-closed behavior is unchanged.
 
 `RoleAuthorizer` maps the trusted configured role to typed permissions. Viewers may list agents
 and tools and read run state, events/SSE, and thread checkpoints. Operators receive those read
@@ -385,9 +392,10 @@ security, post-dispatch drift, and unrecoverable evidence-mirror gaps.
 ## Deliberate limitations
 
 SQLite and an in-process queue keep the repository runnable without external services. The
-supplied Compose configuration requires `RUNTIME_API_KEYS_JSON`. The Kubernetes Deployment reads
-that value from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and rotation
-of that Secret are intentionally outside this slice. Therefore:
+supplied Compose configuration is the loopback-only local demo. A normal container invocation
+remains fail-closed and requires configured credentials. The Kubernetes Deployment reads
+`RUNTIME_API_KEYS_JSON` from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and
+rotation of that Secret are intentionally outside this slice. Therefore:
 
 - deploy one runtime replica only;
 - there is no distributed worker lease or heartbeat;
