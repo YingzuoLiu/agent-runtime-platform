@@ -248,4 +248,4 @@ def test_external_agent_example_meets_the_physical_line_budget():
     assert len(statement_lines) == len(set(statement_lines))
     assert "runtime_service" not in source
     assert "RUNTIME_API_KEY" in source
-    assert "requests.post" in source
+    assert "httpx.post" in source

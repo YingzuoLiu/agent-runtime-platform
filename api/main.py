@@ -484,7 +484,7 @@ def create_app(
         )
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/ready")
@@ -906,11 +906,12 @@ def create_app(
         try:
             deadline = anyio.current_time() + wait_seconds
             current = action
+            poll_delay = 0.05
             while not current.status.is_terminal:
                 remaining = deadline - anyio.current_time()
                 if remaining <= 0:
                     break
-                await anyio.sleep(min(0.05, remaining))
+                await anyio.sleep(min(poll_delay, remaining))
                 refreshed = await get_action_resource(
                     request,
                     current.action_id,
@@ -923,6 +924,7 @@ def create_app(
                         "The Action's durable evidence is incomplete.",
                     )
                 current = refreshed
+                poll_delay = min(0.4, poll_delay * 1.5)
             return current
         finally:
             semaphore.release()

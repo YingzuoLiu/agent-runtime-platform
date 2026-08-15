@@ -73,6 +73,16 @@ def wait_for_action(
     raise AssertionError(f"Action did not reach {expected}: {action_id}")
 
 
+def wait_for_terminal_run(run_store, action_id: str, *, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        run = run_store.get_run_internal(action_id)
+        if run is not None and run.status.is_terminal:
+            return run
+        time.sleep(0.02)
+    raise AssertionError(f"Run did not reach a terminal status: {action_id}")
+
+
 class BaseProvider:
     provider_identity = "action-recovery-provider-v1"
 
@@ -376,11 +386,11 @@ def test_cancellation_after_dispatch_never_masks_provider_outcome(
             action_id,
             {"succeeded", "failed", "outcome_unknown"},
         )
-        run = client.app.state.run_store.get_run_internal(action_id)
+        run = wait_for_terminal_run(client.app.state.run_store, action_id)
 
     assert during_dispatch["status"] == "running"
     assert action["status"] == expected_action_status
-    assert run is not None and run.status == expected_run_status
+    assert run.status == expected_run_status
     assert len(provider.requests) == 1
 
 
