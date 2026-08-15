@@ -3,17 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.types import Scope
 
 from api.demo import (
@@ -25,6 +27,7 @@ from api.demo import (
 )
 from domains.release_validation.runtime import ReleaseValidationWorkflow
 from domains.release_validation.tools import build_release_validation_tool_registry
+from domains.durable_action import DurableActionGatewayRuntime, DurableActionState
 from domains.travel.dynamic_runtime import DynamicTravelRuntime
 from domains.travel.external_action_runtime import (
     DurableActionTravelPlanner,
@@ -83,9 +86,45 @@ from runtime_service.external_actions import (
     ExternalActionProviderRegistry,
 )
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
+from runtime_service.action_gateway import (
+    ACTION_AGENT_ID,
+    ACTION_AGENT_VERSION,
+    ACTION_DOMAIN_ID,
+    ACTION_REQUEST_NAMESPACE_PREFIX,
+    ActionApiErrorBody,
+    ActionApiErrorEnvelope,
+    ActionCreateRequest,
+    ActionEvent,
+    ActionResource,
+    DurableActionInput,
+    load_action_providers_from_environment,
+)
+from runtime_service.action_gateway_service import (
+    ActionEvidenceIncompleteError,
+    ActionTypeNotRegisteredError,
+    DestinationNotRegisteredError,
+    DurableActionGateway,
+    IdempotencyKeyReusedError,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+class ActionRouteError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.headers = dict(headers or {})
 
 
 class NoStoreStaticFiles(StaticFiles):
@@ -122,6 +161,8 @@ def create_app(
     authorizer: Authorizer | None = None,
     travel_planner: Planner | None = None,
     travel_action_provider: ExternalActionProvider | None = None,
+    action_providers: Mapping[str, ExternalActionProvider] | None = None,
+    action_waiter_limit: int | None = None,
     demo_mode: bool | None = None,
     demo_api_key: str | None = None,
     runtime_extensions: Sequence[RuntimeExtension] = (),
@@ -131,6 +172,18 @@ def create_app(
         database_value = os.getenv("RUNTIME_DB_PATH") or "runtime_data/runtime.db"
     resolved_database_path = Path(database_value)
     resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
+    resolved_action_waiter_limit = (
+        int(os.getenv("RUNTIME_ACTION_WAITER_LIMIT", "16"))
+        if action_waiter_limit is None
+        else action_waiter_limit
+    )
+    if not 1 <= resolved_action_waiter_limit <= 1_000:
+        raise ValueError("action waiter limit must be between 1 and 1000")
+    configured_action_providers = dict(load_action_providers_from_environment())
+    for alias, provider in (action_providers or {}).items():
+        if alias in configured_action_providers:
+            raise ValueError(f"Duplicate Action destination alias: {alias}")
+        configured_action_providers[alias] = provider
     resolved_runtime_extensions = tuple(runtime_extensions)
     resolved_demo_mode = resolve_demo_mode(demo_mode)
     demo_session: DemoSession | None = None
@@ -177,7 +230,7 @@ def create_app(
             workflow_store,
             ToolSandbox(build_release_validation_tool_registry()),
         )
-        provider_registry = ExternalActionProviderRegistry()
+        travel_provider_registry = ExternalActionProviderRegistry()
         if travel_action_provider is not None:
             resolved_action_provider = travel_action_provider
         elif action_provider_url := os.getenv("RUNTIME_TRAVEL_ACTION_PROVIDER_URL"):
@@ -216,8 +269,12 @@ def create_app(
                     f"{resolved_database_path.name}.trip-hold-provider"
                 )
             )
-        provider_registry.register("travel-trip-hold", resolved_action_provider)
-        action_dispatcher = ExternalActionDispatcher(provider_registry)
+        travel_provider_registry.register("travel-trip-hold", resolved_action_provider)
+        travel_action_dispatcher = ExternalActionDispatcher(travel_provider_registry)
+        action_provider_registry = ExternalActionProviderRegistry()
+        for alias, provider in sorted(configured_action_providers.items()):
+            action_provider_registry.register(alias, provider)
+        action_dispatcher = ExternalActionDispatcher(action_provider_registry)
         dynamic_travel_loop = DynamicToolLoop(
             planner=resolved_travel_planner,
             tool_registry=legacy_travel_tool_registry,
@@ -244,7 +301,7 @@ def create_app(
             run_event_sink=store,
             workflow_type="dynamic-tool-loop:travel-agent:1.2.0",
             max_tool_calls=4,
-            external_action_dispatcher=action_dispatcher,
+            external_action_dispatcher=travel_action_dispatcher,
         )
         registry = build_default_registry(
             release_validation_workflow=release_workflow,
@@ -271,6 +328,21 @@ def create_app(
                 )
             ),
         )
+        registry.register(
+            ACTION_AGENT_ID,
+            ACTION_AGENT_VERSION,
+            lambda: DurableActionGatewayRuntime(
+                workflow_store=workflow_store,
+                run_event_sink=store,
+                dispatcher=action_dispatcher,
+            ),
+            description=(
+                "Private single-step domain for the durable Action API façade."
+            ),
+            input_model=DurableActionInput,
+            state_model=DurableActionState,
+            public_runs_api=False,
+        )
         extension_context = RuntimeExtensionContext(
             registry=registry,
             workflow_store=workflow_store,
@@ -287,6 +359,12 @@ def create_app(
                 workflow_store.has_external_action_requiring_reconciliation
             ),
         )
+        action_gateway = DurableActionGateway(
+            manager=manager,
+            run_store=store,
+            workflow_store=workflow_store,
+            provider_registry=action_provider_registry,
+        )
         manager.start()
         app.state.run_store = store
         app.state.memory_store = memory_store
@@ -299,6 +377,8 @@ def create_app(
         app.state.external_action_tool_registry = external_action_tool_registry
         app.state.workflow_store = workflow_store
         app.state.travel_action_provider = resolved_action_provider
+        app.state.action_provider_registry = action_provider_registry
+        app.state.action_gateway = action_gateway
         app.state.authenticator = resolved_authenticator
         app.state.authorizer = resolved_authorizer
         yield
@@ -311,7 +391,7 @@ def create_app(
             "plus policy-enforced tools, governed cross-thread memory and durable "
             "external actions."
         ),
-        version="1.2.0",
+        version="1.3.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -347,6 +427,61 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Operation not permitted",
             ) from exc
+
+    def require_action_principal(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> Principal:
+        api_key = None
+        if credentials is not None and credentials.scheme.lower() == "bearer":
+            api_key = credentials.credentials
+        try:
+            return resolved_authenticator.authenticate(api_key)
+        except AuthenticationError:
+            raise ActionRouteError(
+                status.HTTP_401_UNAUTHORIZED,
+                "invalid_api_key",
+                "Invalid or missing API key.",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from None
+
+    def require_action_permission(
+        principal: Principal,
+        permission: RuntimePermission,
+    ) -> None:
+        try:
+            resolved_authorizer.authorize(principal, permission)
+        except AuthorizationError:
+            raise ActionRouteError(
+                status.HTTP_403_FORBIDDEN,
+                "operation_not_permitted",
+                "Operation not permitted.",
+            ) from None
+
+    def public_run_or_none(request: Request, run: RunRecord | None) -> RunRecord | None:
+        if run is None:
+            return None
+        try:
+            registration = request.app.state.agent_registry.registration(
+                run.agent_id,
+                run.agent_version,
+            )
+        except KeyError:
+            return None
+        return run if registration.public_runs_api else None
+
+    @app.exception_handler(ActionRouteError)
+    async def render_action_error(
+        _request: Request,
+        exc: ActionRouteError,
+    ) -> JSONResponse:
+        envelope = ActionApiErrorEnvelope(
+            error=ActionApiErrorBody(code=exc.code, message=exc.message)
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=envelope.model_dump(mode="json"),
+            headers=exc.headers,
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -415,7 +550,11 @@ def create_app(
         store: SQLiteRunStore = request.app.state.run_store
         if (
             payload.run_id is not None
-            and store.get_run_for_tenant(payload.run_id, principal.tenant_id) is None
+            and public_run_or_none(
+                request,
+                store.get_run_for_tenant(payload.run_id, principal.tenant_id),
+            )
+            is None
         ):
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.TOOLS_EXECUTE)
@@ -493,8 +632,35 @@ def create_app(
         payload: RunCreateRequest,
         request: Request,
         principal: Principal = Depends(require_principal),
-    ) -> RunRecord:
+    ) -> RunRecord | JSONResponse:
         require_permission(principal, RuntimePermission.RUNS_CREATE)
+        if (
+            payload.client_request_id is not None
+            and payload.client_request_id.startswith(ACTION_REQUEST_NAMESPACE_PREFIX)
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "reserved_client_request_namespace",
+                        "message": (
+                            "client_request_id uses a namespace reserved for the Action API."
+                        ),
+                    }
+                },
+            )
+        try:
+            registration = request.app.state.agent_registry.registration(
+                payload.agent_id,
+                payload.agent_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not registration.public_runs_api:
+            raise HTTPException(
+                status_code=422,
+                detail="Agent version is not available through /runs",
+            )
         authority = effective_execution_authority(principal, resolved_authorizer)
         try:
             return get_manager(request).submit(
@@ -516,10 +682,10 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
-        run = get_manager(request).get_run(
+        run = public_run_or_none(request, get_manager(request).get_run(
             run_id,
             tenant_context=principal.tenant_context,
-        )
+        ))
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.RUNS_READ)
@@ -531,13 +697,13 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
-        if (
+        if public_run_or_none(
+            request,
             get_manager(request).get_run(
                 run_id,
                 tenant_context=principal.tenant_context,
-            )
-            is None
-        ):
+            ),
+        ) is None:
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.RUNS_CANCEL)
         try:
@@ -555,13 +721,13 @@ def create_app(
         principal: Principal = Depends(require_principal),
         after_sequence: int = Query(default=0, ge=0),
     ) -> list[RunEvent]:
-        if (
+        if public_run_or_none(
+            request,
             get_manager(request).get_run(
                 run_id,
                 tenant_context=principal.tenant_context,
-            )
-            is None
-        ):
+            ),
+        ) is None:
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
         return request.app.state.run_store.list_events_for_tenant(
@@ -578,10 +744,10 @@ def create_app(
         after_sequence: int = Query(default=0, ge=0),
     ) -> StreamingResponse:
         manager = get_manager(request)
-        if (
-            manager.get_run(run_id, tenant_context=principal.tenant_context)
-            is None
-        ):
+        if public_run_or_none(
+            request,
+            manager.get_run(run_id, tenant_context=principal.tenant_context),
+        ) is None:
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.RUN_EVENTS_READ)
 
@@ -609,6 +775,277 @@ def create_app(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    def action_gateway_error(exc: Exception) -> ActionRouteError:
+        if isinstance(exc, ActionTypeNotRegisteredError):
+            return ActionRouteError(
+                422,
+                "action_type_not_registered",
+                "The requested Action type is not registered.",
+            )
+        if isinstance(exc, DestinationNotRegisteredError):
+            return ActionRouteError(
+                422,
+                "destination_not_registered",
+                "The requested destination alias is not registered.",
+            )
+        if isinstance(exc, IdempotencyKeyReusedError):
+            return ActionRouteError(
+                status.HTTP_409_CONFLICT,
+                "idempotency_key_reused",
+                "The idempotency key is already bound to a different action request.",
+            )
+        return ActionRouteError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "action_evidence_incomplete",
+            "The Action's durable evidence is incomplete.",
+        )
+
+    async def parse_action_request(request: Request) -> ActionCreateRequest:
+        try:
+            raw_payload = await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "The Action request body is invalid.",
+            ) from None
+        if not isinstance(raw_payload, dict):
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "The Action request body is invalid.",
+            )
+        try:
+            return ActionCreateRequest.model_validate(raw_payload)
+        except ValidationError:
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "The Action request body is invalid.",
+            ) from None
+
+    def parse_wait(request: Request) -> float:
+        values = request.query_params.getlist("wait")
+        if len(values) > 1:
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "wait must be a number between 0 and 5 seconds.",
+            )
+        try:
+            wait = float(values[0]) if values else 0.0
+        except ValueError:
+            wait = math.nan
+        if not math.isfinite(wait) or not 0 <= wait <= 5:
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "wait must be a number between 0 and 5 seconds.",
+            )
+        return wait
+
+    def parse_after_sequence(request: Request) -> int:
+        values = request.query_params.getlist("after_sequence")
+        if len(values) > 1:
+            candidate = -1
+        else:
+            try:
+                candidate = int(values[0]) if values else 0
+            except ValueError:
+                candidate = -1
+        if candidate < 0:
+            raise ActionRouteError(
+                422,
+                "invalid_action_input",
+                "after_sequence must be a non-negative integer.",
+            )
+        return candidate
+
+    async def get_action_resource(
+        request: Request,
+        action_id: str,
+        principal: Principal,
+    ) -> ActionResource | None:
+        gateway: DurableActionGateway = request.app.state.action_gateway
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: gateway.get(
+                    action_id,
+                    tenant_context=principal.tenant_context,
+                )
+            )
+        except ActionEvidenceIncompleteError as exc:
+            raise action_gateway_error(exc) from None
+
+    async def action_exists(
+        request: Request,
+        action_id: str,
+        principal: Principal,
+    ) -> bool:
+        gateway: DurableActionGateway = request.app.state.action_gateway
+        return await anyio.to_thread.run_sync(
+            lambda: gateway.exists(
+                action_id,
+                tenant_context=principal.tenant_context,
+            )
+        )
+
+    async def wait_for_action(
+        request: Request,
+        action: ActionResource,
+        principal: Principal,
+        wait_seconds: float,
+    ) -> ActionResource:
+        if wait_seconds <= 0 or action.status.is_terminal:
+            return action
+        semaphore: anyio.Semaphore = request.app.state.action_waiter_semaphore
+        try:
+            semaphore.acquire_nowait()
+        except anyio.WouldBlock:
+            return action
+        try:
+            deadline = anyio.current_time() + wait_seconds
+            current = action
+            while not current.status.is_terminal:
+                remaining = deadline - anyio.current_time()
+                if remaining <= 0:
+                    break
+                await anyio.sleep(min(0.05, remaining))
+                refreshed = await get_action_resource(
+                    request,
+                    current.action_id,
+                    principal,
+                )
+                if refreshed is None:
+                    raise ActionRouteError(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "action_evidence_incomplete",
+                        "The Action's durable evidence is incomplete.",
+                    )
+                current = refreshed
+            return current
+        finally:
+            semaphore.release()
+
+    def action_response(action: ActionResource) -> JSONResponse:
+        if action.status.is_terminal:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=action.model_dump(mode="json"),
+            )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=action.model_dump(mode="json"),
+            headers={
+                "Location": f"/actions/{action.action_id}",
+                "Retry-After": "1",
+            },
+        )
+
+    app.state.action_waiter_semaphore = anyio.Semaphore(
+        resolved_action_waiter_limit
+    )
+
+    @app.post("/actions", response_model=ActionResource)
+    async def create_action(
+        request: Request,
+        principal: Principal = Depends(require_action_principal),
+    ) -> JSONResponse:
+        require_action_permission(principal, RuntimePermission.RUNS_CREATE)
+        require_action_permission(
+            principal,
+            RuntimePermission.EXTERNAL_ACTIONS_EXECUTE,
+        )
+        require_action_permission(principal, RuntimePermission.TOOLS_EXECUTE)
+        payload = await parse_action_request(request)
+        wait_seconds = parse_wait(request)
+        authority = effective_execution_authority(principal, resolved_authorizer)
+        tenant_context = TenantContext(
+            tenant_id=authority.tenant_id,
+            subject_id=authority.subject_id,
+            permissions=authority.permissions,
+        )
+        gateway: DurableActionGateway = request.app.state.action_gateway
+        try:
+            submitted = await anyio.to_thread.run_sync(
+                lambda: gateway.submit(payload, tenant_context=tenant_context)
+            )
+        except (
+            ActionTypeNotRegisteredError,
+            DestinationNotRegisteredError,
+            IdempotencyKeyReusedError,
+            ActionEvidenceIncompleteError,
+        ) as exc:
+            raise action_gateway_error(exc) from None
+        action = await wait_for_action(
+            request,
+            submitted.resource,
+            principal,
+            wait_seconds,
+        )
+        return action_response(action)
+
+    @app.get("/actions/{action_id}", response_model=ActionResource)
+    async def get_action(
+        action_id: str,
+        request: Request,
+        principal: Principal = Depends(require_action_principal),
+    ) -> ActionResource:
+        if not await action_exists(request, action_id, principal):
+            raise ActionRouteError(
+                status.HTTP_404_NOT_FOUND,
+                "action_not_found",
+                "Action not found.",
+            )
+        require_action_permission(principal, RuntimePermission.RUNS_READ)
+        action = await get_action_resource(request, action_id, principal)
+        if action is None:  # pragma: no cover - tenant lookup was just verified
+            raise ActionRouteError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "action_evidence_incomplete",
+                "The Action's durable evidence is incomplete.",
+            )
+        return action
+
+    @app.get("/actions/{action_id}/events", response_model=list[ActionEvent])
+    async def list_action_events(
+        action_id: str,
+        request: Request,
+        principal: Principal = Depends(require_action_principal),
+    ) -> list[ActionEvent]:
+        gateway: DurableActionGateway = request.app.state.action_gateway
+        if not await action_exists(request, action_id, principal):
+            raise ActionRouteError(
+                status.HTTP_404_NOT_FOUND,
+                "action_not_found",
+                "Action not found.",
+            )
+        require_action_permission(principal, RuntimePermission.RUN_EVENTS_READ)
+        if await get_action_resource(request, action_id, principal) is None:
+            raise ActionRouteError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "action_evidence_incomplete",
+                "The Action's durable evidence is incomplete.",
+            )
+        after_sequence = parse_after_sequence(request)
+        try:
+            events = await anyio.to_thread.run_sync(
+                lambda: gateway.list_events(
+                    action_id,
+                    tenant_context=principal.tenant_context,
+                    after_sequence=after_sequence,
+                )
+            )
+        except ActionEvidenceIncompleteError as exc:
+            raise action_gateway_error(exc) from None
+        if events is None:  # pragma: no cover - tenant lookup was just verified
+            raise ActionRouteError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "action_evidence_incomplete",
+                "The Action's durable evidence is incomplete.",
+            )
+        return events
+
     @app.get("/threads/{thread_id}/state")
     def get_thread_state(
         thread_id: str,
@@ -618,6 +1055,8 @@ def create_app(
         schema_version: str = Query(default="1"),
     ) -> dict:
         require_permission(principal, RuntimePermission.THREAD_STATE_READ)
+        if domain_id == ACTION_DOMAIN_ID:
+            raise HTTPException(status_code=404, detail="Thread state not found")
         try:
             state_value = request.app.state.run_store.load_thread_state(
                 thread_id,

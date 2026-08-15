@@ -25,6 +25,7 @@ class RuntimeRegistration:
     state_model: type[BaseRuntimeState]
     factory: RuntimeFactory
     run_reference_resolver: RunReferenceResolver | None = None
+    public_runs_api: bool = True
 
     def parse_input(self, payload: dict[str, Any]) -> BaseModel:
         return self.input_model.model_validate(payload)
@@ -57,6 +58,7 @@ class AgentRegistry:
         input_model: type[BaseModel],
         state_model: type[BaseRuntimeState],
         run_reference_resolver: RunReferenceResolver | None = None,
+        public_runs_api: bool = True,
     ) -> None:
         key = (agent_id, version)
         if key in self._registrations:
@@ -78,6 +80,7 @@ class AgentRegistry:
             state_model=state_model,
             factory=factory,
             run_reference_resolver=run_reference_resolver,
+            public_runs_api=public_runs_api,
         )
 
     def registration(self, agent_id: str, version: str) -> RuntimeRegistration:
@@ -112,6 +115,7 @@ class AgentRegistry:
                 input_schema=registration.input_model.model_json_schema(),
             )
             for _, registration in sorted(self._registrations.items())
+            if registration.public_runs_api
         ]
 
 

@@ -9,6 +9,10 @@ The implementation makes external intent, dispatch attempts, and outcomes durabl
 claim exactly-once execution, automatic compensation, human approval, or integration with live
 booking, payment, or inventory systems.
 
+Phase 7D reuses this same coordinator and Run lifecycle behind a private single-step domain and the
+public `/actions` façade. See [`durable-action-gateway.md`](durable-action-gateway.md) for that
+external-Agent contract. The façade does not split the coordinator into a second lifecycle.
+
 `DynamicToolLoop` retains Planner orchestration and policy ordering. The stateless
 `ExternalActionCoordinator` owns prepare/dispatch/retry/recovery transitions, while
 `EvidenceProjector` keeps workflow evidence authoritative and repairs its public Run-event
