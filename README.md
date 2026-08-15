@@ -406,12 +406,16 @@ The release-validation domain is independent of Travel. Its manifests, artifacts
 records, and tool results are synthetic fixtures. Scheduling is intentionally serial; no parallel
 execution claim is made.
 
-### Bring your own Agent / Domain
+### Trusted domain extensions
 
 `create_app(runtime_extensions=(extension,))` is a trusted, deployment-time registration seam. An
 extension can provide its own strict input/state models, version-pinned Runtime factory, Planner,
 private tool registry, and final evidence validator while reusing the same authenticated
 `POST /runs`, Run/Event persistence, checkpointing, and recovery lifecycle.
+
+This seam is for deployment-owned domains that adopt the Runtime's execution lifecycle. It is not
+a drop-in integration surface for external Agent frameworks that retain their own Planner loop,
+tool execution, session state, and persistence.
 
 The executable [`incident-triage:1.0.0` reference](docs/bring-your-own-domain.md) is deliberately
 opt-in and fully offline. It inspects one deterministic synthetic signal and produces a
@@ -766,12 +770,12 @@ platform.
 - no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
   reconciliation for unknown external-action outcomes.
 
-Phase 7C is the current developer-integration milestone. It implements a deliberately narrow Bring
-Your Own Agent / Domain seam for trusted deployment code and proves it with the optional offline
-incident-triage package. It does not claim runtime installation of OpenClaw plugins or untrusted
-extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls, a live
-read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain possible
-follow-up slices rather than prerequisites for the runtime demonstrated here.
+Phase 7C is the current developer-integration milestone. It implements a deliberately narrow
+trusted domain/runtime extension seam for deployment-owned code and proves it with the optional
+offline incident-triage package. It does not claim runtime installation of OpenClaw plugins or
+untrusted extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls,
+a live read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain
+possible follow-up slices rather than prerequisites for the runtime demonstrated here.
 
 ## License
 

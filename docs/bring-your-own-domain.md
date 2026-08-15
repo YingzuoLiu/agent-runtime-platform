@@ -1,4 +1,4 @@
-# Bring Your Own Agent / Domain
+# Trusted Domain Extensions
 
 Phase 7C adds one narrow, real extension boundary: a **trusted Python package can register an
 Agent version at application startup** and then use the existing durable Run, Event, and
