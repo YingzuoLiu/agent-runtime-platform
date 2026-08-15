@@ -8,6 +8,7 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from agent.contracts import (
+    BaseRuntimeState,
     RuntimeExecutionAuthority,
     RuntimeExecutionContext,
     RuntimeExecutionError,
@@ -16,7 +17,7 @@ from agent.contracts import (
 from .auth import TenantContext
 from .external_actions import ExternalActionReconciliationPendingError
 from .models import RunCreateRequest, RunRecord, RunStatus
-from .registry import AgentRegistry
+from .registry import AgentRegistry, RuntimeRegistration
 from .store import SQLiteRunStore
 
 
@@ -51,6 +52,8 @@ class RuntimeManager:
         with self._lock:
             if self._started:
                 return
+            recoverable_runs = self.store.list_recoverable_runs()
+            self._assert_recoverable_runs_registered(recoverable_runs)
             self._started = True
             for index in range(self.worker_count):
                 worker = threading.Thread(
@@ -60,7 +63,7 @@ class RuntimeManager:
                 )
                 worker.start()
                 self._workers.append(worker)
-            for run in self.store.list_recoverable_runs():
+            for run in recoverable_runs:
                 if run.status == RunStatus.RUNNING:
                     recovered = self.store.recover_run_for_restart(
                         run.run_id,
@@ -241,11 +244,28 @@ class RuntimeManager:
                 domain_id=run.domain_id,
                 schema_version=run.schema_version,
             )
-            state = run.state or persisted_state or runtime.initial_state(run.thread_id)
+            state_source = (
+                "request"
+                if run.state is not None
+                else "thread_store"
+                if persisted_state is not None
+                else "new_state"
+            )
+            candidate_state = (
+                run.state
+                or persisted_state
+                or runtime.initial_state(run.thread_id)
+            )
+            state = self._validate_runtime_state(
+                registration,
+                candidate_state,
+                thread_id=run.thread_id,
+                boundary="initial_state",
+            )
             self.store.append_event(
                 run.run_id,
                 "checkpoint.loaded",
-                {"source": "request" if run.state is not None else "thread_store" if persisted_state is not None else "new_state"},
+                {"source": state_source},
             )
             assert run.input is not None
             runtime_input = registration.parse_input(run.input)
@@ -263,14 +283,20 @@ class RuntimeManager:
                     authority=self._execution_authority(run),
                 ),
             )
-            run.state = result.state
+            result_state = self._validate_runtime_state(
+                registration,
+                result.state,
+                thread_id=run.thread_id,
+                boundary="execute",
+            )
+            run.state = result_state
             run.output_message = result.message
             run.validation_errors = result.validation_errors
             run.error_code = None
             run.error = None
             if not self.store.finalize_completed_run(run):
                 latest = self._require_run(run_id)
-                latest.state = result.state
+                latest.state = result_state
                 latest.error_code = None
                 latest.error = None
                 self._mark_cancelled(latest, reason="cancelled_after_execution_boundary")
@@ -350,6 +376,57 @@ class RuntimeManager:
         if run is None:
             raise KeyError(f"Run not found: {run_id}")
         return run
+
+    def _assert_recoverable_runs_registered(
+        self,
+        recoverable_runs: list[RunRecord],
+    ) -> None:
+        """Keep durable work recoverable when a deployment omits its extension."""
+
+        for run in recoverable_runs:
+            try:
+                registration = self.registry.registration(
+                    run.agent_id,
+                    run.agent_version,
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "RuntimeManager cannot start: recoverable run "
+                    f"{run.run_id} requires unregistered Agent version "
+                    f"{run.agent_id}:{run.agent_version}"
+                ) from exc
+            if (
+                registration.domain_id != run.domain_id
+                or registration.schema_version != run.schema_version
+            ):
+                raise RuntimeError(
+                    "RuntimeManager cannot start: recoverable run "
+                    f"{run.run_id} schema {run.domain_id}:{run.schema_version} "
+                    "does not match its registered Agent version"
+                )
+
+    @staticmethod
+    def _validate_runtime_state(
+        registration: RuntimeRegistration,
+        state: BaseRuntimeState,
+        *,
+        thread_id: str,
+        boundary: str,
+    ) -> BaseRuntimeState:
+        """Fail closed before a third-party Runtime state reaches persistence."""
+
+        try:
+            validated = registration.parse_state(state)
+        except Exception as exc:
+            raise ValueError(
+                f"Runtime {boundary} state does not match registered schema "
+                f"{registration.domain_id}:{registration.schema_version}"
+            ) from exc
+        if validated.thread_id != thread_id:
+            raise ValueError(
+                f"Runtime {boundary} state.thread_id must match run.thread_id"
+            )
+        return validated
 
     @staticmethod
     def _execution_authority(run: RunRecord) -> RuntimeExecutionAuthority:

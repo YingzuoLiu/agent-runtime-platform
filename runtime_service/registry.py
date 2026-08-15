@@ -30,10 +30,8 @@ class RuntimeRegistration:
         return self.input_model.model_validate(payload)
 
     def parse_state(self, payload: dict[str, Any] | BaseRuntimeState) -> BaseRuntimeState:
-        if isinstance(payload, self.state_model):
-            return payload
         if isinstance(payload, BaseRuntimeState):
-            payload = payload.model_dump(mode="python")
+            payload = payload.model_dump(mode="python", warnings="error")
         return self.state_model.model_validate(payload)
 
     def referenced_run_ids(self, runtime_input: BaseModel) -> tuple[str, ...]:
