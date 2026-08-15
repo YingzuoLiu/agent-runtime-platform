@@ -27,7 +27,8 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=appuser:appuser . .
-RUN mkdir -p /app/runtime_data && chown -R appuser:appuser /app/runtime_data
+RUN mkdir -p /app/provider_data /app/runtime_data \
+    && chown -R appuser:appuser /app/provider_data /app/runtime_data
 
 USER appuser
 EXPOSE 8000

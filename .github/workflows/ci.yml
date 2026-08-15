@@ -19,7 +19,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements-dev.txt
-      - run: python -m compileall agent api runtime_service domains examples
-      - run: ruff check agent api runtime_service tests domains examples
+      - run: python -m compileall agent api demo_provider runtime_service domains examples
+      - run: ruff check agent api demo_provider runtime_service tests domains examples
       - run: mypy
       - run: pytest -q
+      - run: docker compose config --quiet

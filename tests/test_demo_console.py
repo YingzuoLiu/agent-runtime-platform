@@ -322,11 +322,27 @@ def test_demo_mode_is_explicit_and_cannot_mix_with_production_credentials(
         )
 
 
-def test_compose_enables_only_the_loopback_local_demo(tmp_path, monkeypatch):
+def test_compose_enables_loopback_demo_with_independent_provider(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     compose_path = REPOSITORY_ROOT / "docker-compose.yml"
     compose = compose_path.read_text(encoding="utf-8")
+    provider_service, runtime_and_volumes = compose.split("  runtime:\n", maxsplit=1)
+    runtime_service, named_volumes = runtime_and_volumes.split("\nvolumes:\n", maxsplit=1)
     assert compose.startswith("# LOCAL DEMO ONLY")
-    assert '"127.0.0.1:8000:8000"' in compose
-    assert 'RUNTIME_DEMO_MODE: "true"' in compose
+    assert '"127.0.0.1:8000:8000"' in provider_service
+    assert '"127.0.0.1:8100:8100"' in provider_service
+    assert "demo_provider.app:app" in provider_service
+    assert "--no-access-log" in provider_service
+    assert "provider-data:/app/provider_data" in provider_service
+    assert "http://127.0.0.1:8100/health" in provider_service
+    assert 'restart: "no"' in provider_service
+    assert "network_mode: service:demo-provider" in runtime_service
+    assert "condition: service_healthy" in runtime_service
+    assert "ports:" not in runtime_service
+    assert "http://127.0.0.1:8000/health" in runtime_service
+    assert "runtime-data:/app/runtime_data" in runtime_service
+    assert 'RUNTIME_DEMO_MODE: "true"' in runtime_service
+    assert 'restart: "no"' in runtime_service
+    assert "provider-data:" in named_volumes
+    assert "runtime-data:" in named_volumes
     assert "RUNTIME_API_KEYS_JSON" not in compose
