@@ -37,6 +37,7 @@ WORKFLOW_STORE_METHODS = {
     "mark_running",
     "ping",
     "prepare_external_action",
+    "read_run_snapshot",
     "recover_interrupted_step",
     "retry_external_action_dispatch",
     "reuse_completed_step",

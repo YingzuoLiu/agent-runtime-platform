@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)
-![Status](https://img.shields.io/badge/status-Phase%207C%20complete-2ea44f)
+![Status](https://img.shields.io/badge/status-Phase%207D%20complete-2ea44f)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Many Agent projects focus on deciding what the Agent should do next. This project focuses on what
@@ -16,6 +16,9 @@ Travel is the main reference application, not the product boundary. A separate
 `release-validation` domain exercises the same runtime through a deterministic DAG and selective
 replay. Trusted deployment-time extensions can register additional typed domains without editing
 Runtime Core; Phase 7C includes an opt-in synthetic incident-triage proof.
+Phase 7D adds a narrow durable Action gateway so existing Agents and scripts can delegate an
+allowlisted side effect without moving their Planner, memory, session, or main loop into this
+runtime.
 
 ## Why an Agent Runtime?
 
@@ -143,6 +146,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
+| Action gateway | `webhook.send` façade over a private single-step domain and the existing Run lifecycle | [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md), [`examples/external_agent.py`](examples/external_agent.py) |
 | Security | Fail-closed API-key auth, tenant isolation, Viewer/Operator RBAC, registered-tool sandboxing | [`runtime_service/auth.py`](runtime_service/auth.py), [`docs/cloud-runtime.md`](docs/cloud-runtime.md) |
 | Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
 | Domains | Five Travel versions, two release-validation versions, and an opt-in trusted extension seam | [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md) |
@@ -243,6 +247,54 @@ curl -X DELETE -H "Authorization: Bearer $RUNTIME_API_KEY" \
 If required information is missing, the completed run returns
 `state.current_stage="needs_clarification"`. Submit another run of the same pinned Travel version on the
 same tenant-qualified thread to continue from its durable checkpoint.
+
+## Delegate one durable Action
+
+The Runtime Console and Travel flow remain the primary local demo. The separate Action gateway is
+for an existing Agent, script, or workflow that already owns its orchestration and needs one
+durable, allowlisted side effect. Phase 7D supports only `webhook.send`, routed through a
+deployment-owned destination alias; callers cannot supply a URL, method, headers, credentials, or
+provider recovery settings.
+
+Before starting the API, register a provider endpoint that implements the runtime's JSON envelope
+contract:
+
+```bash
+export RUNTIME_ACTION_PROVIDERS_JSON='{
+  "demo": {
+    "endpoint": "https://provider.example/actions",
+    "provider_identity": "demo-provider-v1",
+    "bearer_token": "replace-with-a-server-owned-token",
+    "supports_idempotency": true,
+    "definitive_status_codes": [400, 401, 403, 404]
+  }
+}'
+```
+
+With `RUNTIME_API_KEY` set to the Operator credential configured above, the complete external-Agent
+integration is [`examples/external_agent.py`](examples/external_agent.py) (target: ≤10 executable
+lines):
+
+```bash
+python examples/external_agent.py
+```
+
+The request uses `POST /actions?wait=5`. It returns `200` if the Action reaches a public terminal
+state inside the bound, otherwise `202` with the current durable Action, its `action_id`, a
+`Location` header, and `Retry-After`. Five seconds is a polling bound, not a completion promise.
+Inspect the resource and authoritative Action events with:
+
+```bash
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" \
+  http://127.0.0.1:8000/actions/<action_id>
+
+curl -H "Authorization: Bearer $RUNTIME_API_KEY" \
+  'http://127.0.0.1:8000/actions/<action_id>/events?after_sequence=0'
+```
+
+See [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md) for idempotency, provider
+request/response envelopes, status projection, recovery, and deployment boundaries. The configured
+HTTP adapter is not a raw-body forwarder or a drop-in endpoint for ordinary webhook products.
 
 ## Architecture
 
@@ -402,6 +454,9 @@ Versions remain registered because durable runs pin exact behavior for recovery 
 | `release-validation` | `1.0.0` | Fixed-order workflow | Compatibility contract for existing durable runs |
 | `release-validation` | `1.1.0` | Static validated DAG | Step persistence, selective replay, signature-safe evidence reuse |
 
+The built-in `durable-action-gateway:1.0.0` registration is intentionally absent from this public
+catalog and from `GET /agents`; only `/actions` may submit its private single-step Runs.
+
 The release-validation domain is independent of Travel. Its manifests, artifacts, compatibility
 records, and tool results are synthetic fixtures. Scheduling is intentionally serial; no parallel
 execution claim is made.
@@ -510,9 +565,12 @@ networking or create a private mount namespace.
 | `GET /runs/{id}` | Read one tenant-scoped run | yes | yes |
 | `GET /runs/{id}/events` | Read durable events | yes | yes |
 | `GET /runs/{id}/events/stream` | Stream the same event model over SSE | yes | yes |
+| `GET /actions/{id}` | Read one tenant-scoped durable Action | yes | yes |
+| `GET /actions/{id}/events` | Read allowlisted authoritative Action evidence | yes | yes |
 | `GET /threads/{id}/state` | Read the tenant-scoped checkpoint | yes | yes |
 | `GET /memories` | Read the current subject's active or historical memory records | yes | yes |
 | `POST /runs` | Create or selectively replay a run | no | yes |
+| `POST /actions` | Submit one allowlisted durable side effect with optional bounded wait | no | yes |
 | `POST /runs/{id}/cancel` | Request cooperative cancellation | no | yes |
 | `POST /tools/{tool}/execute` | Execute a registered read-only tool directly; external writes return `409` | no | yes |
 | `POST /agent/message` | Call the synchronous Travel compatibility path | no | yes |
@@ -662,6 +720,8 @@ input signatures still match; the source run is never mutated.
   failure codes, recovery boundaries, and model adapter;
 - [`docs/durable-external-actions.md`](docs/durable-external-actions.md): action ledger,
   idempotency, provider boundary, cancellation arbitration, and uncertain outcomes;
+- [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md): external-Agent Action API,
+  destination configuration, HTTP envelope, bounded wait, and public evidence contract;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
   retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
@@ -711,6 +771,10 @@ second dynamic non-Travel domain through the existing API, exact API/persisted e
 private-tool allowlisting, evidence-gated finish, unknown-tool zero execution, checkpoint schema
 round-trip, missing-extension recovery preflight, and fail-closed Runtime state/thread validation
 before persistence.
+Phase 7D covers canonical Action idempotency, a private single-step domain, server-owned destination
+routing, provider-capability recovery, terminal uncertainty, cancellation precedence, safe status
+and event projection, tenant/RBAC isolation, bounded asynchronous waiting, multi-manager SQLite
+races, threadpool-pressure behavior, and the ten-line external-Agent example.
 
 GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
 
@@ -753,6 +817,8 @@ platform.
 - only two static roles, with no custom or per-Agent/per-tool grants;
 - process isolation rather than a container, gVisor, or microVM sandbox;
 - no arbitrary user-code or untrusted third-party MCP execution;
+- the Action façade supports only `webhook.send` to server-registered destinations; it is not an
+  arbitrary URL/method/header forwarder and has no per-destination grants;
 - trusted extensions are explicit startup composition only, with no discovery, hot loading,
   package marketplace, or plugin installation lifecycle;
 - serial DAG and dynamic-tool scheduling;
@@ -770,12 +836,13 @@ platform.
 - no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
   reconciliation for unknown external-action outcomes.
 
-Phase 7C is the current developer-integration milestone. It implements a deliberately narrow
-trusted domain/runtime extension seam for deployment-owned code and proves it with the optional
-offline incident-triage package. It does not claim runtime installation of OpenClaw plugins or
-untrusted extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls,
-a live read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain
-possible follow-up slices rather than prerequisites for the runtime demonstrated here.
+Phase 7D is the current Agent-integration milestone. It exposes the existing durable external-action
+state machine through a deliberately narrow Action façade while leaving Planner, memory, session,
+and framework orchestration with the caller. It does not add MCP, OpenClaw, Letta, or other
+framework-specific adapters, arbitrary webhooks, human approval, or active provider queries for a
+terminal unknown outcome. Those boundaries, semantic memory retrieval, bounded parallel read-only
+calls, a live read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation
+remain possible follow-up slices rather than prerequisites for the runtime demonstrated here.
 
 ## License
 

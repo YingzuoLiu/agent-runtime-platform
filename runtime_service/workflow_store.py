@@ -170,6 +170,15 @@ class WorkflowEvent(BaseModel):
     created_at: str = Field(default_factory=utc_now)
 
 
+class WorkflowRunSnapshot(BaseModel):
+    """One read-transaction view used by compound public projections."""
+
+    execution: WorkflowExecutionRecord | None = None
+    steps: list[ToolCallRecord] = Field(default_factory=list)
+    external_actions: list[ExternalActionRecord] = Field(default_factory=list)
+    events: list[WorkflowEvent] = Field(default_factory=list)
+
+
 class ExecutionClaimResult(BaseModel):
     outcome: ExecutionOutcome
     execution: WorkflowExecutionRecord
@@ -421,6 +430,14 @@ class WorkflowStore(Protocol):
         *,
         after_sequence: int = 0,
     ) -> list[WorkflowEvent]:
+        ...
+
+    def read_run_snapshot(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> WorkflowRunSnapshot:
         ...
 
 
@@ -2059,6 +2076,67 @@ class SQLiteWorkflowStore:
             )
             for row in rows
         ]
+
+    def read_run_snapshot(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+    ) -> WorkflowRunSnapshot:
+        """Read all Action projection facts from one SQLite snapshot.
+
+        External-action and parent-step finalization is one write transaction.
+        A projector that reads those tables through separate connections can
+        nevertheless combine a pre-commit step with a post-commit ledger row.
+        An explicit read transaction keeps the compound view coherent.
+        """
+
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            execution_row = connection.execute(
+                "SELECT * FROM workflow_executions WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            step_rows = connection.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+            action_rows = connection.execute(
+                "SELECT * FROM external_actions WHERE run_id = ? ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+            event_rows = connection.execute(
+                """
+                SELECT * FROM workflow_events
+                WHERE run_id = ? AND sequence > ?
+                ORDER BY sequence
+                """,
+                (run_id, after_sequence),
+            ).fetchall()
+            connection.commit()
+
+        return WorkflowRunSnapshot(
+            execution=(
+                self._row_to_execution(execution_row)
+                if execution_row is not None
+                else None
+            ),
+            steps=[self._row_to_step(row) for row in step_rows],
+            external_actions=[
+                self._row_to_external_action(row) for row in action_rows
+            ],
+            events=[
+                WorkflowEvent(
+                    event_id=row["event_id"],
+                    run_id=row["run_id"],
+                    sequence=row["sequence"],
+                    event_type=row["event_type"],
+                    payload=json.loads(row["payload_json"]),
+                    created_at=row["created_at"],
+                )
+                for row in event_rows
+            ],
+        )
 
     @staticmethod
     def _append_event_with_connection(
