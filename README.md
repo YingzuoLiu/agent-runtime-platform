@@ -771,11 +771,11 @@ platform.
   reconciliation for unknown external-action outcomes.
 
 Phase 7C is the current developer-integration milestone. It implements a deliberately narrow
-trusted domain/runtime extension seam for deployment-owned code and proves it with the optional offline
-incident-triage package. It does not claim runtime installation of OpenClaw plugins or untrusted
-extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls, a live
-read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain possible
-follow-up slices rather than prerequisites for the runtime demonstrated here.
+trusted domain/runtime extension seam for deployment-owned code and proves it with the optional
+offline incident-triage package. It does not claim runtime installation of OpenClaw plugins or
+untrusted extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls,
+a live read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain
+possible follow-up slices rather than prerequisites for the runtime demonstrated here.
 
 ## License
 
