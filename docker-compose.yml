@@ -1,9 +1,42 @@
 # LOCAL DEMO ONLY — unauthenticated Operator session on 127.0.0.1. Do not deploy.
 services:
-  runtime:
+  demo-provider:
     build: .
+    command:
+      - uvicorn
+      - demo_provider.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8100"
+      - --no-access-log
+    # This sidecar owns the shared network namespace, so it publishes both its
+    # control port and the Runtime's port. The Runtime must not declare ports.
     ports:
       - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8100:8100"
+    volumes:
+      - provider-data:/app/provider_data
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      start_period: 2s
+      retries: 15
+
+  runtime:
+    build: .
+    depends_on:
+      demo-provider:
+        condition: service_healthy
+    network_mode: service:demo-provider
     environment:
       RUNTIME_DB_PATH: /app/runtime_data/runtime.db
       RUNTIME_WORKER_COUNT: "1"
@@ -11,7 +44,20 @@ services:
       RUNTIME_DEMO_MODE: "true"
     volumes:
       - runtime-data:/app/runtime_data
-    restart: unless-stopped
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      start_period: 2s
+      retries: 15
 
 volumes:
+  provider-data:
   runtime-data:

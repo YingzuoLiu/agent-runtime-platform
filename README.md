@@ -743,10 +743,11 @@ are not on the cloud-runtime request path.
 Run the same static and behavioral gates used by GitHub Actions:
 
 ```bash
-python -m compileall agent api runtime_service domains examples
-ruff check agent api runtime_service tests domains examples
+python -m compileall agent api demo_provider runtime_service domains examples
+ruff check agent api demo_provider runtime_service tests domains examples
 mypy
 pytest -q
+docker compose config --quiet
 ```
 
 The full suite covers typed reduction and validation, golden traces, review evidence, multi-turn
