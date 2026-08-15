@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,8 @@ from runtime_service import (
     RunEvent,
     RunRecord,
     RuntimeManager,
+    RuntimeExtension,
+    RuntimeExtensionContext,
     RuntimePermission,
     SQLiteMemoryStore,
     SQLiteRunStore,
@@ -121,12 +124,14 @@ def create_app(
     travel_action_provider: ExternalActionProvider | None = None,
     demo_mode: bool | None = None,
     demo_api_key: str | None = None,
+    runtime_extensions: Sequence[RuntimeExtension] = (),
 ) -> FastAPI:
     database_value = database_path
     if database_value is None:
         database_value = os.getenv("RUNTIME_DB_PATH") or "runtime_data/runtime.db"
     resolved_database_path = Path(database_value)
     resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
+    resolved_runtime_extensions = tuple(runtime_extensions)
     resolved_demo_mode = resolve_demo_mode(demo_mode)
     demo_session: DemoSession | None = None
     if resolved_demo_mode:
@@ -266,6 +271,13 @@ def create_app(
                 )
             ),
         )
+        extension_context = RuntimeExtensionContext(
+            registry=registry,
+            workflow_store=workflow_store,
+            run_event_sink=store,
+        )
+        for extension in resolved_runtime_extensions:
+            extension.register(extension_context)
         store.bind_state_registry(registry)
         manager = RuntimeManager(
             store=store,

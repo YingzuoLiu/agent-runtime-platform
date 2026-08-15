@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -124,8 +125,20 @@ class SQLiteTripHoldProvider:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        connection.execute("PRAGMA busy_timeout=30000")
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                return connection
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    connection.close()
+                    raise
+                # SQLite may return SQLITE_BUSY immediately while another first-open
+                # connection is switching the same file into WAL mode. Retrying here
+                # preserves the cross-instance BEGIN IMMEDIATE contract below.
+                time.sleep(0.01)
 
     def _initialize(self) -> str:
         with self._lock, self._connect() as connection:

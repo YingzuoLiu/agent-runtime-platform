@@ -28,6 +28,7 @@ from .external_actions import (
     ExternalActionProviderResult,
     ExternalActionRequest,
 )
+from .extensions import RuntimeExtension, RuntimeExtensionContext
 from .http_external_action import HttpExternalActionProvider
 from .manager import ReferencedRunNotFoundError, RuntimeManager
 from .memory import (
@@ -126,6 +127,8 @@ __all__ = [
     "RunStatus",
     "RetrievedMemory",
     "RuntimeManager",
+    "RuntimeExtension",
+    "RuntimeExtensionContext",
     "RoleAuthorizer",
     "RuntimePermission",
     "RuntimeRole",

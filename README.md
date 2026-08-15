@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)
-![Status](https://img.shields.io/badge/status-Phase%207B%20complete-2ea44f)
+![Status](https://img.shields.io/badge/status-Phase%207C%20complete-2ea44f)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Many Agent projects focus on deciding what the Agent should do next. This project focuses on what
@@ -14,7 +14,8 @@ validation, and evidence of what actually happened.
 
 Travel is the main reference application, not the product boundary. A separate
 `release-validation` domain exercises the same runtime through a deterministic DAG and selective
-replay.
+replay. Trusted deployment-time extensions can register additional typed domains without editing
+Runtime Core; Phase 7C includes an opt-in synthetic incident-triage proof.
 
 ## Why an Agent Runtime?
 
@@ -144,7 +145,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Security | Fail-closed API-key auth, tenant isolation, Viewer/Operator RBAC, registered-tool sandboxing | [`runtime_service/auth.py`](runtime_service/auth.py), [`docs/cloud-runtime.md`](docs/cloud-runtime.md) |
 | Memory | Subject-scoped versioned preferences, sealed run snapshots, audit events, and operational forgetting | [`docs/governed-memory.md`](docs/governed-memory.md) |
-| Domains | Five Travel runtime versions plus fixed-order and DAG release-validation versions | [`runtime_service/registry.py`](runtime_service/registry.py) |
+| Domains | Five Travel versions, two release-validation versions, and an opt-in trusted extension seam | [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md) |
 | Evidence | Workflow-first projection for Planner, policy, tool, action, and loop-outcome evidence; manager recovery events remain direct | [`runtime_service/evidence.py`](runtime_service/evidence.py), [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
 | Product surface | Local Runtime Console over the same authenticated Run and Event APIs | [`api/demo_assets`](api/demo_assets), [`tests/test_demo_console.py`](tests/test_demo_console.py) |
 | Verification | Full suite; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
@@ -253,6 +254,7 @@ flowchart TB
     M --> S[(SQLite runs, events, checkpoints)]
     M --> T[Travel runtimes]
     M --> R[Release-validation runtimes]
+    M --> U[Trusted opt-in domains]
     T --> X[Governed memory]
     X --> Q[(SQLite memories and run snapshots)]
     T --> L[DynamicToolLoop]
@@ -404,11 +406,36 @@ The release-validation domain is independent of Travel. Its manifests, artifacts
 records, and tool results are synthetic fixtures. Scheduling is intentionally serial; no parallel
 execution claim is made.
 
+### Bring your own Agent / Domain
+
+`create_app(runtime_extensions=(extension,))` is a trusted, deployment-time registration seam. An
+extension can provide its own strict input/state models, version-pinned Runtime factory, Planner,
+private tool registry, and final evidence validator while reusing the same authenticated
+`POST /runs`, Run/Event persistence, checkpointing, and recovery lifecycle.
+
+The executable [`incident-triage:1.0.0` reference](docs/bring-your-own-domain.md) is deliberately
+opt-in and fully offline. It inspects one deterministic synthetic signal and produces a
+recommendation with `action_executed=false`; submitted signal claims are checked against a
+server-owned fixture, while unsupported services, fabricated finishes, and an attempted
+unregistered rollback tool fail closed. It is not loaded by the default Travel demo.
+
+Start the custom composition after configuring a normal Operator API key:
+
+```bash
+uvicorn examples.incident_triage_app:app --host 127.0.0.1 --port 8000
+```
+
+This seam does not discover or sandbox arbitrary third-party code, install OpenClaw plugins, or
+automatically add memory, external actions, or human approval. See the guide for the exact
+contract, PowerShell walkthrough, API payload, versioning rules, and Guardian relationship.
+
 ## Reliability and safety properties
 
 ### Typed state and visible failure
 
 - Pydantic input, state, tool-argument, and Planner-decision contracts;
+- registered state-model and `thread_id` revalidation at Runtime input/output boundaries before
+  checkpoint persistence;
 - explicit `StatePatch` transitions and deterministic nested-state reduction;
 - strict rejection of unknown or cross-domain state fields;
 - stable failure codes for invalid tools, arguments, permission, timeout, handler failure, step
@@ -424,6 +451,8 @@ execution claim is made.
 - exact Agent-version pinning;
 - atomic cancellation/completion guard;
 - startup recovery for queued and running work;
+- startup preflight that preserves recoverable work when a pinned Agent version or state schema is
+  not registered;
 - exclusive step claims and attempt-token protection;
 - immutable selective-replay child runs with typed source and step lineage;
 - replay of indexed Planner decisions and reuse of completed tool results;
@@ -608,6 +637,7 @@ input signatures still match; the source run is never mutated.
 | Path | Why it matters |
 | --- | --- |
 | [`runtime_service/dynamic_loop.py`](runtime_service/dynamic_loop.py) | Domain-neutral Planner/policy/tool state machine and recovery logic |
+| [`runtime_service/extensions.py`](runtime_service/extensions.py) | Trusted deployment-time registration contract and shared extension context |
 | [`runtime_service/external_actions.py`](runtime_service/external_actions.py) | Provider contracts, registry, and sanitized dispatch boundary |
 | [`runtime_service/http_external_action.py`](runtime_service/http_external_action.py) | Optional server-configured JSON-over-HTTP provider adapter |
 | [`runtime_service/manager.py`](runtime_service/manager.py) | Durable run lifecycle, worker queue, cancellation, and restart handoff |
@@ -618,6 +648,8 @@ input signatures still match; the source run is never mutated.
 | [`domains/travel/tools/trip_hold_provider.py`](domains/travel/tools/trip_hold_provider.py) | Deterministic provider-side SQLite test double |
 | [`domains/travel/memory.py`](domains/travel/memory.py) | Allowlisted extraction and typed Travel preference mapping |
 | [`domains/release_validation/runtime.py`](domains/release_validation/runtime.py) | Independent DAG workflow and selective replay adapter |
+| [`domains/incident_triage/extension.py`](domains/incident_triage/extension.py) | Opt-in non-Travel extension composition and version registration |
+| [`tests/test_bring_your_own_domain.py`](tests/test_bring_your_own_domain.py) | Same-API, persisted-evidence, allowlist, and validation proofs for Phase 7C |
 | [`tests/test_execution_authority.py`](tests/test_execution_authority.py) | Trusted authority, restart, tampering, and idempotent-resubmission proofs |
 
 ## Documentation map
@@ -634,6 +666,8 @@ input signatures still match; the source run is never mutated.
   selective replay, identity hashing, retry, and interrupted recovery;
 - [`docs/evidence-review-workflow.md`](docs/evidence-review-workflow.md): review contracts,
   partial results, local replanning, and semantic-analyzer boundary;
+- [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md): trusted extension seam,
+  executable incident-triage reference, API walkthrough, and version/recovery rules;
 - [`FINDINGS.md`](FINDINGS.md): evaluation methodology and behavioral findings;
 - [`docs/sample_trace.md`](docs/sample_trace.md): an annotated application-runtime trace.
 
@@ -645,8 +679,8 @@ are not on the cloud-runtime request path.
 Run the same static and behavioral gates used by GitHub Actions:
 
 ```bash
-python -m compileall agent api runtime_service domains
-ruff check agent api runtime_service tests domains
+python -m compileall agent api runtime_service domains examples
+ruff check agent api runtime_service tests domains examples
 mypy
 pytest -q
 ```
@@ -668,6 +702,11 @@ HTTP-boundary sanitization, and action-event REST/SSE parity.
 Phase 7B covers demo-route isolation, ephemeral local credentials, direct submission through the
 existing Run API, validated result rendering inputs, and equality between API-visible and persisted
 Runtime evidence.
+Phase 7C covers opt-in registration without Core edits, strict custom input/state contracts, a
+second dynamic non-Travel domain through the existing API, exact API/persisted event equality,
+private-tool allowlisting, evidence-gated finish, unknown-tool zero execution, checkpoint schema
+round-trip, missing-extension recovery preflight, and fail-closed Runtime state/thread validation
+before persistence.
 
 GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
 
@@ -705,11 +744,15 @@ platform.
 
 - SQLite rather than PostgreSQL, and an in-process queue rather than distributed workers;
 - no worker lease, heartbeat, quota, token accounting, key rotation, or external secret manager;
+- no per-thread lease or checkpoint revision CAS; callers must serialize Runs for one
+  tenant-qualified thread;
 - only two static roles, with no custom or per-Agent/per-tool grants;
 - process isolation rather than a container, gVisor, or microVM sandbox;
 - no arbitrary user-code or untrusted third-party MCP execution;
+- trusted extensions are explicit startup composition only, with no discovery, hot loading,
+  package marketplace, or plugin installation lifecycle;
 - serial DAG and dynamic-tool scheduling;
-- synthetic Travel and release-validation data;
+- synthetic Travel, release-validation, and incident-triage data;
 - no real flight, hotel, booking, payment, or inventory integration and no official vendor
   sandbox claim;
 - the optional HTTP provider is a configurable transport boundary, not a validated live Travel
@@ -723,9 +766,10 @@ platform.
 - no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
   reconciliation for unknown external-action outcomes.
 
-Phase 7B is the current portfolio product-surface milestone. A Bring Your Own Agent / Domain guide
-is planned as a separate phase after the real extension seam is validated; it is not implemented or
-claimed here. Human approval, semantic memory retrieval, bounded parallel read-only calls, a live
+Phase 7C is the current developer-integration milestone. It implements a deliberately narrow Bring
+Your Own Agent / Domain seam for trusted deployment code and proves it with the optional offline
+incident-triage package. It does not claim runtime installation of OpenClaw plugins or untrusted
+extensions. Human approval, semantic memory retrieval, bounded parallel read-only calls, a live
 read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation remain possible
 follow-up slices rather than prerequisites for the runtime demonstrated here.
 
