@@ -333,6 +333,7 @@ def test_compose_enables_loopback_demo_with_independent_provider(tmp_path, monke
     assert '"127.0.0.1:8100:8100"' in provider_service
     assert "demo_provider.app:app" in provider_service
     assert "--no-access-log" in provider_service
+    assert "DEMO_PROVIDER_DB_PATH: /app/provider_data/provider.db" in provider_service
     assert "provider-data:/app/provider_data" in provider_service
     assert "http://127.0.0.1:8100/health" in provider_service
     assert 'restart: "no"' in provider_service
@@ -342,6 +343,13 @@ def test_compose_enables_loopback_demo_with_independent_provider(tmp_path, monke
     assert "http://127.0.0.1:8000/health" in runtime_service
     assert "runtime-data:/app/runtime_data" in runtime_service
     assert 'RUNTIME_DEMO_MODE: "true"' in runtime_service
+    assert "RUNTIME_ACTION_PROVIDERS_JSON" in runtime_service
+    assert '"safe-retry"' in runtime_service
+    assert '"unsafe-no-retry"' in runtime_service
+    assert '"endpoint": "http://127.0.0.1:8100/actions/idempotent"' in runtime_service
+    assert '"endpoint": "http://127.0.0.1:8100/actions/unsafe"' in runtime_service
+    assert '"supports_idempotency": true' in runtime_service
+    assert '"supports_idempotency": false' in runtime_service
     assert 'restart: "no"' in runtime_service
     assert "provider-data:" in named_volumes
     assert "runtime-data:" in named_volumes
