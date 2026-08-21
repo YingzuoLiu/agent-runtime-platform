@@ -23,6 +23,19 @@ class RunStatus(str, Enum):
         return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
 
 
+class RunLeaseRecoveryReason(str, Enum):
+    LEASE_EXPIRED = "lease_expired"
+    LEGACY_UNLEASED = "legacy_unleased"
+
+
+class RunCommitOutcome(str, Enum):
+    COMMITTED = "committed"
+    CANCEL_REQUESTED = "cancel_requested"
+    LEASE_LOST = "lease_lost"
+    ALREADY_TERMINAL = "already_terminal"
+    NOT_ELIGIBLE = "not_eligible"
+
+
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,6 +85,10 @@ class RunRecord(BaseModel):
     updated_at: str = Field(default_factory=utc_now)
     started_at: str | None = None
     completed_at: str | None = None
+    lease_owner_id: str | None = Field(default=None, exclude=True, repr=False)
+    lease_token: str | None = Field(default=None, exclude=True, repr=False)
+    lease_heartbeat_at: int | None = Field(default=None, exclude=True, repr=False)
+    lease_expires_at: int | None = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")
     def normalize_legacy_message(self) -> "RunRecord":
@@ -80,6 +97,17 @@ class RunRecord(BaseModel):
         if self.input is None:
             self.input = {"user_message": self.input_message}
         return self
+
+
+class RunLeaseClaim(BaseModel):
+    """Internal proof that one Manager currently owns a Run attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run: RunRecord
+    owner_id: str = Field(..., min_length=1, exclude=True, repr=False)
+    lease_token: str = Field(..., min_length=1, exclude=True, repr=False)
+    recovery_reason: RunLeaseRecoveryReason | None = None
 
 
 class RunEvent(BaseModel):

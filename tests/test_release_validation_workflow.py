@@ -829,9 +829,22 @@ def test_finalize_cas_miss_does_not_return_a_stale_ready_result(tmp_path):
 
     original_finalize_ready = store.finalize_ready
 
-    def racing_finalize_ready(run_id: str, result_json: str):
-        store.finalize_failed(run_id, error_code="raced_by_another_caller")
-        return original_finalize_ready(run_id, result_json)
+    def racing_finalize_ready(
+        run_id: str,
+        result_json: str,
+        *,
+        lease_token: str | None = None,
+    ):
+        store.finalize_failed(
+            run_id,
+            error_code="raced_by_another_caller",
+            lease_token=lease_token,
+        )
+        return original_finalize_ready(
+            run_id,
+            result_json,
+            lease_token=lease_token,
+        )
 
     store.finalize_ready = racing_finalize_ready  # type: ignore[method-assign]
 

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from agent.contracts import utc_now
 from .sandbox import ToolRetryMode
+from .store import RunLeaseLostError
 
 
 class WorkflowStatus(str, Enum):
@@ -230,19 +231,28 @@ class WorkflowStore(Protocol):
         run_id: str,
         workflow_type: str,
         input_hash: str,
+        *,
+        lease_token: str | None = None,
     ) -> ExecutionClaimResult:
         ...
 
     def get_execution(self, run_id: str) -> WorkflowExecutionRecord | None:
         ...
 
-    def mark_running(self, run_id: str) -> WorkflowExecutionRecord:
+    def mark_running(
+        self,
+        run_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> WorkflowExecutionRecord:
         ...
 
     def finalize_ready(
         self,
         run_id: str,
         result_json: str,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowExecutionRecord:
         ...
 
@@ -251,6 +261,8 @@ class WorkflowStore(Protocol):
         run_id: str,
         result_json: str,
         error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowExecutionRecord:
         ...
 
@@ -258,6 +270,8 @@ class WorkflowStore(Protocol):
         self,
         run_id: str,
         error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowExecutionRecord:
         ...
 
@@ -268,6 +282,8 @@ class WorkflowStore(Protocol):
         step_id: str,
         tool_name: str,
         input_hash: str,
+        *,
+        lease_token: str | None = None,
     ) -> StepReuseResult:
         ...
 
@@ -279,6 +295,7 @@ class WorkflowStore(Protocol):
         input_hash: str,
         *,
         max_attempts: int,
+        lease_token: str | None = None,
     ) -> ClaimResult:
         ...
 
@@ -288,6 +305,8 @@ class WorkflowStore(Protocol):
         step_id: str,
         attempt_token: str,
         result_json: str,
+        *,
+        lease_token: str | None = None,
     ) -> ToolCallRecord:
         ...
 
@@ -297,6 +316,8 @@ class WorkflowStore(Protocol):
         step_id: str,
         attempt_token: str,
         error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> ToolCallRecord:
         ...
 
@@ -304,6 +325,8 @@ class WorkflowStore(Protocol):
         self,
         run_id: str,
         step_id: str,
+        *,
+        lease_token: str | None = None,
     ) -> ToolCallRecord:
         ...
 
@@ -333,6 +356,7 @@ class WorkflowStore(Protocol):
         arguments_json: str,
         retry_mode: ExternalActionRetryMode | str,
         idempotency_key: str,
+        lease_token: str | None = None,
     ) -> ExternalActionPrepareResult:
         ...
 
@@ -342,6 +366,7 @@ class WorkflowStore(Protocol):
         step_id: str,
         *,
         tool_attempt_token: str,
+        lease_token: str | None = None,
     ) -> ExternalActionDispatchResult:
         ...
 
@@ -352,6 +377,7 @@ class WorkflowStore(Protocol):
         *,
         previous_dispatch_token: str,
         tool_attempt_token: str,
+        lease_token: str | None = None,
     ) -> ExternalActionDispatchResult:
         ...
 
@@ -392,6 +418,19 @@ class WorkflowStore(Protocol):
     ) -> ExternalActionRecord:
         ...
 
+    def finalize_external_action_reconciliation_unknown(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+        lease_token: str | None = None,
+    ) -> ExternalActionRecord:
+        ...
+
     def finalize_unsafe_interrupted_action(
         self,
         run_id: str,
@@ -400,6 +439,7 @@ class WorkflowStore(Protocol):
         dispatch_token: str,
         tool_attempt_token: str,
         error_code: str = "external_action_outcome_unknown",
+        lease_token: str | None = None,
     ) -> ExternalActionRecord:
         ...
 
@@ -421,6 +461,8 @@ class WorkflowStore(Protocol):
         run_id: str,
         event_type: str,
         payload: dict[str, Any] | None = None,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowEvent:
         ...
 
@@ -555,7 +597,12 @@ class SQLiteWorkflowStore:
     # ---- execution-level ----
 
     def create_or_get_execution(
-        self, run_id: str, workflow_type: str, input_hash: str
+        self,
+        run_id: str,
+        workflow_type: str,
+        input_hash: str,
+        *,
+        lease_token: str | None = None,
     ) -> ExecutionClaimResult:
         """Create-or-get with explicit identity-mismatch reporting.
 
@@ -567,6 +614,12 @@ class SQLiteWorkflowStore:
         """
         now = utc_now()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             existing = connection.execute(
                 "SELECT * FROM workflow_executions WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -616,9 +669,20 @@ class SQLiteWorkflowStore:
             ).fetchone()
         return self._row_to_execution(row) if row else None
 
-    def mark_running(self, run_id: str) -> WorkflowExecutionRecord:
+    def mark_running(
+        self,
+        run_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> WorkflowExecutionRecord:
         now = utc_now()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             cursor = connection.execute(
                 """
                 UPDATE workflow_executions SET status = ?, updated_at = ?
@@ -635,17 +699,29 @@ class SQLiteWorkflowStore:
                 self._append_event_with_connection(connection, run_id, "workflow.started", {})
         return self._row_to_execution(row)
 
-    def finalize_ready(self, run_id: str, result_json: str) -> WorkflowExecutionRecord:
+    def finalize_ready(
+        self,
+        run_id: str,
+        result_json: str,
+        *,
+        lease_token: str | None = None,
+    ) -> WorkflowExecutionRecord:
         return self._finalize_execution(
             run_id,
             WorkflowStatus.READY,
             result_json=result_json,
             error_code=None,
             event_type="workflow.ready",
+            lease_token=lease_token,
         )
 
     def finalize_blocked(
-        self, run_id: str, result_json: str, error_code: str
+        self,
+        run_id: str,
+        result_json: str,
+        error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowExecutionRecord:
         return self._finalize_execution(
             run_id,
@@ -653,15 +729,23 @@ class SQLiteWorkflowStore:
             result_json=result_json,
             error_code=error_code,
             event_type="workflow.blocked",
+            lease_token=lease_token,
         )
 
-    def finalize_failed(self, run_id: str, error_code: str) -> WorkflowExecutionRecord:
+    def finalize_failed(
+        self,
+        run_id: str,
+        error_code: str,
+        *,
+        lease_token: str | None = None,
+    ) -> WorkflowExecutionRecord:
         return self._finalize_execution(
             run_id,
             WorkflowStatus.FAILED,
             result_json=None,
             error_code=error_code,
             event_type="workflow.failed",
+            lease_token=lease_token,
         )
 
     def _finalize_execution(
@@ -672,10 +756,11 @@ class SQLiteWorkflowStore:
         result_json: str | None,
         error_code: str | None,
         event_type: str,
+        lease_token: str | None,
     ) -> WorkflowExecutionRecord:
         """Atomically transition a RUNNING execution to a terminal status.
 
-        Same compare-and-set discipline as `SQLiteRunStore.finalize_completed_run`:
+        Same compare-and-set discipline as `SQLiteRunStore.commit_completed_run`:
         the eligibility check (`status = 'running'`) and the terminal
         transition are the same UPDATE, and the describing event commits in
         the same transaction, so a reader can never observe the new status
@@ -684,6 +769,12 @@ class SQLiteWorkflowStore:
         """
         now = utc_now()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             cursor = connection.execute(
                 """
                 UPDATE workflow_executions SET
@@ -720,6 +811,8 @@ class SQLiteWorkflowStore:
         step_id: str,
         tool_name: str,
         input_hash: str,
+        *,
+        lease_token: str | None = None,
     ) -> StepReuseResult:
         """Copy compatible completed evidence into a different execution.
 
@@ -737,6 +830,11 @@ class SQLiteWorkflowStore:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                target_run_id,
+                lease_token=lease_token,
+            )
 
             source_execution_row = connection.execute(
                 "SELECT * FROM workflow_executions WHERE run_id = ?", (source_run_id,)
@@ -883,6 +981,7 @@ class SQLiteWorkflowStore:
         input_hash: str,
         *,
         max_attempts: int,
+        lease_token: str | None = None,
     ) -> ClaimResult:
         """Exclusively claim a step for execution.
 
@@ -904,6 +1003,11 @@ class SQLiteWorkflowStore:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
 
             execution_row = connection.execute(
                 "SELECT run_id FROM workflow_executions WHERE run_id = ?",
@@ -1095,7 +1199,13 @@ class SQLiteWorkflowStore:
         )
 
     def complete_step(
-        self, run_id: str, step_id: str, attempt_token: str, result_json: str
+        self,
+        run_id: str,
+        step_id: str,
+        attempt_token: str,
+        result_json: str,
+        *,
+        lease_token: str | None = None,
     ) -> ToolCallRecord:
         return self._finalize_step(
             run_id,
@@ -1106,10 +1216,17 @@ class SQLiteWorkflowStore:
             error_code=None,
             event_type="step.completed",
             outcome="completed",
+            lease_token=lease_token,
         )
 
     def fail_step(
-        self, run_id: str, step_id: str, attempt_token: str, error_code: str
+        self,
+        run_id: str,
+        step_id: str,
+        attempt_token: str,
+        error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> ToolCallRecord:
         return self._finalize_step(
             run_id,
@@ -1120,6 +1237,7 @@ class SQLiteWorkflowStore:
             error_code=error_code,
             event_type="step.failed",
             outcome="failed",
+            lease_token=lease_token,
         )
 
     def _finalize_step(
@@ -1133,9 +1251,16 @@ class SQLiteWorkflowStore:
         error_code: str | None,
         event_type: str,
         outcome: str,
+        lease_token: str | None,
     ) -> ToolCallRecord:
         now = utc_now()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             cursor = connection.execute(
                 """
                 UPDATE tool_calls SET
@@ -1182,7 +1307,13 @@ class SQLiteWorkflowStore:
             )
         return record
 
-    def recover_interrupted_step(self, run_id: str, step_id: str) -> ToolCallRecord:
+    def recover_interrupted_step(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> ToolCallRecord:
         """Explicitly declare a RUNNING step abandoned.
 
         Never invoked automatically by `claim_step`: a caller must decide,
@@ -1194,6 +1325,12 @@ class SQLiteWorkflowStore:
         """
         now = utc_now()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             cursor = connection.execute(
                 """
                 UPDATE tool_calls SET status = ?, error_code = ?, updated_at = ?
@@ -1254,6 +1391,7 @@ class SQLiteWorkflowStore:
         arguments_json: str,
         retry_mode: ExternalActionRetryMode | str,
         idempotency_key: str,
+        lease_token: str | None = None,
     ) -> ExternalActionPrepareResult:
         """Persist an exact external-write intent before provider dispatch.
 
@@ -1299,6 +1437,11 @@ class SQLiteWorkflowStore:
 
         connection = self._immediate_connection()
         try:
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             run_row = connection.execute(
                 """
                 SELECT tenant_id, execution_authority_json
@@ -1463,11 +1606,17 @@ class SQLiteWorkflowStore:
         step_id: str,
         *,
         tool_attempt_token: str,
+        lease_token: str | None = None,
     ) -> ExternalActionDispatchResult:
         """Claim a PREPARED action for its first provider dispatch."""
 
         connection = self._immediate_connection()
         try:
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             row = self._require_external_action_row(connection, run_id, step_id)
             action = self._row_to_external_action(row)
             if action.status.is_terminal:
@@ -1547,11 +1696,17 @@ class SQLiteWorkflowStore:
         *,
         previous_dispatch_token: str,
         tool_attempt_token: str,
+        lease_token: str | None = None,
     ) -> ExternalActionDispatchResult:
         """Rotate the dispatch token for a safely retryable in-flight action."""
 
         connection = self._immediate_connection()
         try:
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             row = self._require_external_action_row(connection, run_id, step_id)
             action = self._row_to_external_action(row)
             if action.status.is_terminal:
@@ -1690,6 +1845,38 @@ class SQLiteWorkflowStore:
             error_code=error_code,
         )
 
+    def finalize_external_action_reconciliation_unknown(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        dispatch_token: str,
+        tool_attempt_token: str,
+        error_code: str,
+        provider_reference: str | None = None,
+        lease_token: str | None = None,
+    ) -> ExternalActionRecord:
+        """Close a dispatch from current-attempt reconciliation policy.
+
+        Unlike a provider response, this is a local Runtime decision.  The
+        dispatch and tool-attempt tokens still bind the affected rows, while
+        the Run lease proves that this attempt may make the decision now.
+        """
+
+        return self._finalize_external_action(
+            run_id,
+            step_id,
+            dispatch_token=dispatch_token,
+            tool_attempt_token=tool_attempt_token,
+            action_status=ExternalActionStatus.OUTCOME_UNKNOWN,
+            tool_status=ToolCallStatus.FAILED,
+            result_json=None,
+            provider_reference=provider_reference,
+            error_code=error_code,
+            lease_token=lease_token,
+            require_run_lease=True,
+        )
+
     def finalize_unsafe_interrupted_action(
         self,
         run_id: str,
@@ -1698,6 +1885,7 @@ class SQLiteWorkflowStore:
         dispatch_token: str,
         tool_attempt_token: str,
         error_code: str = "external_action_outcome_unknown",
+        lease_token: str | None = None,
     ) -> ExternalActionRecord:
         """Fail closed after restart when an unsafe dispatch may have escaped."""
 
@@ -1712,6 +1900,8 @@ class SQLiteWorkflowStore:
             provider_reference=None,
             error_code=error_code,
             required_retry_mode=ExternalActionRetryMode.UNSAFE,
+            lease_token=lease_token,
+            require_run_lease=True,
         )
 
     def get_external_action(
@@ -1768,6 +1958,8 @@ class SQLiteWorkflowStore:
         provider_reference: str | None,
         error_code: str | None,
         required_retry_mode: ExternalActionRetryMode | None = None,
+        lease_token: str | None = None,
+        require_run_lease: bool = False,
     ) -> ExternalActionRecord:
         if action_status not in {
             ExternalActionStatus.SUCCEEDED,
@@ -1791,6 +1983,12 @@ class SQLiteWorkflowStore:
 
         connection = self._immediate_connection()
         try:
+            if require_run_lease:
+                self._assert_current_run_lease(
+                    connection,
+                    run_id,
+                    lease_token=lease_token,
+                )
             action_row = self._require_external_action_row(connection, run_id, step_id)
             action = self._row_to_external_action(action_row)
             if required_retry_mode is not None and action.retry_mode != required_retry_mode:
@@ -1943,6 +2141,64 @@ class SQLiteWorkflowStore:
         return connection
 
     @staticmethod
+    def _assert_current_run_lease(
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        lease_token: str | None,
+    ) -> None:
+        """Fence a managed workflow mutation inside its write transaction.
+
+        ``SQLiteWorkflowStore`` also supports standalone workflow ledgers used
+        without ``SQLiteRunStore``.  Such a ledger has no matching ``runs`` row
+        and therefore no Run authority to validate.  Once a matching Run row
+        exists, however, every attempt-owned mutation must prove the current,
+        unexpired token; a legacy or partially migrated row fails closed.
+        """
+
+        runs_table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'runs'
+            """
+        ).fetchone()
+        if runs_table is None:
+            if lease_token is None:
+                return
+            raise RunLeaseLostError(f"Run lease is not enforceable: {run_id}")
+
+        matching_run = connection.execute(
+            "SELECT 1 FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if matching_run is None:
+            if lease_token is None:
+                return
+            raise RunLeaseLostError(f"Run lease is not enforceable: {run_id}")
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if not {"status", "lease_token", "lease_expires_at"}.issubset(columns):
+            raise RunLeaseLostError(f"Run lease is not enforceable: {run_id}")
+
+        store_now = connection.execute(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+        ).fetchone()
+        assert store_now is not None
+        current = connection.execute(
+            """
+            SELECT 1 FROM runs
+            WHERE run_id = ? AND status = 'running' AND lease_token = ?
+                AND lease_expires_at > ?
+            """,
+            (run_id, lease_token, int(store_now[0])),
+        ).fetchone()
+        if lease_token is None or current is None:
+            raise RunLeaseLostError(f"Run lease is no longer current: {run_id}")
+
+    @staticmethod
     def _canonical_json_object(encoded: str) -> str:
         try:
             value = json.loads(encoded)
@@ -2038,7 +2294,12 @@ class SQLiteWorkflowStore:
     # ---- events ----
 
     def append_event(
-        self, run_id: str, event_type: str, payload: dict[str, Any] | None = None
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        lease_token: str | None = None,
     ) -> WorkflowEvent:
         """Append a domain-level annotation event, e.g. a cache-reuse note.
 
@@ -2053,6 +2314,12 @@ class SQLiteWorkflowStore:
         event insert applies here too.
         """
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_current_run_lease(
+                connection,
+                run_id,
+                lease_token=lease_token,
+            )
             return self._append_event_with_connection(connection, run_id, event_type, payload)
 
     def list_events(self, run_id: str, *, after_sequence: int = 0) -> list[WorkflowEvent]:

@@ -487,8 +487,11 @@ def test_missing_extension_fails_startup_without_consuming_recoverable_work(tmp_
             permissions=(RuntimePermission.TOOLS_EXECUTE.value,),
         ),
     )
-    store.create_run(run)
-    store.append_event(run.run_id, "run.queued", {"recovery_fixture": True})
+    store.create_run_with_event(
+        run,
+        event_type="run.queued",
+        payload={"recovery_fixture": True},
+    )
 
     app_without_extension = create_app(
         database_path=database_path,

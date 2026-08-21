@@ -144,6 +144,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Planning | Strict `CALL_TOOL`, `REQUEST_CLARIFICATION`, and `FINISH` decisions | [`runtime_service/dynamic_loop.py`](runtime_service/dynamic_loop.py) |
 | Policy | Fixed step-limit, allowlist, permission, and argument-schema checks before execution | [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) |
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
+| Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Action gateway | `webhook.send` façade over a private single-step domain and the existing Run lifecycle | [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md), [`examples/external_agent.py`](examples/external_agent.py) |
@@ -509,7 +510,9 @@ contract, PowerShell walkthrough, API payload, versioning rules, and Guardian re
 - idempotent submission scoped by tenant and `client_request_id`;
 - exact Agent-version pinning;
 - atomic cancellation/completion guard;
-- startup recovery for queued and running work;
+- store-authoritative Run claims with renewable leases and attempt-specific fencing tokens;
+- automatic takeover of expired or legacy-unleased running work without stealing a live attempt;
+- fenced Run, checkpoint, workflow, memory, and new external-dispatch mutations;
 - startup preflight that preserves recoverable work when a pinned Agent version or state schema is
   not registered;
 - exclusive step claims and attempt-token protection;
@@ -704,7 +707,7 @@ input signatures still match; the source run is never mutated.
 | [`runtime_service/extensions.py`](runtime_service/extensions.py) | Trusted deployment-time registration contract and shared extension context |
 | [`runtime_service/external_actions.py`](runtime_service/external_actions.py) | Provider contracts, registry, and sanitized dispatch boundary |
 | [`runtime_service/http_external_action.py`](runtime_service/http_external_action.py) | Optional server-configured JSON-over-HTTP provider adapter |
-| [`runtime_service/manager.py`](runtime_service/manager.py) | Durable run lifecycle, worker queue, cancellation, and restart handoff |
+| [`runtime_service/manager.py`](runtime_service/manager.py) | Durable Run polling, lease heartbeat/takeover, cancellation, and fenced finalization |
 | [`runtime_service/auth.py`](runtime_service/auth.py) | Principal derivation, typed permissions, and default-deny authorization |
 | [`runtime_service/memory.py`](runtime_service/memory.py) | Versioned records, audit events, sealed snapshots, and run evidence |
 | [`domains/travel/dynamic_runtime.py`](domains/travel/dynamic_runtime.py) | Reference adapter and domain-owned final validation |
@@ -724,6 +727,8 @@ input signatures still match; the source run is never mutated.
   idempotency, provider boundary, cancellation arbitration, and uncertain outcomes;
 - [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md): external-Agent Action API,
   destination configuration, HTTP envelope, bounded wait, and public evidence contract;
+- [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md): Run ownership, heartbeat,
+  exact-expiry takeover, fencing tokens, and deployment migration boundary;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
   retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
@@ -784,20 +789,26 @@ GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11
 ## Deployment boundary
 
 Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest are included.
-SQLite and the in-process queue keep the project self-contained, but they are not horizontally
-scalable.
+SQLite plus durable polling and an in-process wake signal keep the project self-contained. Multiple
+Managers sharing one local database are fenced, but this is not a multi-host or horizontally
+scalable deployment claim.
 
 Durable workflow consumers target the structural `WorkflowStore` contract, while the service
 composition root still supplies the repository's only implementation, `SQLiteWorkflowStore`.
 This separates runtime typing from SQLite without claiming that another backend already preserves
 the required cross-ledger transactions, fencing, ordering, and restart-recovery semantics.
 
+The first lease-aware deployment requires a stop-the-old-runtime boundary: stop and verify every
+pre-leasing process, run the additive migration, and then start only lease-aware binaries. Mixed
+old/new execution and mixed-version rollback are unsupported because the old Manager ignores lease
+columns. See [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md#persisted-model).
+
 Before increasing replicas, the architecture would need:
 
 ```text
 PostgreSQL runs/checkpoints/events/memories/external_actions
 + Redis, Pub/Sub, or another distributed queue
-+ worker leases and heartbeats
++ a PostgreSQL implementation of the existing lease and fencing contract
 + provider-specific reconciliation and compensation
 + OpenTelemetry traces and metrics
 + container-backed sandbox workers
@@ -813,8 +824,10 @@ Kubernetes manifest expects `RUNTIME_API_KEYS_JSON` in Secret `travel-agent-runt
 This is a completed portfolio/reference milestone, not a claim of a complete production Agent
 platform.
 
-- SQLite rather than PostgreSQL, and an in-process queue rather than distributed workers;
-- no worker lease, heartbeat, quota, token accounting, key rotation, or external secret manager;
+- SQLite rather than PostgreSQL, with durable polling plus a local wake signal rather than a
+  distributed worker queue;
+- Run leases and fencing are a single-host SQLite reference, not a distributed multi-host lease;
+- no quota, token accounting, key rotation, or external secret manager;
 - no per-thread lease or checkpoint revision CAS; callers must serialize Runs for one
   tenant-qualified thread;
 - only two static roles, with no custom or per-Agent/per-tool grants;

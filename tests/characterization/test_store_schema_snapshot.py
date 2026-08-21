@@ -13,7 +13,7 @@ from domains.travel.state import AgentState
 from runtime_service import RunRecord, RunStatus
 from runtime_service.memory import SQLiteMemoryStore
 from runtime_service.registry import build_default_registry
-from runtime_service.models import LEGACY_TENANT_ID
+from runtime_service.models import LEGACY_TENANT_ID, RunLeaseRecoveryReason
 from runtime_service.store import SQLiteRunStore
 
 EXPECTED_COLUMNS = {
@@ -41,6 +41,10 @@ EXPECTED_COLUMNS = {
         ("updated_at", "TEXT", 1, 0),
         ("started_at", "TEXT", 0, 0),
         ("completed_at", "TEXT", 0, 0),
+        ("lease_owner_id", "TEXT", 0, 0),
+        ("lease_token", "TEXT", 0, 0),
+        ("lease_heartbeat_at", "INTEGER", 0, 0),
+        ("lease_expires_at", "INTEGER", 0, 0),
     ],
     "run_events": [
         ("event_id", "INTEGER", 0, 1),
@@ -138,6 +142,24 @@ def test_expected_tables_include_runtime_and_governed_memory_tables(tmp_path):
     assert {row[0] for row in rows} == set(EXPECTED_COLUMNS)
 
 
+def test_run_claim_index_matches_lease_candidate_ordering(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    SQLiteRunStore(database_path)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        columns = [
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(idx_runs_claimable)"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
+
+    assert columns == ["status", "lease_expires_at", "created_at"]
+
+
 def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     database_path = tmp_path / "legacy.db"
     state = AgentState(thread_id="legacy-thread", destination="Tokyo")
@@ -208,6 +230,32 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
             ),
         )
         connection.execute(
+            """
+            INSERT INTO runs VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                "run_legacy_running",
+                "legacy-running-thread",
+                "travel-agent",
+                "0.3.0",
+                "running",
+                "Plan Osaka",
+                None,
+                None,
+                "[]",
+                None,
+                1,
+                0,
+                None,
+                "2026-01-02T00:00:00+00:00",
+                "2026-01-02T00:00:00+00:00",
+                "2026-01-02T00:00:00+00:00",
+                None,
+            ),
+        )
+        connection.execute(
             "INSERT INTO thread_states VALUES (?, ?, ?)",
             (
                 "legacy-thread",
@@ -224,6 +272,17 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
                 "run.completed",
                 "{}",
                 "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO run_events (run_id, sequence, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "run_legacy_running",
+                1,
+                "run.started",
+                '{"attempt": 1}',
+                "2026-01-02T00:00:00+00:00",
             ),
         )
         connection.commit()
@@ -254,6 +313,35 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     assert [event.event_type for event in store.list_events("run_legacy")] == [
         "run.completed"
     ]
+    legacy_claim = store.claim_next_run(
+        owner_id="lease-aware-manager",
+        lease_duration_seconds=30,
+    )
+    assert legacy_claim is not None
+    assert legacy_claim.run.run_id == "run_legacy_running"
+    assert legacy_claim.run.attempt == 2
+    assert legacy_claim.recovery_reason == RunLeaseRecoveryReason.LEGACY_UNLEASED
+    assert legacy_claim.run.lease_token == legacy_claim.lease_token
+    first_lease_token = legacy_claim.lease_token
+    assert store.expire_run_lease(
+        legacy_claim.run.run_id,
+        lease_token=first_lease_token,
+    )
+    replacement_claim = store.claim_next_run(
+        owner_id="replacement-manager",
+        lease_duration_seconds=30,
+    )
+    assert replacement_claim is not None
+    assert replacement_claim.run.run_id == "run_legacy_running"
+    assert replacement_claim.run.attempt == 3
+    assert replacement_claim.recovery_reason == RunLeaseRecoveryReason.LEASE_EXPIRED
+    assert replacement_claim.lease_token != first_lease_token
+    recovery_reasons = [
+        event.payload["reason"]
+        for event in store.list_events("run_legacy_running")
+        if event.event_type == "run.recovered"
+    ]
+    assert recovery_reasons == ["legacy_unleased", "lease_expired"]
     assert memory_store.list_memories(
         tenant_id=LEGACY_TENANT_ID,
         subject_id="legacy-unknown",

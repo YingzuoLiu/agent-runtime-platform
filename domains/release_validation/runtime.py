@@ -351,6 +351,7 @@ class ReleaseValidationWorkflow:
         resume_interrupted: bool = False,
         replay: SelectiveReplayRequest | None = None,
         legacy_fixed_order: bool = False,
+        lease_token: str | None = None,
     ) -> ReleaseValidationResult:
         manifest = _canonicalize_manifest(manifest)
         identity_payload = manifest.model_dump(mode="json")
@@ -360,7 +361,12 @@ class ReleaseValidationWorkflow:
                 "replay": replay.model_dump(mode="json"),
             }
         execution_hash = _stable_hash(identity_payload)
-        claim = self.store.create_or_get_execution(run_id, WORKFLOW_TYPE, execution_hash)
+        claim = self.store.create_or_get_execution(
+            run_id,
+            WORKFLOW_TYPE,
+            execution_hash,
+            lease_token=lease_token,
+        )
         if claim.outcome == ExecutionOutcome.WORKFLOW_TYPE_MISMATCH:
             raise WorkflowTypeMismatchError(
                 f"run_id {run_id!r} was previously used for workflow_type "
@@ -376,11 +382,15 @@ class ReleaseValidationWorkflow:
         # persisted record alone -- never from re-running anything.
         execution_record = claim.execution
         if execution_record.status in (WorkflowStatus.READY, WorkflowStatus.BLOCKED):
-            return self._reuse_terminal_result(run_id, execution_record)
+            return self._reuse_terminal_result(
+                run_id,
+                execution_record,
+                lease_token=lease_token,
+            )
         if execution_record.status == WorkflowStatus.FAILED:
             raise WorkflowExecutionFailedError(run_id, execution_record.error_code)
         if execution_record.status == WorkflowStatus.PENDING:
-            self.store.mark_running(run_id)
+            self.store.mark_running(run_id, lease_token=lease_token)
         # WorkflowStatus.RUNNING: fall through into the step loop, whose
         # own ALREADY_RUNNING/interrupted-recovery handling covers it.
 
@@ -424,6 +434,7 @@ class ReleaseValidationWorkflow:
                         step.step_id,
                         step.tool_name,
                         _stable_hash(arguments),
+                        lease_token=lease_token,
                     )
                     if reuse.outcome in {StepReuseOutcome.COPIED, StepReuseOutcome.EXISTING}:
                         assert reuse.step is not None and reuse.step.result_json is not None
@@ -441,6 +452,7 @@ class ReleaseValidationWorkflow:
                     step,
                     arguments,
                     resume_interrupted=resume_interrupted,
+                    lease_token=lease_token,
                 )
                 if replay is not None:
                     replayed_step_ids.add(step.step_id)
@@ -473,7 +485,10 @@ class ReleaseValidationWorkflow:
                     replay=replay_summary,
                 )
                 record = self.store.finalize_blocked(
-                    run_id, candidate.model_dump_json(), error_code="readiness_requirements_unmet"
+                    run_id,
+                    candidate.model_dump_json(),
+                    error_code="readiness_requirements_unmet",
+                    lease_token=lease_token,
                 )
             else:
                 candidate = ReleaseValidationResult(
@@ -482,9 +497,18 @@ class ReleaseValidationWorkflow:
                     findings=[],
                     replay=replay_summary,
                 )
-                record = self.store.finalize_ready(run_id, candidate.model_dump_json())
+                record = self.store.finalize_ready(
+                    run_id,
+                    candidate.model_dump_json(),
+                    lease_token=lease_token,
+                )
 
-            return self._settle_finalize(run_id, candidate, record)
+            return self._settle_finalize(
+                run_id,
+                candidate,
+                record,
+                lease_token=lease_token,
+            )
         except (
             ExecutionInputMismatchError,
             WorkflowTypeMismatchError,
@@ -497,7 +521,11 @@ class ReleaseValidationWorkflow:
             # (re-)finalized here.
             raise
         except Exception as exc:
-            record = self.store.finalize_failed(run_id, error_code=f"{type(exc).__name__}: {exc}")
+            record = self.store.finalize_failed(
+                run_id,
+                error_code=f"{type(exc).__name__}: {exc}",
+                lease_token=lease_token,
+            )
             if record.status != WorkflowStatus.FAILED:
                 # The CAS did not apply -- do not let a late failure handler
                 # override or misreport an execution that some other call
@@ -537,6 +565,8 @@ class ReleaseValidationWorkflow:
         run_id: str,
         candidate: ReleaseValidationResult,
         record: WorkflowExecutionRecord,
+        *,
+        lease_token: str | None,
     ) -> ReleaseValidationResult:
         """Reconcile what `run()` computed with what actually got persisted.
 
@@ -550,7 +580,11 @@ class ReleaseValidationWorkflow:
         if record.status.value == candidate.status.value:
             return candidate
         if record.status in (WorkflowStatus.READY, WorkflowStatus.BLOCKED):
-            return self._reuse_terminal_result(run_id, record)
+            return self._reuse_terminal_result(
+                run_id,
+                record,
+                lease_token=lease_token,
+            )
         if record.status == WorkflowStatus.FAILED:
             raise WorkflowExecutionFailedError(run_id, record.error_code)
         raise RuntimeError(
@@ -559,7 +593,11 @@ class ReleaseValidationWorkflow:
         )
 
     def _reuse_terminal_result(
-        self, run_id: str, record: WorkflowExecutionRecord
+        self,
+        run_id: str,
+        record: WorkflowExecutionRecord,
+        *,
+        lease_token: str | None,
     ) -> ReleaseValidationResult:
         if record.result_json is None:
             raise RuntimeError(
@@ -576,6 +614,7 @@ class ReleaseValidationWorkflow:
             run_id,
             "workflow.result_reused",
             {"run_id": run_id, "persisted_status": record.status.value, "outcome": "reused"},
+            lease_token=lease_token,
         )
         return result
 
@@ -586,12 +625,18 @@ class ReleaseValidationWorkflow:
         arguments: Dict[str, Any],
         *,
         resume_interrupted: bool,
+        lease_token: str | None,
     ) -> Dict[str, Any]:
         step_hash = _stable_hash(arguments)
 
         for _ in range(_STEP_LOOP_GUARD):
             claim = self.store.claim_step(
-                run_id, step.step_id, step.tool_name, step_hash, max_attempts=MAX_ATTEMPTS
+                run_id,
+                step.step_id,
+                step.tool_name,
+                step_hash,
+                max_attempts=MAX_ATTEMPTS,
+                lease_token=lease_token,
             )
 
             if claim.outcome == ClaimOutcome.CACHED:
@@ -605,6 +650,7 @@ class ReleaseValidationWorkflow:
                         "attempt_count": claim.step.attempt_count,
                         "outcome": "cached",
                     },
+                    lease_token=lease_token,
                 )
                 return json.loads(claim.step.result_json)
 
@@ -632,7 +678,11 @@ class ReleaseValidationWorkflow:
                         f"step {run_id}/{step.step_id} is already running; pass "
                         "resume_interrupted=True to explicitly recover it"
                     )
-                self.store.recover_interrupted_step(run_id, step.step_id)
+                self.store.recover_interrupted_step(
+                    run_id,
+                    step.step_id,
+                    lease_token=lease_token,
+                )
                 continue  # re-claim: the row is now FAILED(interrupted), eligible for a fresh attempt
 
             assert claim.outcome == ClaimOutcome.CLAIMED
@@ -641,12 +691,24 @@ class ReleaseValidationWorkflow:
 
             if execution.status == ToolExecutionStatus.COMPLETED:
                 result_json = json.dumps(execution.result)
-                self.store.complete_step(run_id, step.step_id, claim.attempt_token, result_json)
+                self.store.complete_step(
+                    run_id,
+                    step.step_id,
+                    claim.attempt_token,
+                    result_json,
+                    lease_token=lease_token,
+                )
                 assert execution.result is not None
                 return execution.result
 
             error_code = _step_error_code(execution.status, execution.error)
-            self.store.fail_step(run_id, step.step_id, claim.attempt_token, error_code=error_code)
+            self.store.fail_step(
+                run_id,
+                step.step_id,
+                claim.attempt_token,
+                error_code=error_code,
+                lease_token=lease_token,
+            )
 
             if self._is_transient_failure(execution):
                 continue  # re-claim: claim_step decides retry vs ATTEMPTS_EXHAUSTED
@@ -707,6 +769,7 @@ class ManagedReleaseValidationRuntime:
             ),
             replay=replay,
             legacy_fixed_order=self.legacy_fixed_order,
+            lease_token=context.lease_token,
         )
         updated_state = state.model_copy(
             update={

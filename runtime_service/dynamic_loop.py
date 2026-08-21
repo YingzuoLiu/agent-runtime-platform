@@ -162,7 +162,7 @@ class DynamicToolLoop:
             dispatcher=external_action_dispatcher,
             workflow_type=workflow_type,
             evidence_projector=self.evidence_projector,
-            fail=lambda run_id, code, detail: self._fail(run_id, code, detail),
+            fail=self._fail,
             failure_messages=lambda: self._FAILURE_MESSAGES,
             max_dispatches=lambda: self.MAX_EXTERNAL_ACTION_DISPATCHES,
         )
@@ -282,6 +282,7 @@ class DynamicToolLoop:
             context.run_id,
             self.workflow_type,
             input_hash,
+            lease_token=context.lease_token,
         )
         if claim.outcome in {
             ExecutionOutcome.INPUT_MISMATCH,
@@ -297,7 +298,7 @@ class DynamicToolLoop:
 
         execution = claim.execution
         try:
-            self._mirror_evidence(context.run_id)
+            self._mirror_evidence(context)
         except Exception:
             # At the entry recovery boundary, a terminal action may only need
             # its public evidence repaired. Preserve its stronger durable
@@ -323,7 +324,10 @@ class DynamicToolLoop:
             code = execution.error_code or "tool_execution_failed"
             raise RuntimeExecutionError(code, "Dynamic workflow previously failed.")
         if execution.status == WorkflowStatus.PENDING:
-            self.workflow_store.mark_running(context.run_id)
+            self.workflow_store.mark_running(
+                context.run_id,
+                lease_token=context.lease_token,
+            )
 
         observations = self._restore_observations(context)
 
@@ -345,7 +349,7 @@ class DynamicToolLoop:
                     observations=observations,
                 )
                 self._complete_loop(
-                    context.run_id,
+                    context,
                     result,
                     evidence_id="loop:outcome",
                     blocked_code="clarification_required",
@@ -357,13 +361,13 @@ class DynamicToolLoop:
                     evaluation = finish_evaluator(decision, observations)
                 except (InvalidPlannerDecisionError, ValidationError, ValueError) as exc:
                     self._fail(
-                        context.run_id,
+                        context,
                         "invalid_planner_decision",
                         f"FINISH payload was rejected: {type(exc).__name__}",
                     )
                 if evaluation.outcome == DynamicLoopOutcome.CLARIFICATION:
                     self._fail(
-                        context.run_id,
+                        context,
                         "invalid_planner_decision",
                         "A FINISH evaluator cannot return clarification.",
                     )
@@ -375,7 +379,7 @@ class DynamicToolLoop:
                     observations=observations,
                 )
                 self._complete_loop(
-                    context.run_id,
+                    context,
                     result,
                     evidence_id="loop:outcome",
                     blocked_code=(
@@ -416,9 +420,9 @@ class DynamicToolLoop:
         persisted = self._workflow_evidence(context.run_id, "planner.decision", evidence_id)
         if persisted is not None:
             if persisted.get("outcome") == "rejected":
-                self._ensure_run_evidence(context.run_id, "planner.decision", persisted)
+                self._ensure_run_evidence(context, "planner.decision", persisted)
                 self._fail(
-                    context.run_id,
+                    context,
                     str(persisted.get("error_code") or "invalid_planner_decision"),
                     "Persisted planner attempt was rejected.",
                 )
@@ -428,11 +432,11 @@ class DynamicToolLoop:
                 )
             except (KeyError, ValidationError) as exc:
                 self._fail(
-                    context.run_id,
+                    context,
                     "invalid_planner_decision",
                     f"Persisted planner decision is invalid: {type(exc).__name__}",
                 )
-            self._ensure_run_evidence(context.run_id, "planner.decision", persisted)
+            self._ensure_run_evidence(context, "planner.decision", persisted)
             return decision
 
         planner_context = PlannerContext(
@@ -449,37 +453,37 @@ class DynamicToolLoop:
             raw_decision = self.planner.decide(planner_context)
         except InvalidPlannerDecisionError as exc:
             self._record_planner_failure(
-                context.run_id,
+                context,
                 evidence_id,
                 decision_index,
                 "invalid_planner_decision",
             )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 f"Planner returned an invalid decision: {exc}",
             )
         except PlannerProviderError as exc:
             self._record_planner_failure(
-                context.run_id,
+                context,
                 evidence_id,
                 decision_index,
                 "planner_provider_failed",
             )
             self._fail(
-                context.run_id,
+                context,
                 "planner_provider_failed",
                 f"Planner provider failed: {exc}",
             )
         except Exception as exc:
             self._record_planner_failure(
-                context.run_id,
+                context,
                 evidence_id,
                 decision_index,
                 "planner_provider_failed",
             )
             self._fail(
-                context.run_id,
+                context,
                 "planner_provider_failed",
                 f"Planner provider failed: {type(exc).__name__}",
             )
@@ -488,13 +492,13 @@ class DynamicToolLoop:
             decision = PLANNER_DECISION_ADAPTER.validate_python(raw_decision)
         except ValidationError as exc:
             self._record_planner_failure(
-                context.run_id,
+                context,
                 evidence_id,
                 decision_index,
                 "invalid_planner_decision",
             )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 f"Planner decision failed schema validation: {exc.title}",
             )
@@ -507,7 +511,7 @@ class DynamicToolLoop:
         }
         if isinstance(decision, CallToolDecision):
             payload["step_id"] = f"call-{decision_index:04d}"
-        self._record_evidence(context.run_id, "planner.decision", payload)
+        self._record_evidence(context, "planner.decision", payload)
         return decision
 
     def _authorize_call(
@@ -526,14 +530,14 @@ class DynamicToolLoop:
         )
         if tool_call_count >= self.max_tool_calls:
             self._record_policy_denial(
-                context.run_id,
+                context,
                 evidence_id,
                 step_id,
                 decision.tool_name,
                 "step_limit_exceeded",
             )
             self._fail(
-                context.run_id,
+                context,
                 "step_limit_exceeded",
                 f"Tool-call limit {self.max_tool_calls} was exceeded.",
             )
@@ -546,14 +550,14 @@ class DynamicToolLoop:
                     action=dispatched_action,
                 )
             self._record_policy_denial(
-                context.run_id,
+                context,
                 evidence_id,
                 step_id,
                 decision.tool_name,
                 "unknown_tool",
             )
             self._fail(
-                context.run_id,
+                context,
                 "unknown_tool",
                 "Planner selected a tool outside the runtime allowlist.",
             )
@@ -565,14 +569,14 @@ class DynamicToolLoop:
                     action=dispatched_action,
                 )
             self._record_policy_denial(
-                context.run_id,
+                context,
                 evidence_id,
                 step_id,
                 decision.tool_name,
                 "tool_permission_denied",
             )
             self._fail(
-                context.run_id,
+                context,
                 "tool_permission_denied",
                 "Execution authority does not allow tool execution.",
             )
@@ -593,14 +597,14 @@ class DynamicToolLoop:
                         action=dispatched_action,
                     )
                 self._record_policy_denial(
-                    context.run_id,
+                    context,
                     evidence_id,
                     step_id,
                     decision.tool_name,
                     "external_action_permission_denied",
                 )
                 self._fail(
-                    context.run_id,
+                    context,
                     "external_action_permission_denied",
                     "Execution authority does not allow external actions.",
                 )
@@ -619,14 +623,14 @@ class DynamicToolLoop:
                         action=dispatched_action,
                     )
                 self._record_policy_denial(
-                    context.run_id,
+                    context,
                     evidence_id,
                     step_id,
                     decision.tool_name,
                     "external_action_not_requested",
                 )
                 self._fail(
-                    context.run_id,
+                    context,
                     "external_action_not_requested",
                     "External action requires an explicit runtime-input request.",
                 )
@@ -639,14 +643,14 @@ class DynamicToolLoop:
                         action=dispatched_action,
                     )
                 self._record_policy_denial(
-                    context.run_id,
+                    context,
                     evidence_id,
                     step_id,
                     decision.tool_name,
                     "external_action_not_configured",
                 )
                 self._fail(
-                    context.run_id,
+                    context,
                     "external_action_not_configured",
                     "External action provider is not configured.",
                 )
@@ -660,14 +664,14 @@ class DynamicToolLoop:
                         action=dispatched_action,
                     )
                 self._record_policy_denial(
-                    context.run_id,
+                    context,
                     evidence_id,
                     step_id,
                     decision.tool_name,
                     "external_action_idempotency_unsupported",
                 )
                 self._fail(
-                    context.run_id,
+                    context,
                     "external_action_idempotency_unsupported",
                     "External action provider does not support idempotency.",
                 )
@@ -681,14 +685,14 @@ class DynamicToolLoop:
                     action=dispatched_action,
                 )
             self._record_policy_denial(
-                context.run_id,
+                context,
                 evidence_id,
                 step_id,
                 decision.tool_name,
                 "invalid_tool_arguments",
             )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_tool_arguments",
                 "Planner supplied arguments that do not match the tool schema.",
             )
@@ -710,7 +714,7 @@ class DynamicToolLoop:
                 }
             )
         self._record_evidence(
-            context.run_id,
+            context,
             "policy.decision",
             allowed_payload,
         )
@@ -727,7 +731,7 @@ class DynamicToolLoop:
         spec = self.tool_registry.resolve(decision.tool_name)
         if spec is None:
             self._fail(
-                context.run_id,
+                context,
                 "unknown_tool",
                 "Authorized tool disappeared from the runtime allowlist.",
             )
@@ -760,20 +764,24 @@ class DynamicToolLoop:
             if existing.error_code != "interrupted":
                 code = existing.error_code or "tool_execution_failed"
                 self._record_tool_failure(
-                    context.run_id,
+                    context,
                     step_id,
                     decision.tool_name,
                     code,
                 )
-                self._fail(context.run_id, code, "Tool call previously failed.")
+                self._fail(context, code, "Tool call previously failed.")
         if existing is not None and existing.status == ToolCallStatus.RUNNING:
             if not context.recovered_after_restart:
                 self._fail(
-                    context.run_id,
+                    context,
                     "tool_execution_failed",
                     "Tool call is already running without a restart recovery boundary.",
                 )
-            self.workflow_store.recover_interrupted_step(context.run_id, step_id)
+            self.workflow_store.recover_interrupted_step(
+                context.run_id,
+                step_id,
+                lease_token=context.lease_token,
+            )
 
         claim = self.workflow_store.claim_step(
             context.run_id,
@@ -781,12 +789,13 @@ class DynamicToolLoop:
             decision.tool_name,
             input_hash,
             max_attempts=2,
+            lease_token=context.lease_token,
         )
         if claim.outcome == ClaimOutcome.CACHED:
             assert claim.step is not None and claim.step.result_json is not None
-            result = self._decode_tool_result_or_fail(context.run_id, claim.step)
+            result = self._decode_tool_result_or_fail(context, claim.step)
             self._record_tool_success(
-                context.run_id,
+                context,
                 step_id,
                 decision.tool_name,
                 result,
@@ -800,7 +809,7 @@ class DynamicToolLoop:
             )
         if claim.outcome in {ClaimOutcome.INPUT_MISMATCH, ClaimOutcome.DEFINITION_MISMATCH}:
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Persisted tool-call identity does not match the planner decision.",
             )
@@ -809,7 +818,7 @@ class DynamicToolLoop:
             ClaimOutcome.ATTEMPTS_EXHAUSTED,
         }:
             self._fail(
-                context.run_id,
+                context,
                 "tool_execution_failed",
                 f"Tool call could not be claimed: {claim.outcome.value}.",
             )
@@ -828,15 +837,16 @@ class DynamicToolLoop:
                 step_id,
                 claim.attempt_token,
                 code,
+                lease_token=context.lease_token,
             )
             self._record_tool_failure(
-                context.run_id,
+                context,
                 step_id,
                 decision.tool_name,
                 code,
             )
             self._fail(
-                context.run_id,
+                context,
                 code,
                 f"Tool executor raised {type(exc).__name__}.",
             )
@@ -848,14 +858,15 @@ class DynamicToolLoop:
                 step_id,
                 claim.attempt_token,
                 code,
+                lease_token=context.lease_token,
             )
             self._record_tool_failure(
-                context.run_id,
+                context,
                 step_id,
                 decision.tool_name,
                 code,
             )
-            self._fail(context.run_id, code, "Tool execution did not complete successfully.")
+            self._fail(context, code, "Tool execution did not complete successfully.")
 
         result = execution.result
         self.workflow_store.complete_step(
@@ -863,9 +874,10 @@ class DynamicToolLoop:
             step_id,
             claim.attempt_token,
             json.dumps(result, sort_keys=True, separators=(",", ":")),
+            lease_token=context.lease_token,
         )
         self._record_tool_success(
-            context.run_id,
+            context,
             step_id,
             decision.tool_name,
             result,
@@ -961,9 +973,9 @@ class DynamicToolLoop:
                         code="invalid_planner_decision",
                         detail="Read-only completed step unexpectedly has an external action.",
                     )
-                result = self._decode_tool_result_or_fail(context.run_id, step)
+                result = self._decode_tool_result_or_fail(context, step)
                 self._record_tool_success(
-                    context.run_id,
+                    context,
                     step.step_id,
                     step.tool_name,
                     result,
@@ -1052,24 +1064,24 @@ class DynamicToolLoop:
                     )
                 code = step.error_code or "tool_execution_failed"
                 self._record_tool_failure(
-                    context.run_id,
+                    context,
                     step.step_id,
                     step.tool_name,
                     code,
                 )
-                self._fail(context.run_id, code, "Persisted tool call failed.")
+                self._fail(context, code, "Persisted tool call failed.")
         return observations
 
     def _complete_loop(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         result: DynamicLoopResult,
         *,
         evidence_id: str,
         blocked_code: str | None,
     ) -> None:
         self._record_evidence(
-            run_id,
+            context,
             "loop.outcome",
             {
                 "evidence_id": evidence_id,
@@ -1080,20 +1092,38 @@ class DynamicToolLoop:
         )
         serialized = result.model_dump_json()
         if blocked_code is None:
-            self.workflow_store.finalize_ready(run_id, serialized)
+            self.workflow_store.finalize_ready(
+                context.run_id,
+                serialized,
+                lease_token=context.lease_token,
+            )
         else:
-            self.workflow_store.finalize_blocked(run_id, serialized, blocked_code)
+            self.workflow_store.finalize_blocked(
+                context.run_id,
+                serialized,
+                blocked_code,
+                lease_token=context.lease_token,
+            )
 
-    def _fail(self, run_id: str, code: str, _unsafe_detail: str) -> NoReturn:
+    def _fail(
+        self,
+        context: RuntimeExecutionContext,
+        code: str,
+        _unsafe_detail: str,
+    ) -> NoReturn:
         # Failure evidence is user-visible and must be identical when a crash
         # occurs after appending the outcome but before finalizing the workflow.
         # Keep provider/model details out of the ledger and treat an existing
         # failed outcome as the authority during recovery.
         message = self._FAILURE_MESSAGES.get(code, "Dynamic tool loop failed.")
-        existing = self._workflow_evidence(run_id, "loop.outcome", "loop:outcome")
+        existing = self._workflow_evidence(
+            context.run_id,
+            "loop.outcome",
+            "loop:outcome",
+        )
         if existing is None:
             self._record_evidence(
-                run_id,
+                context,
                 "loop.outcome",
                 {
                     "evidence_id": "loop:outcome",
@@ -1115,22 +1145,26 @@ class DynamicToolLoop:
                     "Durable loop failure evidence has an invalid message.",
                 )
             message = persisted_message
-            self._ensure_run_evidence(run_id, "loop.outcome", existing)
-        execution = self.workflow_store.get_execution(run_id)
+            self._ensure_run_evidence(context, "loop.outcome", existing)
+        execution = self.workflow_store.get_execution(context.run_id)
         if execution is not None and execution.status == WorkflowStatus.RUNNING:
-            self.workflow_store.finalize_failed(run_id, code)
+            self.workflow_store.finalize_failed(
+                context.run_id,
+                code,
+                lease_token=context.lease_token,
+            )
         raise RuntimeExecutionError(code, message)
 
     def _record_policy_denial(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         evidence_id: str,
         step_id: str,
         tool_name: str,
         error_code: str,
     ) -> None:
         self._record_evidence(
-            run_id,
+            context,
             "policy.decision",
             {
                 "evidence_id": evidence_id,
@@ -1143,13 +1177,13 @@ class DynamicToolLoop:
 
     def _record_planner_failure(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         evidence_id: str,
         decision_index: int,
         error_code: str,
     ) -> None:
         self._record_evidence(
-            run_id,
+            context,
             "planner.decision",
             {
                 "evidence_id": evidence_id,
@@ -1161,40 +1195,65 @@ class DynamicToolLoop:
 
     def _record_tool_success(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         step_id: str,
         tool_name: str,
         result: dict[str, Any],
     ) -> None:
-        self.evidence_projector.record_tool_success(run_id, step_id, tool_name, result)
+        self.evidence_projector.record_tool_success(
+            context.run_id,
+            step_id,
+            tool_name,
+            result,
+            lease_token=context.lease_token,
+        )
 
     def _record_tool_failure(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         step_id: str,
         tool_name: str,
         error_code: str,
     ) -> None:
-        self.evidence_projector.record_tool_failure(run_id, step_id, tool_name, error_code)
+        self.evidence_projector.record_tool_failure(
+            context.run_id,
+            step_id,
+            tool_name,
+            error_code,
+            lease_token=context.lease_token,
+        )
 
     def _record_evidence(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
-        self.evidence_projector.record(run_id, event_type, payload)
+        self.evidence_projector.record(
+            context.run_id,
+            event_type,
+            payload,
+            lease_token=context.lease_token,
+        )
 
-    def _mirror_evidence(self, run_id: str) -> None:
-        self.evidence_projector.mirror(run_id)
+    def _mirror_evidence(self, context: RuntimeExecutionContext) -> None:
+        self.evidence_projector.mirror(
+            context.run_id,
+            lease_token=context.lease_token,
+        )
 
     def _ensure_run_evidence(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
-        self.evidence_projector.ensure_run_evidence(run_id, event_type, payload)
+        self.evidence_projector.ensure_run_evidence(
+            context.run_id,
+            event_type,
+            payload,
+            lease_token=context.lease_token,
+        )
 
     def _workflow_evidence(
         self,
@@ -1222,6 +1281,7 @@ class DynamicToolLoop:
             code=code,
             detail=detail,
         )
+        raise AssertionError("external-action failure handling returned unexpectedly")
 
     def _decision_payload_for_step(
         self,
@@ -1244,13 +1304,13 @@ class DynamicToolLoop:
 
     def _decode_tool_result_or_fail(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         step: ToolCallRecord,
     ) -> dict[str, Any]:
         try:
             return self._decode_tool_result(step)
         except RuntimeExecutionError as exc:
-            self._fail(run_id, exc.code, str(exc))
+            self._fail(context, exc.code, str(exc))
 
     _stable_hash = staticmethod(stable_hash)
 

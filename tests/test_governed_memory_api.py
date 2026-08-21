@@ -389,7 +389,7 @@ def test_registered_versions_pin_legacy_and_explicit_preference_parsers(tmp_path
 def test_recovered_phase5a_run_uses_version_pinned_legacy_parser(tmp_path):
     database_path = tmp_path / "phase5a-parser-recovery.db"
     run_id = "run_phase5a_parser_recovery"
-    SQLiteRunStore(database_path).create_run(
+    SQLiteRunStore(database_path)._seed_historical_run_for_migration(
         RunRecord(
             run_id=run_id,
             tenant_id=TENANT_A,

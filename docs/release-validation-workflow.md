@@ -144,7 +144,8 @@ The validator remains a flat deterministic checklist, not a policy language.
 - The DAG is code-defined and static; clients cannot submit arbitrary graphs.
 - Scheduling is serial and deterministic, not parallel.
 - Replay creates a child run; terminal source runs are immutable.
-- There is no worker lease or heartbeat, so interrupted recovery stays explicit.
+- Run takeover requires an expired or legacy-unleased top-level Run; interrupted node recovery
+  remains explicit and every workflow mutation is fenced by the current Run token.
 - Tool choice is fixed per node; there is no planner or LLM-driven tool loop.
 - The shared API applies static Viewer/Operator authorization; custom roles,
   per-workflow grants, quotas, PostgreSQL, and external secret management remain future work.

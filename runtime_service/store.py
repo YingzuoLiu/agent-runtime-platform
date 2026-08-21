@@ -4,10 +4,23 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 from agent.contracts import BaseRuntimeState, utc_now
-from .models import LEGACY_TENANT_ID, RunEvent, RunRecord, RunStatus
+from .models import (
+    LEGACY_TENANT_ID,
+    RunCommitOutcome,
+    RunEvent,
+    RunLeaseClaim,
+    RunLeaseRecoveryReason,
+    RunRecord,
+    RunStatus,
+)
+
+
+class RunLeaseLostError(RuntimeError):
+    """Raised when an attempt-owned mutation no longer holds its Run lease."""
 
 
 class StateRegistry(Protocol):
@@ -23,16 +36,29 @@ class StateRegistry(Protocol):
 class SQLiteRunStore:
     """Durable run, event and thread-state storage backed by SQLite."""
 
+    _CONTROL_PLANE_EVENT_TYPES = frozenset(
+        {
+            "sandbox.execution_started",
+            "sandbox.execution_finished",
+        }
+    )
+
     def __init__(
         self,
         database_path: str | Path,
         *,
         state_registry: StateRegistry | None = None,
+        lease_operation_timeout_seconds: float = 1.0,
+        lease_clock_ms: Callable[[], int] | None = None,
     ) -> None:
+        if lease_operation_timeout_seconds <= 0:
+            raise ValueError("lease_operation_timeout_seconds must be positive")
         self.database_path = str(database_path)
         self._lock = threading.RLock()
         self._state_registry = state_registry
         self._state_models: dict[tuple[str, str], type[BaseRuntimeState]] = {}
+        self._lease_operation_timeout_seconds = lease_operation_timeout_seconds
+        self._lease_clock_ms = lease_clock_ms
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -41,12 +67,32 @@ class SQLiteRunStore:
             raise ValueError("SQLiteRunStore is already bound to a different state registry")
         self._state_registry = state_registry
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+    @property
+    def lease_operation_timeout_seconds(self) -> float:
+        """Maximum SQLite wait used by claim, heartbeat, and fenced commits."""
+
+        return self._lease_operation_timeout_seconds
+
+    def _connect(self, *, timeout_seconds: float = 30) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=timeout_seconds)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    def _lease_connect(self) -> sqlite3.Connection:
+        return self._connect(timeout_seconds=self._lease_operation_timeout_seconds)
+
+    def _lease_now_ms(self, connection: sqlite3.Connection) -> int:
+        """Read the lease clock from SQLite, not from a worker's wall clock."""
+
+        if self._lease_clock_ms is not None:
+            return self._lease_clock_ms()
+        row = connection.execute(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     def initialize(self) -> None:
         with self._lock, self._connect() as connection:
@@ -76,7 +122,11 @@ class SQLiteRunStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    lease_owner_id TEXT,
+                    lease_token TEXT,
+                    lease_heartbeat_at INTEGER,
+                    lease_expires_at INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS run_events (
@@ -123,6 +173,12 @@ class SQLiteRunStore:
                     "ALTER TABLE runs ADD COLUMN execution_authority_json TEXT"
                 ),
                 "error_code": "ALTER TABLE runs ADD COLUMN error_code TEXT",
+                "lease_owner_id": "ALTER TABLE runs ADD COLUMN lease_owner_id TEXT",
+                "lease_token": "ALTER TABLE runs ADD COLUMN lease_token TEXT",
+                "lease_heartbeat_at": (
+                    "ALTER TABLE runs ADD COLUMN lease_heartbeat_at INTEGER"
+                ),
+                "lease_expires_at": "ALTER TABLE runs ADD COLUMN lease_expires_at INTEGER",
             }
             for column, statement in run_migrations.items():
                 if column not in columns:
@@ -156,6 +212,8 @@ class SQLiteRunStore:
                 CREATE INDEX IF NOT EXISTS idx_runs_tenant_thread_id
                     ON runs(tenant_id, thread_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+                CREATE INDEX IF NOT EXISTS idx_runs_claimable
+                    ON runs(status, lease_expires_at, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_tenant_client_request_id
                     ON runs(tenant_id, client_request_id)
                     WHERE client_request_id IS NOT NULL;
@@ -221,7 +279,11 @@ class SQLiteRunStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 started_at TEXT,
-                completed_at TEXT
+                completed_at TEXT,
+                lease_owner_id TEXT,
+                lease_token TEXT,
+                lease_heartbeat_at INTEGER,
+                lease_expires_at INTEGER
             );
 
             INSERT INTO runs_tenant_migration (
@@ -229,14 +291,16 @@ class SQLiteRunStore:
                 domain_id, schema_version, status, input_message, input_json,
                 state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
-                updated_at, started_at, completed_at
+                updated_at, started_at, completed_at, lease_owner_id,
+                lease_token, lease_heartbeat_at, lease_expires_at
             )
             SELECT
                 run_id, tenant_id, execution_authority_json, thread_id, agent_id, agent_version,
                 domain_id, schema_version, status, input_message, input_json,
                 state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
-                updated_at, started_at, completed_at
+                updated_at, started_at, completed_at, lease_owner_id,
+                lease_token, lease_heartbeat_at, lease_expires_at
             FROM runs;
 
             DROP TABLE runs;
@@ -277,21 +341,96 @@ class SQLiteRunStore:
             connection.execute("SELECT 1").fetchone()
 
     def create_run(self, run: RunRecord) -> RunRecord:
+        self._assert_new_queued_run(run)
         with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO runs (
-                    run_id, tenant_id, execution_authority_json, thread_id, agent_id,
-                    agent_version, domain_id,
-                    schema_version, status, input_message, input_json,
-                    state_json, output_message,
-                    validation_errors_json, error_code, error, attempt, cancel_requested,
-                    client_request_id, created_at, updated_at, started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                self._run_values(run),
+            self._insert_run_with_connection(connection, run)
+        return run
+
+    def create_run_with_event(
+        self,
+        run: RunRecord,
+        *,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> RunRecord:
+        """Create a Run and its first event in one transaction."""
+
+        self._assert_new_queued_run(run)
+        if event_type != "run.queued":
+            raise ValueError("A new Run's initial event must be run.queued")
+        with self._lock, self._connect() as connection:
+            self._insert_run_with_connection(connection, run)
+            self._append_event_with_connection(
+                connection,
+                run.run_id,
+                event_type,
+                payload,
             )
         return run
+
+    @staticmethod
+    def _assert_new_queued_run(run: RunRecord) -> None:
+        lease_fields = (
+            run.lease_owner_id,
+            run.lease_token,
+            run.lease_heartbeat_at,
+            run.lease_expires_at,
+        )
+        if (
+            run.status != RunStatus.QUEUED
+            or run.attempt != 0
+            or run.cancel_requested
+            or run.started_at is not None
+            or run.completed_at is not None
+            or run.output_message is not None
+            or bool(run.validation_errors)
+            or run.error_code is not None
+            or run.error is not None
+            or any(value is not None for value in lease_fields)
+        ):
+            raise ValueError(
+                "New Runs must be pristine queued records without lease authority"
+            )
+
+    def _seed_historical_run_for_migration(
+        self,
+        run: RunRecord,
+        *,
+        event_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> RunRecord:
+        """Seed pre-leasing history for migrations and compatibility tests only."""
+
+        with self._lock, self._connect() as connection:
+            self._insert_run_with_connection(connection, run)
+            if event_type is not None:
+                self._append_event_with_connection(
+                    connection,
+                    run.run_id,
+                    event_type,
+                    payload,
+                )
+        return run
+
+    def _insert_run_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        run: RunRecord,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runs (
+                run_id, tenant_id, execution_authority_json, thread_id, agent_id,
+                agent_version, domain_id,
+                schema_version, status, input_message, input_json,
+                state_json, output_message,
+                validation_errors_json, error_code, error, attempt, cancel_requested,
+                client_request_id, created_at, updated_at, started_at, completed_at,
+                lease_owner_id, lease_token, lease_heartbeat_at, lease_expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._run_values(run),
+        )
 
     def get_run_internal(self, run_id: str) -> RunRecord | None:
         with self._connect() as connection:
@@ -320,49 +459,27 @@ class SQLiteRunStore:
             ).fetchone()
         return self._row_to_run(row) if row else None
 
-    def update_run(self, run: RunRecord) -> RunRecord:
-        run.updated_at = utc_now()
-        with self._lock, self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE runs SET
-                    execution_authority_json = ?, thread_id = ?, agent_id = ?,
-                    agent_version = ?, domain_id = ?,
-                    schema_version = ?, status = ?, input_message = ?, input_json = ?,
-                    state_json = ?, output_message = ?,
-                    validation_errors_json = ?, error_code = ?, error = ?, attempt = ?,
-                    cancel_requested = ?, client_request_id = ?, created_at = ?,
-                    updated_at = ?, started_at = ?, completed_at = ?
-                WHERE run_id = ? AND tenant_id = ?
-                """,
-                (*self._run_values(run)[2:], run.run_id, run.tenant_id),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"Run not found: {run.run_id}")
-        return run
-
-    def mark_reconciliation_pending(
+    def commit_reconciliation_pending(
         self,
         run_id: str,
         *,
         tenant_id: str,
+        lease_token: str,
         error_code: str,
         error: str,
-    ) -> RunRecord:
-        """Persist a non-terminal recovery marker without overwriting races.
-
-        In particular, this narrow UPDATE must not copy a stale
-        ``cancel_requested`` value back over a cancellation CAS that committed
-        while the worker was unwinding its runtime call.
-        """
+    ) -> RunCommitOutcome:
+        """Fence and persist a non-terminal external-action recovery marker."""
 
         updated_at = utc_now()
-        with self._lock, self._connect() as connection:
-            connection.execute(
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            cursor = connection.execute(
                 """
                 UPDATE runs SET
                     error_code = ?, error = ?, completed_at = NULL, updated_at = ?
                 WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    AND lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     error_code,
@@ -371,121 +488,310 @@ class SQLiteRunStore:
                     run_id,
                     tenant_id,
                     RunStatus.RUNNING.value,
+                    lease_token,
+                    now_ms,
                 ),
             )
-            row = connection.execute(
-                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
-                (run_id, tenant_id),
-            ).fetchone()
-        if row is None:
-            raise KeyError(f"Run not found: {run_id}")
-        return self._row_to_run(row)
+            if cursor.rowcount == 1:
+                return RunCommitOutcome.COMMITTED
+            return self._classify_commit_outcome(
+                connection,
+                run_id,
+                tenant_id=tenant_id,
+                lease_token=lease_token,
+                now_ms=now_ms,
+            )
 
-    def claim_run_start(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
-        """Atomically claim one QUEUED Run without overwriting cancellation.
+    def claim_next_run(
+        self,
+        *,
+        owner_id: str,
+        lease_duration_seconds: int,
+        reconciliation_pending_code: str | None = None,
+    ) -> RunLeaseClaim | None:
+        """Atomically claim one queued or expired Run attempt.
 
-        The narrow UPDATE preserves ``cancel_requested`` if its CAS commits
-        before or during this claim.  The returned row is read in the same
-        transaction and ``run.started`` is appended only for the winning
-        claim, so the Manager can arbitrate that latest cancellation before it
-        invokes domain code.
+        SQLite's write transaction is the arbitration point across Manager
+        processes.  The in-memory wake signal used by a Manager is never part
+        of the ownership decision.
         """
 
-        started_at = utc_now()
-        with self._lock, self._connect() as connection:
+        if not owner_id:
+            raise ValueError("owner_id must not be empty")
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds must be positive")
+
+        lease_token = f"lease_{uuid4().hex}"
+        timestamp = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            expires_at = now_ms + lease_duration_seconds * 1000
+            candidate = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE
+                    (status = ? AND cancel_requested = 0)
+                    OR (
+                        status = ?
+                        AND (
+                            lease_token IS NULL
+                            OR lease_expires_at IS NULL
+                            OR lease_expires_at <= ?
+                        )
+                    )
+                ORDER BY created_at, run_id
+                LIMIT 1
+                """,
+                (RunStatus.QUEUED.value, RunStatus.RUNNING.value, now_ms),
+            ).fetchone()
+            if candidate is None:
+                return None
+
+            was_running = candidate["status"] == RunStatus.RUNNING.value
+            recovery_reason: RunLeaseRecoveryReason | None = None
+            if was_running:
+                recovery_reason = (
+                    RunLeaseRecoveryReason.LEGACY_UNLEASED
+                    if candidate["lease_token"] is None
+                    or candidate["lease_expires_at"] is None
+                    else RunLeaseRecoveryReason.LEASE_EXPIRED
+                )
+
             cursor = connection.execute(
                 """
                 UPDATE runs SET
                     status = ?, started_at = ?, attempt = attempt + 1,
-                    updated_at = ?
-                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    error = CASE WHEN error_code = ? THEN error ELSE NULL END,
+                    error_code = CASE WHEN error_code = ? THEN error_code ELSE NULL END,
+                    updated_at = ?, lease_owner_id = ?, lease_token = ?,
+                    lease_heartbeat_at = ?, lease_expires_at = ?
+                WHERE run_id = ?
+                    AND (
+                        (status = ? AND cancel_requested = 0)
+                        OR (
+                            status = ?
+                            AND (
+                                lease_token IS NULL
+                                OR lease_expires_at IS NULL
+                                OR lease_expires_at <= ?
+                            )
+                        )
+                    )
                 """,
                 (
                     RunStatus.RUNNING.value,
-                    started_at,
-                    started_at,
-                    run_id,
-                    tenant_id,
+                    timestamp,
+                    reconciliation_pending_code,
+                    reconciliation_pending_code,
+                    timestamp,
+                    owner_id,
+                    lease_token,
+                    now_ms,
+                    expires_at,
+                    candidate["run_id"],
                     RunStatus.QUEUED.value,
+                    RunStatus.RUNNING.value,
+                    now_ms,
                 ),
             )
-            row = connection.execute(
-                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
-                (run_id, tenant_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Run not found: {run_id}")
             if cursor.rowcount != 1:
                 return None
+
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (candidate["run_id"],),
+            ).fetchone()
+            assert row is not None
             run = self._row_to_run(row)
+            if recovery_reason is not None:
+                self._append_event_with_connection(
+                    connection,
+                    run.run_id,
+                    "run.recovered",
+                    {
+                        "reason": (
+                            reconciliation_pending_code
+                            if reconciliation_pending_code is not None
+                            and candidate["error_code"] == reconciliation_pending_code
+                            else recovery_reason.value
+                        ),
+                    },
+                )
             self._append_event_with_connection(
                 connection,
-                run_id,
+                run.run_id,
                 "run.started",
-                {"attempt": run.attempt},
+                {
+                    "attempt": run.attempt,
+                    "recovered": recovery_reason is not None,
+                },
             )
-        return run
 
-    def recover_run_for_restart(
+        return RunLeaseClaim(
+            run=run,
+            owner_id=owner_id,
+            lease_token=lease_token,
+            recovery_reason=recovery_reason,
+        )
+
+    def renew_run_lease(
         self,
         run_id: str,
         *,
-        tenant_id: str,
-        reconciliation_pending_code: str,
-    ) -> RunRecord | None:
-        """Atomically return one interrupted RUNNING Run to QUEUED.
+        lease_token: str,
+        lease_duration_seconds: int,
+    ) -> bool:
+        """Renew only a still-current, still-unexpired lease.
 
-        The transition preserves the database's current cancellation flag,
-        rather than copying a stale row returned by ``list_recoverable_runs``.
-        A reconciliation marker survives; unrelated transient errors are
-        cleared.  The recovery event commits in the same transaction.
+        The new deadline is based on the store's current time, never the old
+        deadline, so delayed heartbeats cannot accumulate a far-future lease.
         """
 
-        updated_at = utc_now()
-        with self._lock, self._connect() as connection:
+        if not lease_token:
+            raise ValueError("lease_token must not be empty")
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds must be positive")
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
             cursor = connection.execute(
                 """
                 UPDATE runs SET
-                    status = ?, started_at = NULL,
-                    error = CASE WHEN error_code = ? THEN error ELSE NULL END,
-                    error_code = CASE
-                        WHEN error_code = ? THEN error_code ELSE NULL
-                    END,
-                    updated_at = ?
-                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    lease_heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ? AND status = ? AND lease_token = ?
+                    AND lease_expires_at > ?
                 """,
                 (
-                    RunStatus.QUEUED.value,
-                    reconciliation_pending_code,
-                    reconciliation_pending_code,
-                    updated_at,
+                    now_ms,
+                    now_ms + lease_duration_seconds * 1000,
+                    utc_now(),
                     run_id,
-                    tenant_id,
                     RunStatus.RUNNING.value,
+                    lease_token,
+                    now_ms,
                 ),
             )
-            row = connection.execute(
-                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
-                (run_id, tenant_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Run not found: {run_id}")
-            if cursor.rowcount != 1:
-                return None
-            run = self._row_to_run(row)
-            self._append_event_with_connection(
+        return cursor.rowcount == 1
+
+    def expire_run_lease(self, run_id: str, *, lease_token: str) -> bool:
+        """Relinquish one drained attempt using its token as authority."""
+
+        if not lease_token:
+            raise ValueError("lease_token must not be empty")
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    lease_heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ? AND status = ? AND lease_token = ?
+                """,
+                (
+                    now_ms,
+                    now_ms,
+                    utc_now(),
+                    run_id,
+                    RunStatus.RUNNING.value,
+                    lease_token,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def assert_current_run_lease(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        lease_token: str | None,
+    ) -> None:
+        """Fence an attempt-owned mutation inside its existing transaction."""
+
+        if lease_token is None:
+            raise RunLeaseLostError(f"Run lease token is required: {run_id}")
+        now_ms = self._lease_now_ms(connection)
+        row = connection.execute(
+            """
+            SELECT 1 FROM runs
+            WHERE run_id = ? AND status = ? AND lease_token = ?
+                AND lease_expires_at > ?
+            """,
+            (run_id, RunStatus.RUNNING.value, lease_token, now_ms),
+        ).fetchone()
+        if row is None:
+            raise RunLeaseLostError(f"Run lease is no longer current: {run_id}")
+
+    def append_attempt_event(
+        self,
+        run_id: str,
+        *,
+        lease_token: str | None,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> RunEvent:
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.assert_current_run_lease(
                 connection,
                 run_id,
-                "run.recovered",
-                {
-                    "reason": (
-                        reconciliation_pending_code
-                        if run.error_code == reconciliation_pending_code
-                        else "runtime_restart"
-                    )
-                },
+                lease_token=lease_token,
             )
-        return run
+            return self._append_event_with_connection(
+                connection,
+                run_id,
+                event_type,
+                payload,
+            )
+
+    def finalize_next_queued_cancellation(self) -> RunRecord | None:
+        """Terminalize one cancelled-before-claim Run without acquiring a lease."""
+
+        completed_at = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status = ? AND cancel_requested = 1
+                ORDER BY created_at, run_id
+                LIMIT 1
+                """,
+                (RunStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    status = ?, error_code = NULL, error = NULL,
+                    completed_at = ?, updated_at = ?,
+                    lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
+                WHERE run_id = ? AND status = ? AND cancel_requested = 1
+                """,
+                (
+                    RunStatus.CANCELLED.value,
+                    completed_at,
+                    completed_at,
+                    row["run_id"],
+                    RunStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self._append_event_with_connection(
+                connection,
+                row["run_id"],
+                "run.cancelled",
+                {"reason": "cancelled_before_start"},
+            )
+            updated = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (row["run_id"],),
+            ).fetchone()
+            assert updated is not None
+            return self._row_to_run(updated)
 
     def request_cancel_atomically(self, run_id: str, *, tenant_id: str) -> RunRecord:
         """Atomically flip `cancel_requested` 0 -> 1 for a QUEUED/RUNNING run.
@@ -541,39 +847,31 @@ class SQLiteRunStore:
                 )
         return self._row_to_run(row)
 
-    def finalize_completed_run(self, run: RunRecord) -> bool:
-        """Atomically transition a RUNNING run to COMPLETED with its checkpoint.
+    def commit_completed_run(
+        self,
+        run: RunRecord,
+        *,
+        lease_token: str,
+    ) -> RunCommitOutcome:
+        """Atomically fence and commit a completed Run plus checkpoint/events."""
 
-        The eligibility check and the COMPLETED transition are the same
-        statement: a single conditional `UPDATE ... WHERE run_id = ? AND
-        status = 'running' AND cancel_requested = 0` acts as a compare-and-set.
-        There is no separate read-then-decide step, so a concurrent cancel
-        (which only ever sets `cancel_requested = 1` on non-terminal rows,
-        see `request_cancel_atomically`) and a concurrent/duplicate finalize
-        attempt cannot both believe they won.
+        return self._commit_completed_run(run, lease_token=lease_token)
 
-        If the UPDATE does not affect exactly one row -- the run was already
-        finalized, or a cancel committed first, or it is not currently
-        RUNNING for any other reason -- nothing else in this method runs: no
-        thread checkpoint, no `checkpoint.saved` event, no `run.completed`
-        event. The caller must re-read the run and follow whatever terminal
-        branch actually applies (typically cancellation).
-
-        If the UPDATE succeeds, the thread-state checkpoint UPSERT and both
-        describing events are written using the *same* connection/transaction
-        as the UPDATE, so a reader can never observe `status == "completed"`
-        without the checkpoint and `run.completed` event already committed
-        alongside it, and calling this a second time for the same run is a
-        no-op (the second UPDATE affects zero rows because status is no
-        longer RUNNING).
-        """
+    def _commit_completed_run(
+        self,
+        run: RunRecord,
+        *,
+        lease_token: str,
+    ) -> RunCommitOutcome:
         completed_at = utc_now()
         if run.state is not None:
             self._remember_state_model(run.state)
         state_json = run.state.model_dump_json() if run.state is not None else None
         validation_errors_json = json.dumps(run.validation_errors)
 
-        with self._lock, self._connect() as connection:
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
             self._assert_thread_schema_available(
                 connection,
                 run.tenant_id,
@@ -586,9 +884,12 @@ class SQLiteRunStore:
                 UPDATE runs SET
                     status = ?, state_json = ?, output_message = ?,
                     validation_errors_json = ?, error_code = NULL, error = NULL,
-                    completed_at = ?, updated_at = ?
+                    completed_at = ?, updated_at = ?,
+                    lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
                 WHERE run_id = ? AND tenant_id = ?
                     AND status = ? AND cancel_requested = 0
+                    AND lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     RunStatus.COMPLETED.value,
@@ -600,10 +901,18 @@ class SQLiteRunStore:
                     run.run_id,
                     run.tenant_id,
                     RunStatus.RUNNING.value,
+                    lease_token,
+                    now_ms,
                 ),
             )
             if cursor.rowcount != 1:
-                return False
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
 
             if run.state is not None:
                 connection.execute(
@@ -646,56 +955,41 @@ class SQLiteRunStore:
         run.error = None
         run.completed_at = completed_at
         run.updated_at = completed_at
-        return True
+        run.lease_owner_id = None
+        run.lease_token = None
+        run.lease_heartbeat_at = None
+        run.lease_expires_at = None
+        return RunCommitOutcome.COMMITTED
 
-    def finalize_cancelled_run(self, run: RunRecord, *, reason: str) -> bool:
-        """Atomically transition a cancel-requested QUEUED/RUNNING run to CANCELLED.
+    def commit_cancelled_run(
+        self,
+        run: RunRecord,
+        *,
+        reason: str,
+        lease_token: str,
+    ) -> RunCommitOutcome:
+        return self._commit_cancelled_run(
+            run,
+            reason=reason,
+            lease_token=lease_token,
+        )
 
-        Replaces the two separate commits `_mark_cancelled` used to issue
-        (`update_run` then `append_event`) with a single compare-and-set,
-        the same shape as `finalize_completed_run`. The eligibility check --
-        `status IN ('queued', 'running') AND cancel_requested = 1` -- and
-        the CANCELLED transition happen in the same UPDATE:
-
-        - `status IN ('queued', 'running')` covers both call shapes this
-          replaces: a run cancelled before it ever started running (still
-          QUEUED) and a run cancelled at or after the execution boundary
-          (still RUNNING, since only a successful `finalize_completed_run`
-          ever moves a RUNNING row away from RUNNING).
-        - `cancel_requested = 1` asserts the precondition every call site
-          already relies on (each only calls this once it has confirmed
-          `cancel_requested` is set); it also means a bare duplicate call
-          before this method has flipped `status` away from QUEUED/RUNNING
-          would still be caught if `cancel_requested` were ever 0 here,
-          though that combination should not occur given the call sites.
-
-        Every mutable column other than terminal `error_code`/`error` is
-        written exactly as it currently stands on `run`. Cancellation clears
-        any transient execution or reconciliation error marker. The
-        persisted `tenant_id` is deliberately immutable and is part of the
-        UPDATE predicate instead of its SET list. Therefore,
-        each existing call site's semantics survive unchanged: a
-        before-start cancellation leaves the original request/thread-store
-        state alone (the caller never overwrote `run.state`), while an
-        after-execution-boundary cancellation carries over the
-        just-computed result state (the caller set `run.state` to it before
-        calling this) -- `output_message`/`validation_errors`/`attempt` follow
-        whatever the caller set on `run`.
-
-        If the UPDATE does not affect exactly one row -- already cancelled,
-        already completed/failed by a concurrent finalize, or (defensively)
-        not actually cancel-requested -- nothing else in this method runs:
-        no `run.cancelled` event, no duplicate write, and `run` itself is
-        left unmodified. Calling this a second time for the same run is a
-        no-op for the same reason `finalize_completed_run` is.
-        """
+    def _commit_cancelled_run(
+        self,
+        run: RunRecord,
+        *,
+        reason: str,
+        lease_token: str,
+    ) -> RunCommitOutcome:
         completed_at = utc_now()
         if run.state is not None:
             self._remember_state_model(run.state)
         state_json = run.state.model_dump_json() if run.state is not None else None
         validation_errors_json = json.dumps(run.validation_errors)
 
-        with self._lock, self._connect() as connection:
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
             cursor = connection.execute(
                 """
                 UPDATE runs SET
@@ -706,9 +1000,12 @@ class SQLiteRunStore:
                     validation_errors_json = ?, error_code = NULL, error = NULL,
                     attempt = ?,
                     cancel_requested = ?, client_request_id = ?, created_at = ?,
-                    updated_at = ?, started_at = ?, completed_at = ?
+                    updated_at = ?, started_at = ?, completed_at = ?,
+                    lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
                 WHERE run_id = ? AND tenant_id = ?
                     AND status IN (?, ?) AND cancel_requested = 1
+                    AND lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     (
@@ -738,10 +1035,18 @@ class SQLiteRunStore:
                     run.tenant_id,
                     RunStatus.QUEUED.value,
                     RunStatus.RUNNING.value,
+                    lease_token,
+                    now_ms,
                 ),
             )
             if cursor.rowcount != 1:
-                return False
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
 
             self._append_event_with_connection(
                 connection,
@@ -756,7 +1061,112 @@ class SQLiteRunStore:
         run.error = None
         run.completed_at = completed_at
         run.updated_at = completed_at
-        return True
+        run.lease_owner_id = None
+        run.lease_token = None
+        run.lease_heartbeat_at = None
+        run.lease_expires_at = None
+        return RunCommitOutcome.COMMITTED
+
+    def commit_failed_run(
+        self,
+        run: RunRecord,
+        *,
+        lease_token: str,
+        error_code: str,
+        error: str,
+        traceback_text: str | None = None,
+        allow_cancel_requested: bool = False,
+    ) -> RunCommitOutcome:
+        """Atomically fence and commit a failed Run plus its failure event."""
+
+        completed_at = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    status = ?, error_code = ?, error = ?, completed_at = ?,
+                    updated_at = ?, lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    AND (cancel_requested = 0 OR ? = 1) AND lease_token = ?
+                    AND lease_expires_at > ?
+                """,
+                (
+                    RunStatus.FAILED.value,
+                    error_code,
+                    error,
+                    completed_at,
+                    completed_at,
+                    run.run_id,
+                    run.tenant_id,
+                    RunStatus.RUNNING.value,
+                    int(allow_cancel_requested),
+                    lease_token,
+                    now_ms,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
+            payload: dict[str, Any] = {"error_code": error_code, "error": error}
+            if traceback_text is not None:
+                payload["traceback"] = traceback_text
+            self._append_event_with_connection(
+                connection,
+                run.run_id,
+                "run.failed",
+                payload,
+            )
+
+        run.status = RunStatus.FAILED
+        run.error_code = error_code
+        run.error = error
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        run.lease_owner_id = None
+        run.lease_token = None
+        run.lease_heartbeat_at = None
+        run.lease_expires_at = None
+        return RunCommitOutcome.COMMITTED
+
+    def _classify_commit_outcome(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        tenant_id: str,
+        lease_token: str,
+        now_ms: int,
+    ) -> RunCommitOutcome:
+        row = connection.execute(
+            """
+            SELECT status, cancel_requested, lease_token, lease_expires_at
+            FROM runs WHERE run_id = ? AND tenant_id = ?
+            """,
+            (run_id, tenant_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Run not found: {run_id}")
+        status = RunStatus(row["status"])
+        if status.is_terminal:
+            return RunCommitOutcome.ALREADY_TERMINAL
+        current_lease = (
+            row["lease_token"] == lease_token
+            and row["lease_expires_at"] is not None
+            and int(row["lease_expires_at"]) > now_ms
+        )
+        if not current_lease:
+            return RunCommitOutcome.LEASE_LOST
+        if bool(row["cancel_requested"]):
+            return RunCommitOutcome.CANCEL_REQUESTED
+        return RunCommitOutcome.NOT_ELIGIBLE
 
     def list_recoverable_runs(self) -> list[RunRecord]:
         with self._connect() as connection:
@@ -772,8 +1182,44 @@ class SQLiteRunStore:
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> RunEvent:
+        """Reject unfenced writes to an existing managed Run event stream."""
+
+        del event_type, payload
+        raise RunLeaseLostError(
+            f"Unfenced Run event append is prohibited: {run_id}"
+        )
+
+    def append_control_plane_event(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> RunEvent:
+        """Append one allowlisted API control-plane observation.
+
+        These events describe a synchronous sandbox call made outside a
+        managed attempt. They cannot encode lifecycle, checkpoint, workflow,
+        or other attempt-owned evidence.
+        """
+
+        if event_type not in self._CONTROL_PLANE_EVENT_TYPES:
+            raise ValueError(f"Unsupported control-plane Run event: {event_type}")
         with self._lock, self._connect() as connection:
-            return self._append_event_with_connection(connection, run_id, event_type, payload)
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            return self._append_event_with_connection(
+                connection,
+                run_id,
+                event_type,
+                payload,
+            )
 
     @staticmethod
     def _append_event_with_connection(
@@ -785,11 +1231,8 @@ class SQLiteRunStore:
         """Append an event using a connection the caller already owns.
 
         Callers that need the event insert to participate in a larger
-        transaction (see `finalize_completed_run`) pass their own open
-        connection instead of going through `append_event`, which opens and
-        commits its own connection. The sequence computation and the insert
-        always share one connection, whether that connection is scoped here
-        or by the caller.
+        transaction pass their own open connection. The sequence computation
+        and insert always share that connection.
         """
         sequence = int(
             connection.execute(
@@ -867,7 +1310,18 @@ class SQLiteRunStore:
             for row in rows
         ]
 
-    def save_thread_state(self, state: BaseRuntimeState, *, tenant_id: str) -> None:
+    def save_unmanaged_thread_state(
+        self,
+        state: BaseRuntimeState,
+        *,
+        tenant_id: str,
+    ) -> None:
+        """Persist state for the legacy synchronous, non-Run API only.
+
+        Managed attempts must commit their checkpoint through a fenced Run
+        terminalization method instead of this explicitly unmanaged surface.
+        """
+
         self._remember_state_model(state)
         with self._lock, self._connect() as connection:
             self._assert_thread_schema_available(
@@ -960,6 +1414,10 @@ class SQLiteRunStore:
             run.updated_at,
             run.started_at,
             run.completed_at,
+            run.lease_owner_id,
+            run.lease_token,
+            run.lease_heartbeat_at,
+            run.lease_expires_at,
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
@@ -1005,6 +1463,14 @@ class SQLiteRunStore:
             updated_at=row["updated_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+            lease_owner_id=(row["lease_owner_id"] if "lease_owner_id" in keys else None),
+            lease_token=(row["lease_token"] if "lease_token" in keys else None),
+            lease_heartbeat_at=(
+                row["lease_heartbeat_at"] if "lease_heartbeat_at" in keys else None
+            ),
+            lease_expires_at=(
+                row["lease_expires_at"] if "lease_expires_at" in keys else None
+            ),
         )
 
     @staticmethod

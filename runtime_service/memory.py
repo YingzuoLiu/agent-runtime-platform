@@ -5,12 +5,14 @@ import sqlite3
 import threading
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.contracts import RuntimeExecutionContext, RuntimeExecutionError, utc_now
+
+from .store import RunLeaseLostError
 
 
 MEMORY_READ_PERMISSION = "memory:read"
@@ -146,6 +148,16 @@ class RunEventSink(Protocol):
     ) -> Any:
         ...
 
+    def append_attempt_event(
+        self,
+        run_id: str,
+        *,
+        lease_token: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
+        ...
+
     def list_events(self, run_id: str, *, after_sequence: int = 0) -> list[Any]:
         ...
 
@@ -154,6 +166,20 @@ class MemoryStore(Protocol):
     def upsert(
         self,
         *,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        write: MemoryWrite,
+        source_run_id: str,
+        source_thread_id: str,
+        actor_subject_id: str,
+    ) -> MemoryMutationResult:
+        ...
+
+    def upsert_from_run(
+        self,
+        *,
+        lease_token: str,
         tenant_id: str,
         subject_id: str,
         domain_id: str,
@@ -175,6 +201,18 @@ class MemoryStore(Protocol):
     ) -> MemorySnapshot:
         ...
 
+    def get_or_create_run_snapshot_for_run(
+        self,
+        *,
+        lease_token: str,
+        run_id: str,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        allowed_keys: tuple[str, ...] | None = None,
+    ) -> MemorySnapshot:
+        ...
+
     def list_events_for_run(
         self,
         run_id: str,
@@ -188,9 +226,15 @@ class MemoryStore(Protocol):
 class SQLiteMemoryStore:
     """SQLite-backed, tenant-and-subject-scoped long-term memory storage."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        lease_clock_ms: Callable[[], int] | None = None,
+    ) -> None:
         self.database_path = str(database_path)
         self._lock = threading.RLock()
+        self._lease_clock_ms = lease_clock_ms
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -273,12 +317,81 @@ class SQLiteMemoryStore:
         source_thread_id: str,
         actor_subject_id: str,
     ) -> MemoryMutationResult:
+        """Apply an explicit administrative/test memory mutation.
+
+        Managed Runtime execution must use :meth:`upsert_from_run`, which
+        validates the Run lease in the same transaction as the mutation.
+        """
+
+        return self._upsert(
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            domain_id=domain_id,
+            write=write,
+            source_run_id=source_run_id,
+            source_thread_id=source_thread_id,
+            actor_subject_id=actor_subject_id,
+            lease_token=None,
+        )
+
+    def upsert_from_run(
+        self,
+        *,
+        lease_token: str,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        write: MemoryWrite,
+        source_run_id: str,
+        source_thread_id: str,
+        actor_subject_id: str,
+    ) -> MemoryMutationResult:
+        """Apply a memory mutation owned by the current Run attempt."""
+
+        if not lease_token:
+            raise ValueError("lease_token must not be empty")
+        return self._upsert(
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            domain_id=domain_id,
+            write=write,
+            source_run_id=source_run_id,
+            source_thread_id=source_thread_id,
+            actor_subject_id=actor_subject_id,
+            lease_token=lease_token,
+        )
+
+    def _upsert(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        write: MemoryWrite,
+        source_run_id: str,
+        source_thread_id: str,
+        actor_subject_id: str,
+        lease_token: str | None,
+    ) -> MemoryMutationResult:
         self._validate_identity(tenant_id, subject_id, domain_id)
         encoded_value = self._encode_json(write.value)
         now = utc_now()
 
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if lease_token is not None:
+                self._assert_run_identity(
+                    connection,
+                    run_id=source_run_id,
+                    tenant_id=tenant_id,
+                    subject_id=subject_id,
+                    domain_id=domain_id,
+                )
+                self._assert_current_run_lease(
+                    connection,
+                    source_run_id,
+                    lease_token=lease_token,
+                )
             active_row = connection.execute(
                 """
                 SELECT * FROM memory_records
@@ -577,6 +690,50 @@ class SQLiteMemoryStore:
         domain_id: str,
         allowed_keys: tuple[str, ...] | None = None,
     ) -> MemorySnapshot:
+        """Seal a snapshot through the explicit administrative/test API."""
+
+        return self._get_or_create_run_snapshot(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            domain_id=domain_id,
+            allowed_keys=allowed_keys,
+            lease_token=None,
+        )
+
+    def get_or_create_run_snapshot_for_run(
+        self,
+        *,
+        lease_token: str,
+        run_id: str,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        allowed_keys: tuple[str, ...] | None = None,
+    ) -> MemorySnapshot:
+        """Seal or reuse a snapshot for the current Run attempt."""
+
+        if not lease_token:
+            raise ValueError("lease_token must not be empty")
+        return self._get_or_create_run_snapshot(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            domain_id=domain_id,
+            allowed_keys=allowed_keys,
+            lease_token=lease_token,
+        )
+
+    def _get_or_create_run_snapshot(
+        self,
+        *,
+        run_id: str,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str,
+        allowed_keys: tuple[str, ...] | None,
+        lease_token: str | None,
+    ) -> MemorySnapshot:
         """Seal the first retrieval, including an empty result, for restart safety."""
 
         self._validate_identity(tenant_id, subject_id, domain_id)
@@ -589,6 +746,12 @@ class SQLiteMemoryStore:
                 subject_id=subject_id,
                 domain_id=domain_id,
             )
+            if lease_token is not None:
+                self._assert_current_run_lease(
+                    connection,
+                    run_id,
+                    lease_token=lease_token,
+                )
             existing = connection.execute(
                 "SELECT * FROM run_memory_snapshots WHERE run_id = ?",
                 (run_id,),
@@ -837,6 +1000,34 @@ class SQLiteMemoryStore:
         if authority.get("subject_id") != subject_id:
             raise ValueError("Run identity does not match memory snapshot authority")
 
+    def _lease_now_ms(self, connection: sqlite3.Connection) -> int:
+        if self._lease_clock_ms is not None:
+            return self._lease_clock_ms()
+        row = connection.execute(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def _assert_current_run_lease(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        lease_token: str,
+    ) -> None:
+        now_ms = self._lease_now_ms(connection)
+        row = connection.execute(
+            """
+            SELECT 1 FROM runs
+            WHERE run_id = ? AND status = 'running' AND lease_token = ?
+                AND lease_expires_at > ?
+            """,
+            (run_id, lease_token, now_ms),
+        ).fetchone()
+        if row is None:
+            raise RunLeaseLostError(f"Run lease is no longer current: {run_id}")
+
 
 class GovernedMemory:
     """Run-facing memory boundary with permission checks and durable evidence."""
@@ -857,7 +1048,9 @@ class GovernedMemory:
                 "memory_permission_denied",
                 "Memory read denied by persisted execution authority.",
             )
-        snapshot = self.store.get_or_create_run_snapshot(
+        lease_token = self._require_lease_token(context)
+        snapshot = self.store.get_or_create_run_snapshot_for_run(
+            lease_token=lease_token,
             run_id=context.run_id,
             tenant_id=context.authority.tenant_id,
             subject_id=context.authority.subject_id,
@@ -865,7 +1058,7 @@ class GovernedMemory:
             allowed_keys=tuple(sorted(set(allowed_keys))),
         )
         self._ensure_run_event(
-            context.run_id,
+            context,
             "memory.retrieved",
             {
                 "snapshot_id": snapshot.run_id,
@@ -902,8 +1095,10 @@ class GovernedMemory:
                 "memory_permission_denied",
                 "Memory write denied by persisted execution authority.",
             )
+        lease_token = self._require_lease_token(context)
         for write in writes:
-            self.store.upsert(
+            self.store.upsert_from_run(
+                lease_token=lease_token,
                 tenant_id=context.authority.tenant_id,
                 subject_id=context.authority.subject_id,
                 domain_id=domain_id,
@@ -935,22 +1130,40 @@ class GovernedMemory:
             identity = (event.event_type, event.event_id)
             if identity in existing_audit_events:
                 continue
-            self.run_event_sink.append_event(context.run_id, event.event_type, payload)
+            self.run_event_sink.append_attempt_event(
+                context.run_id,
+                lease_token=self._require_lease_token(context),
+                event_type=event.event_type,
+                payload=payload,
+            )
             existing_audit_events.add(identity)
 
     def _ensure_run_event(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         event_type: str,
         payload: dict[str, Any],
         *,
         identity_key: str,
         identity_value: Any,
     ) -> None:
-        for event in self.run_event_sink.list_events(run_id):
+        for event in self.run_event_sink.list_events(context.run_id):
             if (
                 event.event_type == event_type
                 and event.payload.get(identity_key) == identity_value
             ):
                 return
-        self.run_event_sink.append_event(run_id, event_type, payload)
+        self.run_event_sink.append_attempt_event(
+            context.run_id,
+            lease_token=self._require_lease_token(context),
+            event_type=event_type,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _require_lease_token(context: RuntimeExecutionContext) -> str:
+        if not context.lease_token:
+            raise RunLeaseLostError(
+                f"Run execution has no lease token: {context.run_id}"
+            )
+        return context.lease_token

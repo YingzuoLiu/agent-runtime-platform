@@ -112,6 +112,7 @@ class RuntimeExecutionContext(BaseModel):
     thread_id: str
     recovered_after_restart: bool = False
     authority: RuntimeExecutionAuthority
+    lease_token: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class RuntimeExecutionError(RuntimeError):

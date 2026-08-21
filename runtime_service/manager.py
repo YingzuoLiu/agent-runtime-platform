@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import queue
 import sqlite3
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from uuid import uuid4
@@ -12,11 +12,10 @@ from agent.contracts import (
     RuntimeExecutionAuthority,
     RuntimeExecutionContext,
     RuntimeExecutionError,
-    utc_now,
 )
 from .auth import TenantContext
 from .external_actions import ExternalActionReconciliationPendingError
-from .models import RunCreateRequest, RunRecord, RunStatus
+from .models import RunCommitOutcome, RunCreateRequest, RunLeaseClaim, RunRecord, RunStatus
 from .registry import AgentRegistry, RuntimeRegistration
 from .store import SQLiteRunStore
 
@@ -35,25 +34,74 @@ class RuntimeManager:
         *,
         worker_count: int = 1,
         recovery_reconciliation_required: Callable[[str], bool] | None = None,
+        owner_id: str | None = None,
+        lease_duration_seconds: int = 30,
+        heartbeat_interval_seconds: float = 10,
+        poll_interval_seconds: float = 0.25,
+        shutdown_grace_seconds: float = 5,
     ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be at least 1")
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds must be positive")
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
+        if heartbeat_interval_seconds >= lease_duration_seconds:
+            raise ValueError("heartbeat_interval_seconds must be shorter than the lease")
+        if (
+            heartbeat_interval_seconds + store.lease_operation_timeout_seconds
+            >= lease_duration_seconds
+        ):
+            raise ValueError(
+                "heartbeat interval plus lease-operation timeout must leave "
+                "time before lease expiry"
+            )
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be positive")
+        if shutdown_grace_seconds < 0:
+            raise ValueError("shutdown_grace_seconds must not be negative")
         self.store = store
         self.registry = registry
         self.store.bind_state_registry(registry)
         self.worker_count = worker_count
+        self.owner_id = owner_id or f"manager_{uuid4().hex}"
+        self.lease_duration_seconds = lease_duration_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.poll_interval_seconds = poll_interval_seconds
+        self.shutdown_grace_seconds = shutdown_grace_seconds
         self._recovery_reconciliation_required = recovery_reconciliation_required
-        self._queue: queue.Queue[tuple[str, bool] | None] = queue.Queue()
+        self._wake = threading.Event()
+        self._stop_claiming = threading.Event()
+        self._claim_admission_lock = threading.Lock()
+        self._active_heartbeats: dict[
+            str,
+            tuple[threading.Event, threading.Event],
+        ] = {}
+        self._owned_claims: dict[str, str] = {}
+        self._heartbeat_lock = threading.Lock()
+        self._renewals_disabled = threading.Event()
         self._workers: list[threading.Thread] = []
         self._started = False
         self._lock = threading.Lock()
+        self._stop_in_progress: threading.Event | None = None
 
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
+            if any(worker.is_alive() for worker in self._workers):
+                raise RuntimeError(
+                    "RuntimeManager cannot restart while a previous worker is draining"
+                )
+            if self._workers:
+                self._expire_drained_claims()
+            self._workers.clear()
             recoverable_runs = self.store.list_recoverable_runs()
             self._assert_recoverable_runs_registered(recoverable_runs)
+            self._stop_claiming.clear()
+            self._wake.clear()
+            with self._heartbeat_lock:
+                self._renewals_disabled.clear()
             self._started = True
             for index in range(self.worker_count):
                 worker = threading.Thread(
@@ -63,30 +111,58 @@ class RuntimeManager:
                 )
                 worker.start()
                 self._workers.append(worker)
-            for run in recoverable_runs:
-                if run.status == RunStatus.RUNNING:
-                    recovered = self.store.recover_run_for_restart(
-                        run.run_id,
-                        tenant_id=run.tenant_id,
-                        reconciliation_pending_code=(
-                            ExternalActionReconciliationPendingError.CODE
-                        ),
-                    )
-                    if recovered is None:
-                        continue
-                    run = recovered
-                self._queue.put((run.run_id, True))
+            self._wake.set()
 
     def stop(self) -> None:
         with self._lock:
+            if self._stop_in_progress is not None:
+                stop_complete = self._stop_in_progress
+                stop_leader = False
+            else:
+                stop_complete = threading.Event()
+                stop_leader = True
             if not self._started:
                 return
-            for _ in self._workers:
-                self._queue.put(None)
-            for worker in self._workers:
-                worker.join(timeout=5)
-            self._workers.clear()
-            self._started = False
+            if stop_leader:
+                self._stop_in_progress = stop_complete
+                workers = list(self._workers)
+                # Serialize the stop gate with the final check immediately
+                # before claim_next_run. A worker may finish an already-admitted
+                # claim, but it cannot acquire a new one after this gate closes.
+                with self._claim_admission_lock:
+                    self._stop_claiming.set()
+                self._wake.set()
+
+        if not stop_leader:
+            # Coalesce concurrent calls into the stop generation they observed.
+            # A waiter must never wake later and stop a newly started generation.
+            stop_complete.wait()
+            return
+
+        try:
+            deadline = time.monotonic() + self.shutdown_grace_seconds
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            workers_still_alive = any(worker.is_alive() for worker in workers)
+            with self._heartbeat_lock:
+                # Latch the renewal cutoff before observing or modifying active
+                # heartbeat registrations. A worker paused after claim but
+                # before registration must not renew after stop() returns.
+                self._renewals_disabled.set()
+                if workers_still_alive:
+                    for stop_heartbeat, lease_lost in self._active_heartbeats.values():
+                        lease_lost.set()
+                        stop_heartbeat.set()
+            if not workers_still_alive:
+                # All execution threads have stopped, so relinquishing their
+                # non-terminal leases cannot expose a still-running stale writer.
+                self._expire_drained_claims()
+            with self._lock:
+                self._workers = [worker for worker in workers if worker.is_alive()]
+                self._started = False
+                self._stop_in_progress = None
+                stop_complete.set()
 
     def submit(
         self,
@@ -127,7 +203,20 @@ class RuntimeManager:
                 client_request_id=request.client_request_id,
             )
             try:
-                self.store.create_run(run)
+                self.store.create_run_with_event(
+                    run,
+                    event_type="run.queued",
+                    payload={
+                        "agent_id": run.agent_id,
+                        "agent_version": run.agent_version,
+                        "domain_id": run.domain_id,
+                        "schema_version": run.schema_version,
+                        "tenant_id": run.tenant_id,
+                        "subject_id": tenant_context.subject_id,
+                        "thread_id": run.thread_id,
+                        "client_request_id": run.client_request_id,
+                    },
+                )
             except sqlite3.IntegrityError:
                 if not request.client_request_id:
                     raise
@@ -138,22 +227,8 @@ class RuntimeManager:
                 if existing is None:
                     raise
                 return existing
-            self.store.append_event(
-                run.run_id,
-                "run.queued",
-                {
-                    "agent_id": run.agent_id,
-                    "agent_version": run.agent_version,
-                    "domain_id": run.domain_id,
-                    "schema_version": run.schema_version,
-                    "tenant_id": run.tenant_id,
-                    "subject_id": tenant_context.subject_id,
-                    "thread_id": run.thread_id,
-                    "client_request_id": run.client_request_id,
-                },
-            )
             if self._started:
-                self._queue.put((run.run_id, False))
+                self._wake.set()
             return run
 
     def get_run(
@@ -185,27 +260,125 @@ class RuntimeManager:
         )
 
     def _worker_loop(self) -> None:
-        while True:
-            queue_item = self._queue.get()
+        while not self._stop_claiming.is_set():
             try:
-                if queue_item is None:
-                    return
-                run_id, recovered_after_restart = queue_item
-                self._execute_run(
-                    run_id,
-                    recovered_after_restart=recovered_after_restart,
-                )
-            finally:
-                self._queue.task_done()
+                cancelled = self.store.finalize_next_queued_cancellation()
+                if cancelled is not None:
+                    continue
+                with self._claim_admission_lock:
+                    if self._stop_claiming.is_set():
+                        return
+                    claim = self.store.claim_next_run(
+                        owner_id=self.owner_id,
+                        lease_duration_seconds=self.lease_duration_seconds,
+                        reconciliation_pending_code=(
+                            ExternalActionReconciliationPendingError.CODE
+                        ),
+                    )
+            except sqlite3.Error:
+                self._wake.wait(self.poll_interval_seconds)
+                self._wake.clear()
+                continue
+            if claim is not None:
+                self._execute_claim(claim)
+                continue
+            self._wake.wait(self.poll_interval_seconds)
+            self._wake.clear()
 
-    def _execute_run(
+    def _execute_claim(self, claim: RunLeaseClaim) -> None:
+        stop_heartbeat = threading.Event()
+        lease_lost = threading.Event()
+        with self._heartbeat_lock:
+            if self._renewals_disabled.is_set():
+                admitted = False
+            else:
+                admitted = True
+                self._active_heartbeats[claim.lease_token] = (
+                    stop_heartbeat,
+                    lease_lost,
+                )
+                # At most one retained generation exists per Run. Replacing an
+                # expired generation prevents recovery attempts from growing
+                # this bookkeeping without bound.
+                self._owned_claims[claim.run.run_id] = claim.lease_token
+        if not admitted:
+            # The claim transaction completed before shutdown closed renewal
+            # admission, but Runtime code has not started. Relinquish it now;
+            # a storage failure still falls back to natural lease expiry.
+            try:
+                self.store.expire_run_lease(
+                    claim.run.run_id,
+                    lease_token=claim.lease_token,
+                )
+            except Exception:
+                pass
+            return
+        heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(claim, stop_heartbeat, lease_lost),
+            name=f"agent-runtime-heartbeat-{claim.run.run_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            self._execute_owned_run(claim, lease_lost=lease_lost)
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=self.heartbeat_interval_seconds + 1)
+            try:
+                persisted = self.store.get_run_internal(claim.run.run_id)
+            except Exception:
+                # Cleanup is best effort. A transient read failure must not
+                # kill the worker; the durable lease still expires normally.
+                persisted = None
+            with self._heartbeat_lock:
+                self._active_heartbeats.pop(claim.lease_token, None)
+                if persisted is None or persisted.lease_token != claim.lease_token:
+                    if self._owned_claims.get(claim.run.run_id) == claim.lease_token:
+                        self._owned_claims.pop(claim.run.run_id, None)
+
+    def _expire_drained_claims(self) -> None:
+        with self._heartbeat_lock:
+            claims = list(self._owned_claims.items())
+            self._owned_claims.clear()
+        for run_id, lease_token in claims:
+            try:
+                self.store.expire_run_lease(run_id, lease_token=lease_token)
+            except Exception:
+                # Shutdown cleanup cannot make a lease less safe: failure to
+                # relinquish leaves the store deadline as the authority.
+                continue
+
+    def _heartbeat_loop(
         self,
-        run_id: str,
-        *,
-        recovered_after_restart: bool = False,
+        claim: RunLeaseClaim,
+        stop_heartbeat: threading.Event,
+        lease_lost: threading.Event,
     ) -> None:
-        run = self._require_run(run_id)
-        if run.status.is_terminal:
+        while not stop_heartbeat.wait(self.heartbeat_interval_seconds):
+            try:
+                renewed = self.store.renew_run_lease(
+                    claim.run.run_id,
+                    lease_token=claim.lease_token,
+                    lease_duration_seconds=self.lease_duration_seconds,
+                )
+            except Exception:
+                renewed = False
+            if not renewed:
+                # A definite failed renewal permanently latches this attempt
+                # stale. Never retry the same token after clock regression.
+                lease_lost.set()
+                return
+
+    def _execute_owned_run(
+        self,
+        claim: RunLeaseClaim,
+        *,
+        lease_lost: threading.Event,
+    ) -> None:
+        run = claim.run
+        recovered_after_restart = claim.recovery_reason is not None
+        if lease_lost.is_set():
             return
         reconcile_before_cancelling = (
             recovered_after_restart
@@ -213,19 +386,16 @@ class RuntimeManager:
                 run.error_code == ExternalActionReconciliationPendingError.CODE
                 or (
                     self._recovery_reconciliation_required is not None
-                    and self._recovery_reconciliation_required(run_id)
+                    and self._recovery_reconciliation_required(run.run_id)
                 )
             )
         )
         if run.cancel_requested and not reconcile_before_cancelling:
-            self._mark_cancelled(run, reason="cancelled_before_start")
-            return
-        claimed = self.store.claim_run_start(run_id, tenant_id=run.tenant_id)
-        if claimed is None:
-            return
-        run = claimed
-        if run.cancel_requested and not reconcile_before_cancelling:
-            self._mark_cancelled(run, reason="cancelled_after_start_claim")
+            self._mark_cancelled(
+                run,
+                reason="cancelled_after_start_claim",
+                lease_token=claim.lease_token,
+            )
             return
         try:
             runtime = self.registry.resolve(run.agent_id, run.agent_version)
@@ -262,10 +432,11 @@ class RuntimeManager:
                 thread_id=run.thread_id,
                 boundary="initial_state",
             )
-            self.store.append_event(
+            self.store.append_attempt_event(
                 run.run_id,
-                "checkpoint.loaded",
-                {"source": state_source},
+                lease_token=claim.lease_token,
+                event_type="checkpoint.loaded",
+                payload={"source": state_source},
             )
             assert run.input is not None
             runtime_input = registration.parse_input(run.input)
@@ -281,6 +452,7 @@ class RuntimeManager:
                     thread_id=run.thread_id,
                     recovered_after_restart=recovered_after_restart,
                     authority=self._execution_authority(run),
+                    lease_token=claim.lease_token,
                 ),
             )
             result_state = self._validate_runtime_state(
@@ -289,32 +461,47 @@ class RuntimeManager:
                 thread_id=run.thread_id,
                 boundary="execute",
             )
+            if lease_lost.is_set():
+                return
             run.state = result_state
             run.output_message = result.message
             run.validation_errors = result.validation_errors
             run.error_code = None
             run.error = None
-            if not self.store.finalize_completed_run(run):
-                latest = self._require_run(run_id)
+            outcome = self.store.commit_completed_run(
+                run,
+                lease_token=claim.lease_token,
+            )
+            if outcome == RunCommitOutcome.CANCEL_REQUESTED:
+                latest = self._require_run(run.run_id)
                 latest.state = result_state
+                latest.output_message = result.message
+                latest.validation_errors = result.validation_errors
                 latest.error_code = None
                 latest.error = None
-                self._mark_cancelled(latest, reason="cancelled_after_execution_boundary")
-                return
+                self._mark_cancelled(
+                    latest,
+                    reason="cancelled_after_execution_boundary",
+                    lease_token=claim.lease_token,
+                )
+            return
         except ExternalActionReconciliationPendingError as exc:
-            run = self._require_run(run_id)
+            if lease_lost.is_set():
+                return
             # Persist a non-terminal recovery marker.  It is sufficient on its
             # own to arbitrate restart-time cancellation even when a custom
             # RuntimeManager composition omitted the optional ledger callback.
-            self.store.mark_reconciliation_pending(
-                run_id,
+            self.store.commit_reconciliation_pending(
+                run.run_id,
                 tenant_id=run.tenant_id,
+                lease_token=claim.lease_token,
                 error_code=exc.code,
                 error=f"{type(exc).__name__}: {exc}",
             )
             return
         except Exception as exc:  # pragma: no cover
-            run = self._require_run(run_id)
+            if lease_lost.is_set():
+                return
             reconciliation_pending = (
                 run.error_code == ExternalActionReconciliationPendingError.CODE
                 or reconcile_before_cancelling
@@ -332,9 +519,10 @@ class RuntimeManager:
                 # Setup, registry, input/state loading, or other local failures
                 # cannot supersede a still-pending external-action outcome.
                 pending = ExternalActionReconciliationPendingError()
-                self.store.mark_reconciliation_pending(
-                    run_id,
+                self.store.commit_reconciliation_pending(
+                    run.run_id,
                     tenant_id=run.tenant_id,
+                    lease_token=claim.lease_token,
                     error_code=pending.code,
                     error=f"{type(pending).__name__}: {pending}",
                 )
@@ -348,28 +536,55 @@ class RuntimeManager:
                     "external_action_failed",
                 }
             )
-            if run.cancel_requested and not external_action_safety_failure:
-                self._mark_cancelled(run, reason="cancelled_during_failure_boundary")
+            latest = self._require_run(run.run_id)
+            if latest.cancel_requested and not external_action_safety_failure:
+                self._mark_cancelled(
+                    latest,
+                    reason="cancelled_during_failure_boundary",
+                    lease_token=claim.lease_token,
+                )
                 return
-            run.status = RunStatus.FAILED
-            run.error_code = (
+            error_code = (
                 exc.code
                 if isinstance(exc, RuntimeExecutionError)
                 else "runtime_execution_failed"
             )
-            run.error = f"{type(exc).__name__}: {exc}"
-            run.completed_at = utc_now()
-            self.store.update_run(run)
-            event_payload = {
-                "error_code": run.error_code,
-                "error": run.error,
-            }
-            if not isinstance(exc, RuntimeExecutionError):
-                event_payload["traceback"] = traceback.format_exc(limit=5)
-            self.store.append_event(run.run_id, "run.failed", event_payload)
+            error = f"{type(exc).__name__}: {exc}"
+            outcome = self.store.commit_failed_run(
+                run,
+                lease_token=claim.lease_token,
+                error_code=error_code,
+                error=error,
+                traceback_text=(
+                    None
+                    if isinstance(exc, RuntimeExecutionError)
+                    else traceback.format_exc(limit=5)
+                ),
+                allow_cancel_requested=external_action_safety_failure,
+            )
+            if (
+                outcome == RunCommitOutcome.CANCEL_REQUESTED
+                and not external_action_safety_failure
+            ):
+                latest = self._require_run(run.run_id)
+                self._mark_cancelled(
+                    latest,
+                    reason="cancelled_during_failure_boundary",
+                    lease_token=claim.lease_token,
+                )
 
-    def _mark_cancelled(self, run: RunRecord, *, reason: str) -> bool:
-        return self.store.finalize_cancelled_run(run, reason=reason)
+    def _mark_cancelled(
+        self,
+        run: RunRecord,
+        *,
+        reason: str,
+        lease_token: str,
+    ) -> RunCommitOutcome:
+        return self.store.commit_cancelled_run(
+            run,
+            reason=reason,
+            lease_token=lease_token,
+        )
 
     def _require_run(self, run_id: str) -> RunRecord:
         run = self.store.get_run_internal(run_id)

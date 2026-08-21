@@ -303,12 +303,18 @@ def initialize_stores(
             agent_version="1.0.0",
             domain_id="generic",
             schema_version="1",
-            status=RunStatus.RUNNING,
+            status=RunStatus.QUEUED,
             input=RUNTIME_INPUT,
             execution_authority=context.authority,
-            attempt=1,
+            attempt=0,
         )
     )
+    claim = run_store.claim_next_run(
+        owner_id="dynamic-external-action-test",
+        lease_duration_seconds=300,
+    )
+    assert claim is not None
+    context.lease_token = claim.lease_token
     return run_store, SQLiteWorkflowStore(database_path)
 
 
@@ -654,14 +660,25 @@ def test_definitive_failure_keeps_stable_code_when_run_evidence_mirror_fails(
         retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
         dispatcher=dispatcher_for(provider),
     )
-    original_append = run_store.append_event
+    original_append = run_store.append_attempt_event
 
-    def fail_failure_mirror(run_id, event_type, payload=None):
+    def fail_failure_mirror(
+        run_id,
+        *,
+        lease_token,
+        event_type,
+        payload=None,
+    ):
         if event_type == "external_action.failed":
             raise sqlite3.OperationalError("injected run evidence failure")
-        return original_append(run_id, event_type, payload)
+        return original_append(
+            run_id,
+            lease_token=lease_token,
+            event_type=event_type,
+            payload=payload,
+        )
 
-    monkeypatch.setattr(run_store, "append_event", fail_failure_mirror)
+    monkeypatch.setattr(run_store, "append_attempt_event", fail_failure_mirror)
 
     with pytest.raises(RuntimeExecutionError) as raised:
         execute_loop(loop, context)
@@ -1167,14 +1184,25 @@ def test_success_with_unrepairable_run_evidence_gap_is_not_generic_failure(
         retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
         dispatcher=dispatcher_for(provider),
     )
-    original_append = run_store.append_event
+    original_append = run_store.append_attempt_event
 
-    def fail_success_mirror(run_id, event_type, payload=None):
+    def fail_success_mirror(
+        run_id,
+        *,
+        lease_token,
+        event_type,
+        payload=None,
+    ):
         if event_type == "external_action.succeeded":
             raise sqlite3.OperationalError("injected run evidence failure")
-        return original_append(run_id, event_type, payload)
+        return original_append(
+            run_id,
+            lease_token=lease_token,
+            event_type=event_type,
+            payload=payload,
+        )
 
-    monkeypatch.setattr(run_store, "append_event", fail_success_mirror)
+    monkeypatch.setattr(run_store, "append_attempt_event", fail_success_mirror)
 
     with pytest.raises(RuntimeExecutionError) as raised:
         execute_loop(loop, context)
@@ -1482,14 +1510,29 @@ def test_initial_recovery_mirror_failure_preserves_terminal_success(
         retry_mode=ToolRetryMode.PROVIDER_IDEMPOTENT,
         dispatcher=dispatcher_for(recovered_provider),
     )
-    original_append = recovered_run_store.append_event
+    original_append = recovered_run_store.append_attempt_event
 
-    def fail_success_mirror(run_id, event_type, payload=None):
+    def fail_success_mirror(
+        run_id,
+        *,
+        lease_token,
+        event_type,
+        payload=None,
+    ):
         if event_type == "external_action.succeeded":
             raise sqlite3.OperationalError("injected recovery mirror failure")
-        return original_append(run_id, event_type, payload)
+        return original_append(
+            run_id,
+            lease_token=lease_token,
+            event_type=event_type,
+            payload=payload,
+        )
 
-    monkeypatch.setattr(recovered_run_store, "append_event", fail_success_mirror)
+    monkeypatch.setattr(
+        recovered_run_store,
+        "append_attempt_event",
+        fail_success_mirror,
+    )
 
     with pytest.raises(RuntimeExecutionError) as raised:
         execute_loop(
@@ -1981,6 +2024,7 @@ def test_cancelled_run_stops_after_prepare_without_dispatch(
         step_id: str,
         *,
         tool_attempt_token: str,
+        lease_token: str | None = None,
     ):
         run_store.request_cancel_atomically(
             run_id,
@@ -1990,6 +2034,7 @@ def test_cancelled_run_stops_after_prepare_without_dispatch(
             run_id,
             step_id,
             tool_attempt_token=tool_attempt_token,
+            lease_token=lease_token,
         )
 
     monkeypatch.setattr(

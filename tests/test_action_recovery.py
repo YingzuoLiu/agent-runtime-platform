@@ -318,7 +318,13 @@ def test_cancellation_before_dispatch_is_cancelled_with_zero_provider_calls(
         workflow_store = client.app.state.workflow_store
         original_begin = workflow_store.begin_external_action_dispatch
 
-        def cancel_then_begin(run_id: str, step_id: str, *, tool_attempt_token: str):
+        def cancel_then_begin(
+            run_id: str,
+            step_id: str,
+            *,
+            tool_attempt_token: str,
+            lease_token: str | None = None,
+        ):
             client.app.state.runtime_manager.request_cancel(
                 run_id,
                 tenant_context=TenantContext(
@@ -330,6 +336,7 @@ def test_cancellation_before_dispatch_is_cancelled_with_zero_provider_calls(
                 run_id,
                 step_id,
                 tool_attempt_token=tool_attempt_token,
+                lease_token=lease_token,
             )
 
         monkeypatch.setattr(
@@ -396,8 +403,9 @@ def test_cancellation_after_dispatch_never_masks_provider_outcome(
 
 def test_succeeded_ledger_stays_authoritative_after_later_run_failure(tmp_path):
     provider = SuccessProvider(supports_idempotency=True)
+    database_path = tmp_path / "runtime.db"
     app = create_app(
-        database_path=tmp_path / "runtime.db",
+        database_path=database_path,
         authenticator=AUTHENTICATOR,
         action_providers={"demo": provider},
     )
@@ -407,15 +415,23 @@ def test_succeeded_ledger_stays_authoritative_after_later_run_failure(tmp_path):
         action_id = created.json()["action_id"]
         run = client.app.state.run_store.get_run_internal(action_id)
         assert run is not None
-        client.app.state.run_store.update_run(
-            run.model_copy(
-                update={
-                    "status": RunStatus.FAILED,
-                    "error_code": "runtime_execution_failed",
-                    "error": "secret traceback from a later mirror failure",
-                }
+        # Corrupt the projection directly to model historical data written by
+        # an older runtime. Production RunStore mutation no longer exposes an
+        # unfenced whole-record update surface.
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, error_code = ?, error = ?
+                WHERE run_id = ?
+                """,
+                (
+                    RunStatus.FAILED.value,
+                    "runtime_execution_failed",
+                    "secret traceback from a later mirror failure",
+                    action_id,
+                ),
             )
-        )
         projected = client.get(f"/actions/{action_id}")
 
     assert projected.status_code == 200
@@ -546,10 +562,14 @@ def test_action_events_fail_closed_when_terminal_evidence_conflicts(tmp_path):
         action_id = created.json()["action_id"]
         workflow_store = SQLiteWorkflowStore(database_path)
         action = workflow_store.list_external_actions(action_id)[0]
-        workflow_store.append_event(
-            action_id,
-            "external_action.failed",
-            {
+        # Corrupt the ledger below its fenced public API: this test is proving
+        # that the read boundary rejects contradictory terminal evidence.
+        with workflow_store._connect() as connection:
+            workflow_store._append_event_with_connection(
+                connection,
+                action_id,
+                "external_action.failed",
+                {
                 "evidence_id": f"action:{action.action_id}:tampered-outcome",
                 "action_id": action.action_id,
                 "step_id": action.step_id,
@@ -559,8 +579,8 @@ def test_action_events_fail_closed_when_terminal_evidence_conflicts(tmp_path):
                 "dispatch_count": action.dispatch_count,
                 "provider_reference": None,
                 "error_code": "external_action_failed",
-            },
-        )
+                },
+            )
         events = client.get(f"/actions/{action_id}/events")
 
     assert events.status_code == 500
