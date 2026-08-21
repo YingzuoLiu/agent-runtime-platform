@@ -106,7 +106,7 @@ class DurableActionGatewayRuntime:
                 include_terminal=False,
             )
             self._fail(
-                context.run_id,
+                context,
                 "external_action_evidence_incomplete",
                 "The private Action workflow failed outside a proven provider outcome.",
             )
@@ -122,6 +122,7 @@ class DurableActionGatewayRuntime:
             context.run_id,
             ACTION_WORKFLOW_TYPE,
             execution_hash,
+            lease_token=context.lease_token,
         )
         if claim.outcome in {
             ExecutionOutcome.INPUT_MISMATCH,
@@ -129,7 +130,7 @@ class DurableActionGatewayRuntime:
         }:
             self.coordinator.reconcile_dispatched_action(context=context)
             self._fail(
-                context.run_id,
+                context,
                 "external_action_evidence_incomplete",
                 "Persisted Action workflow identity does not match its Run input.",
             )
@@ -142,17 +143,20 @@ class DurableActionGatewayRuntime:
             code = execution.error_code or "external_action_evidence_incomplete"
             raise RuntimeExecutionError(code, self._safe_message(code))
         if execution.status == WorkflowStatus.PENDING:
-            self.workflow_store.mark_running(context.run_id)
+            self.workflow_store.mark_running(
+                context.run_id,
+                lease_token=context.lease_token,
+            )
 
         if not context.authority.allows("tools:execute"):
             self._fail(
-                context.run_id,
+                context,
                 "tool_permission_denied",
                 "The persisted authority does not include tools:execute.",
             )
         if not context.authority.allows("external-actions:execute"):
             self._fail(
-                context.run_id,
+                context,
                 "external_action_permission_denied",
                 "The persisted authority does not include external-actions:execute.",
             )
@@ -161,7 +165,7 @@ class DurableActionGatewayRuntime:
         if provider is None:
             self.coordinator.reconcile_dispatched_action(context=context)
             self._fail(
-                context.run_id,
+                context,
                 "external_action_not_configured",
                 "The destination alias has no registered provider.",
             )
@@ -192,18 +196,19 @@ class DurableActionGatewayRuntime:
             result = WebhookSendOutput.model_validate(observation.result)
         except ValidationError:
             self._fail(
-                context.run_id,
+                context,
                 "external_action_evidence_incomplete",
                 "Completed provider evidence failed the Action output contract.",
             )
         record = self.workflow_store.finalize_ready(
             context.run_id,
             canonical_action_json(result.model_dump(mode="json")),
+            lease_token=context.lease_token,
         )
         if record.status != WorkflowStatus.READY:
             self.coordinator.reconcile_dispatched_action(context=context)
             self._fail(
-                context.run_id,
+                context,
                 "external_action_evidence_incomplete",
                 "Action workflow finalization did not preserve the provider outcome.",
             )
@@ -232,10 +237,19 @@ class DurableActionGatewayRuntime:
             validation_errors=[],
         )
 
-    def _fail(self, run_id: str, code: str, _unsafe_detail: str) -> NoReturn:
-        execution = self.workflow_store.get_execution(run_id)
+    def _fail(
+        self,
+        context: RuntimeExecutionContext,
+        code: str,
+        _unsafe_detail: str,
+    ) -> NoReturn:
+        execution = self.workflow_store.get_execution(context.run_id)
         if execution is not None and execution.status == WorkflowStatus.RUNNING:
-            self.workflow_store.finalize_failed(run_id, code)
+            self.workflow_store.finalize_failed(
+                context.run_id,
+                code,
+                lease_token=context.lease_token,
+            )
         raise RuntimeExecutionError(code, self._safe_message(code))
 
     def _safe_message(self, code: str) -> str:

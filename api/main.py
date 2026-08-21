@@ -569,20 +569,22 @@ def create_app(
                 detail="External-write tools require the durable run lifecycle",
             )
         if payload.run_id is not None:
-            store.append_event(
+            store.append_control_plane_event(
                 payload.run_id,
-                "sandbox.execution_started",
-                {"tool_name": tool_name},
+                tenant_id=principal.tenant_id,
+                event_type="sandbox.execution_started",
+                payload={"tool_name": tool_name},
             )
 
         sandbox: ToolSandbox = request.app.state.tool_sandbox
         result = sandbox.execute(tool_name, payload.arguments)
 
         if payload.run_id is not None:
-            store.append_event(
+            store.append_control_plane_event(
                 payload.run_id,
-                "sandbox.execution_finished",
-                {
+                tenant_id=principal.tenant_id,
+                event_type="sandbox.execution_finished",
+                payload={
                     "tool_name": tool_name,
                     "execution_id": result.execution_id,
                     "status": result.status.value,
@@ -618,7 +620,10 @@ def create_app(
         state_value = payload.state or persisted_state or AgentState(thread_id=payload.thread_id)
         result = runtime.handle_user_message(state_value, payload.user_message)
         try:
-            store.save_thread_state(result.state, tenant_id=principal.tenant_id)
+            store.save_unmanaged_thread_state(
+                result.state,
+                tenant_id=principal.tenant_id,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return AgentMessageResponse(

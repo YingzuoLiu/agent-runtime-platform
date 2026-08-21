@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 
@@ -25,6 +26,7 @@ from domains.travel.runtime import TravelAgentRuntime, TravelMessageInput
 from domains.travel.state import AgentState
 from runtime_service import (
     AgentRegistry,
+    RunCommitOutcome,
     RunCreateRequest,
     RunRecord,
     RunStatus,
@@ -45,6 +47,23 @@ TENANT_CONTEXT = TenantContext(tenant_id="legacy", subject_id="runtime-tester")
 
 def submit_run(manager: RuntimeManager, request: RunCreateRequest):
     return manager.submit(request, tenant_context=TENANT_CONTEXT)
+
+
+def claim_store_run(
+    store: SQLiteRunStore,
+    run: RunRecord,
+) -> tuple[RunRecord, str]:
+    store.create_run(run)
+    claim = store.claim_next_run(
+        owner_id=f"test-owner-{run.run_id}",
+        lease_duration_seconds=30,
+        reconciliation_pending_code=(
+            ExternalActionReconciliationPendingError.CODE
+        ),
+    )
+    assert claim is not None
+    assert claim.run.run_id == run.run_id
+    return claim.run, claim.lease_token
 
 
 def wait_for_terminal(manager: RuntimeManager, run_id: str, timeout: float = 10.0):
@@ -309,7 +328,109 @@ def test_cancelled_before_start(tmp_path):
         manager.stop()
 
 
-def test_cancel_cas_between_read_and_start_claim_is_not_overwritten(
+def test_stop_gate_prevents_claim_after_control_plane_scan(
+    tmp_path,
+    monkeypatch,
+):
+    scan_entered = threading.Event()
+    release_scan = threading.Event()
+    claim_called = threading.Event()
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    original_finalize = store.finalize_next_queued_cancellation
+    original_claim = store.claim_next_run
+
+    def blocked_finalize():
+        scan_entered.set()
+        if not release_scan.wait(timeout=5):
+            raise TimeoutError("test did not release cancellation scan")
+        return original_finalize()
+
+    def observed_claim(**kwargs):
+        claim_called.set()
+        return original_claim(**kwargs)
+
+    monkeypatch.setattr(store, "finalize_next_queued_cancellation", blocked_finalize)
+    monkeypatch.setattr(store, "claim_next_run", observed_claim)
+    manager = RuntimeManager(
+        store,
+        build_default_registry(),
+        shutdown_grace_seconds=0,
+    )
+    manager.start()
+    assert scan_entered.wait(timeout=5)
+    submitted = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="stop-claim-admission",
+            user_message="Plan a five-day trip to Tokyo.",
+        ),
+    )
+    workers = list(manager._workers)
+
+    manager.stop()
+    release_scan.set()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert not claim_called.is_set()
+    persisted = store.get_run_internal(submitted.run_id)
+    assert persisted is not None
+    assert persisted.status == RunStatus.QUEUED
+    assert persisted.attempt == 0
+
+
+def test_cleanup_read_failure_does_not_kill_worker_or_leak_claim(
+    tmp_path,
+    monkeypatch,
+):
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    manager = RuntimeManager(store, build_default_registry())
+    first = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="cleanup-read-first",
+            user_message="Plan a five-day trip to Tokyo.",
+        ),
+    )
+    second = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="cleanup-read-second",
+            user_message="Plan a five-day trip to Seoul.",
+        ),
+    )
+    cleanup_failure_observed = threading.Event()
+    original_get = store.get_run_internal
+
+    def fail_first_cleanup_read(run_id: str):
+        if not cleanup_failure_observed.is_set():
+            cleanup_failure_observed.set()
+            raise sqlite3.OperationalError("injected cleanup read failure")
+        return original_get(run_id)
+
+    monkeypatch.setattr(store, "get_run_internal", fail_first_cleanup_read)
+    manager.start()
+    try:
+        assert wait_for_terminal(manager, first.run_id).status == RunStatus.COMPLETED
+        assert cleanup_failure_observed.wait(timeout=5)
+        assert wait_for_terminal(manager, second.run_id).status == RunStatus.COMPLETED
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with manager._heartbeat_lock:
+                if not manager._owned_claims:
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("terminal claims leaked from manager bookkeeping")
+
+        assert any(worker.is_alive() for worker in manager._workers)
+    finally:
+        manager.stop()
+
+
+def test_cancel_cas_committing_before_atomic_claim_is_not_overwritten(
     tmp_path,
     monkeypatch,
 ):
@@ -325,13 +446,16 @@ def test_cancel_cas_between_read_and_start_claim_is_not_overwritten(
             user_message="I want a 5-day Tokyo trip under 9000 SGD.",
         ),
     )
-    original_claim = store.claim_run_start
+    original_claim = store.claim_next_run
 
-    def cancel_then_claim(run_id: str, *, tenant_id: str):
-        store.request_cancel_atomically(run_id, tenant_id=tenant_id)
-        return original_claim(run_id, tenant_id=tenant_id)
+    def cancel_then_claim(**kwargs):
+        store.request_cancel_atomically(
+            submitted.run_id,
+            tenant_id=submitted.tenant_id,
+        )
+        return original_claim(**kwargs)
 
-    monkeypatch.setattr(store, "claim_run_start", cancel_then_claim)
+    monkeypatch.setattr(store, "claim_next_run", cancel_then_claim)
     manager.start()
     try:
         result = wait_for_terminal(manager, submitted.run_id)
@@ -344,13 +468,13 @@ def test_cancel_cas_between_read_and_start_claim_is_not_overwritten(
     events = store.list_events(submitted.run_id)
     event_types = [event.event_type for event in events]
     assert event_types.count("run.cancel_requested") == 1
-    assert event_types.count("run.started") == 1
+    assert event_types.count("run.started") == 0
     assert event_types.count("run.cancelled") == 1
     cancelled_events = [
         event for event in events if event.event_type == "run.cancelled"
     ]
     assert cancelled_events[0].payload == {
-        "reason": "cancelled_after_start_claim"
+        "reason": "cancelled_before_start"
     }
 
 
@@ -372,8 +496,11 @@ def test_cancel_cas_after_recovery_scan_is_not_overwritten(
         input_message="I want a 5-day Tokyo trip under 9000 SGD.",
         attempt=1,
     )
-    store.create_run(run)
-    store.append_event(run.run_id, "run.started", {"attempt": 1})
+    store._seed_historical_run_for_migration(
+        run,
+        event_type="run.started",
+        payload={"attempt": 1},
+    )
     original_list = store.list_recoverable_runs
 
     def list_then_cancel():
@@ -391,13 +518,13 @@ def test_cancel_cas_after_recovery_scan_is_not_overwritten(
 
     assert result.status == RunStatus.CANCELLED
     assert result.cancel_requested
-    assert result.attempt == 1
+    assert result.attempt == 2
     assert not started.is_set()
     events = store.list_events(run.run_id)
     event_types = [event.event_type for event in events]
     assert event_types.count("run.cancel_requested") == 1
     assert event_types.count("run.recovered") == 1
-    assert event_types.count("run.started") == 1
+    assert event_types.count("run.started") == 2
     assert event_types.count("run.cancelled") == 1
 
 
@@ -417,7 +544,7 @@ def test_cancelled_after_execution_boundary(tmp_path):
         assert store.load_thread_state("cancel-running", tenant_id="legacy") is None
         reasons = [event.payload.get("reason") for event in store.list_events(submitted.run_id) if event.event_type == "run.cancelled"]
         assert reasons == ["cancelled_after_execution_boundary"]
-        # A cancel that commits before finalize_completed_run's compare-and-set
+        # A cancel that commits before commit_completed_run's compare-and-set
         # UPDATE must win: no checkpoint or completion event may appear, even
         # though the runtime step itself ran to completion.
         event_types = [event.event_type for event in store.list_events(submitted.run_id)]
@@ -468,7 +595,7 @@ def test_outcome_unknown_is_not_hidden_by_concurrent_cancellation(tmp_path):
 def test_recovered_inflight_action_is_reconciled_before_persisted_cancel(tmp_path):
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path)
-    store.create_run(
+    store._seed_historical_run_for_migration(
         RunRecord(
             run_id="run_reconcile_before_cancel",
             thread_id="reconcile-before-cancel",
@@ -599,7 +726,7 @@ def test_reconciliation_pending_run_remains_recoverable_across_restart(tmp_path)
 def test_reconciliation_pending_cancel_resolution_clears_marker(tmp_path):
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path)
-    store.create_run(
+    store._seed_historical_run_for_migration(
         RunRecord(
             run_id="run_pending_cancel_resolution",
             thread_id="pending-cancel-resolution",
@@ -645,7 +772,7 @@ def test_unmarked_crash_recovery_setup_failure_persists_pending_marker(
 ):
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path)
-    store.create_run(
+    store._seed_historical_run_for_migration(
         RunRecord(
             run_id="run_unmarked_crash_setup_failure",
             thread_id="unmarked-crash-setup-failure",
@@ -694,25 +821,31 @@ def test_unmarked_crash_recovery_setup_failure_persists_pending_marker(
 
 def test_reconciliation_marker_update_preserves_cancel_cas(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_pending_marker_cancel_race",
-        thread_id="pending-marker-cancel-race",
-        agent_id="travel-agent",
-        agent_version="1.2.0",
-        status=RunStatus.RUNNING,
-        input_message="Create the test action.",
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_pending_marker_cancel_race",
+            thread_id="pending-marker-cancel-race",
+            agent_id="travel-agent",
+            agent_version="1.2.0",
+            status=RunStatus.QUEUED,
+            input_message="Create the test action.",
+        ),
     )
-    store.create_run(run)
     cancelled = store.request_cancel_atomically(run.run_id, tenant_id=run.tenant_id)
     assert cancelled.cancel_requested
 
-    marked = store.mark_reconciliation_pending(
+    outcome = store.commit_reconciliation_pending(
         run.run_id,
         tenant_id=run.tenant_id,
+        lease_token=lease_token,
         error_code=ExternalActionReconciliationPendingError.CODE,
         error="pending reconciliation",
     )
+    marked = store.get_run_internal(run.run_id)
 
+    assert outcome == RunCommitOutcome.COMMITTED
+    assert marked is not None
     assert marked.status == RunStatus.RUNNING
     assert marked.cancel_requested
     assert marked.error_code == ExternalActionReconciliationPendingError.CODE
@@ -722,8 +855,11 @@ def test_running_run_is_recovered_after_restart(tmp_path):
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path)
     run = RunRecord(run_id="run_recovery_test", thread_id="recovery-thread", agent_id="travel-agent", agent_version="0.3.0", status=RunStatus.RUNNING, input_message="I want a 5-day Tokyo trip under 9000 SGD.", attempt=1)
-    store.create_run(run)
-    store.append_event(run.run_id, "run.started", {"attempt": 1})
+    store._seed_historical_run_for_migration(
+        run,
+        event_type="run.started",
+        payload={"attempt": 1},
+    )
     manager = RuntimeManager(SQLiteRunStore(database_path), build_default_registry())
     manager.start()
     try:
@@ -754,17 +890,29 @@ def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_pa
         agent_version="1.0.0",
         domain_id="release-validation",
         schema_version="1",
-        status=RunStatus.RUNNING,
+        status=RunStatus.QUEUED,
         input=runtime_input.model_dump(mode="json"),
-        attempt=1,
+        attempt=0,
     )
-    SQLiteRunStore(database_path).create_run(run)
+    run_store = SQLiteRunStore(database_path)
+    run_store.create_run(run)
+    seed_claim = run_store.claim_next_run(
+        owner_id="crashed-manager",
+        lease_duration_seconds=30,
+    )
+    assert seed_claim is not None
+    lease_token = seed_claim.lease_token
 
     workflow_store = SQLiteWorkflowStore(database_path)
     canonical_manifest = _canonicalize_manifest(manifest)
     manifest_hash = _stable_hash(canonical_manifest.model_dump(mode="json"))
-    workflow_store.create_or_get_execution(run.run_id, WORKFLOW_TYPE, manifest_hash)
-    workflow_store.mark_running(run.run_id)
+    workflow_store.create_or_get_execution(
+        run.run_id,
+        WORKFLOW_TYPE,
+        manifest_hash,
+        lease_token=lease_token,
+    )
+    workflow_store.mark_running(run.run_id, lease_token=lease_token)
     first_step = STEP_SEQUENCE[0]
     step_hash = _stable_hash(first_step.build_arguments(canonical_manifest, {}))
     workflow_store.claim_step(
@@ -773,7 +921,9 @@ def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_pa
         first_step.tool_name,
         step_hash,
         max_attempts=MAX_ATTEMPTS,
+        lease_token=lease_token,
     )
+    assert run_store.expire_run_lease(run.run_id, lease_token=lease_token)
 
     reopened_workflow_store = SQLiteWorkflowStore(database_path)
     reopened_workflow = ReleaseValidationWorkflow(
@@ -813,7 +963,7 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
     )
     source_workflow.run("source", manifest)
     run_store = SQLiteRunStore(database_path)
-    run_store.create_run(
+    run_store._seed_historical_run_for_migration(
         RunRecord(
             run_id="source",
             thread_id="replay-source-thread",
@@ -837,11 +987,17 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
         agent_version="1.1.0",
         domain_id="release-validation",
         schema_version="1",
-        status=RunStatus.RUNNING,
+        status=RunStatus.QUEUED,
         input=runtime_input.model_dump(mode="json"),
-        attempt=1,
+        attempt=0,
     )
     run_store.create_run(target)
+    seed_claim = run_store.claim_next_run(
+        owner_id="crashed-manager",
+        lease_duration_seconds=30,
+    )
+    assert seed_claim is not None
+    lease_token = seed_claim.lease_token
     workflow_store.create_or_get_execution(
         target.run_id,
         WORKFLOW_TYPE,
@@ -851,8 +1007,9 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
                 "replay": replay.model_dump(mode="json"),
             }
         ),
+        lease_token=lease_token,
     )
-    workflow_store.mark_running(target.run_id)
+    workflow_store.mark_running(target.run_id, lease_token=lease_token)
     by_id = {step.step_id: step for step in STEP_SEQUENCE}
     for step_id in ("load_manifest", "inspect_artifacts"):
         step = by_id[step_id]
@@ -863,6 +1020,7 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
             step_id,
             step.tool_name,
             _stable_hash(arguments),
+            lease_token=lease_token,
         )
     interrupted = by_id["run_unit_tests"]
     workflow_store.claim_step(
@@ -871,7 +1029,9 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
         interrupted.tool_name,
         _stable_hash(interrupted.build_arguments(manifest, {})),
         max_attempts=MAX_ATTEMPTS,
+        lease_token=lease_token,
     )
+    assert run_store.expire_run_lease(target.run_id, lease_token=lease_token)
 
     reopened_workflow_store = SQLiteWorkflowStore(database_path)
     reopened_workflow = ReleaseValidationWorkflow(
@@ -899,26 +1059,38 @@ def test_selective_replay_child_resumes_end_to_end_after_manager_restart(tmp_pat
     assert target_steps["inspect_artifacts"].attempt_count == 0
 
 
-def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
+def test_commit_completed_run_is_idempotent_on_duplicate_call(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_finalize_test",
-        thread_id="finalize-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
-        attempt=1,
-        error_code=ExternalActionReconciliationPendingError.CODE,
-        error="pending reconciliation",
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_finalize_test",
+            thread_id="finalize-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
+    assert (
+        store.commit_reconciliation_pending(
+            run.run_id,
+            tenant_id=run.tenant_id,
+            lease_token=lease_token,
+            error_code=ExternalActionReconciliationPendingError.CODE,
+            error="pending reconciliation",
+        )
+        == RunCommitOutcome.COMMITTED
+    )
+    persisted_pending = store.get_run_internal(run.run_id)
+    assert persisted_pending is not None
+    run = persisted_pending
     run.state = AgentState(thread_id="finalize-thread", destination="Tokyo", days=5, budget=9000)
     run.output_message = "Planned."
     run.validation_errors = []
 
-    first = store.finalize_completed_run(run)
-    assert first is True
+    first = store.commit_completed_run(run, lease_token=lease_token)
+    assert first == RunCommitOutcome.COMMITTED
     assert run.status == RunStatus.COMPLETED
     assert run.error_code is None
     assert run.error is None
@@ -932,9 +1104,9 @@ def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
     assert event_types_after_first.count("checkpoint.saved") == 1
     assert event_types_after_first.count("run.completed") == 1
 
-    second = store.finalize_completed_run(run)
+    second = store.commit_completed_run(run, lease_token=lease_token)
 
-    assert second is False
+    assert second == RunCommitOutcome.ALREADY_TERMINAL
     # A duplicate call must not write any new checkpoint or event: the
     # conditional UPDATE affects zero rows because status is no longer
     # RUNNING, so nothing past it in the method body ever runs.
@@ -946,18 +1118,19 @@ def test_finalize_completed_run_is_idempotent_on_duplicate_call(tmp_path):
     assert persisted.status == RunStatus.COMPLETED
 
 
-def test_finalize_completed_run_rejects_when_cancel_requested_first(tmp_path):
+def test_commit_completed_run_rejects_when_cancel_requested_first(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_cancel_race_test",
-        thread_id="cancel-race-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
-        attempt=1,
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_cancel_race_test",
+            thread_id="cancel-race-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
 
     # Simulate a cancel committing to the database first, in the window
     # between a worker starting execution and it finishing.
@@ -969,13 +1142,13 @@ def test_finalize_completed_run_rejects_when_cancel_requested_first(tmp_path):
     run.output_message = "Planned."
     run.validation_errors = []
 
-    result = store.finalize_completed_run(run)
+    result = store.commit_completed_run(run, lease_token=lease_token)
 
-    assert result is False
+    assert result == RunCommitOutcome.CANCEL_REQUESTED
     persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
-    # RuntimeManager -- not finalize_completed_run -- owns the transition to
-    # CANCELLED once this returns False; the row is left RUNNING here.
+    # RuntimeManager -- not commit_completed_run -- owns the transition to
+    # CANCELLED after this outcome; the row is left RUNNING here.
     assert persisted.status == RunStatus.RUNNING
     assert persisted.state is None
     assert store.load_thread_state("cancel-race-thread", tenant_id="legacy") is None
@@ -1006,31 +1179,41 @@ def test_request_cancel_atomically_is_idempotent_on_duplicate_call(tmp_path):
     assert events.count("run.cancel_requested") == 1
 
 
-def test_finalize_cancelled_run_is_idempotent_on_duplicate_call(tmp_path):
+def test_commit_cancelled_run_is_idempotent_on_duplicate_call(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_dup_cancel_finalize",
-        thread_id="dup-cancel-finalize-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
-        cancel_requested=True,
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_dup_cancel_finalize",
+            thread_id="dup-cancel-finalize-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
+    run = store.request_cancel_atomically(run.run_id, tenant_id=run.tenant_id)
 
-    first = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
-    assert first is True
+    first = store.commit_cancelled_run(
+        run,
+        reason="cancelled_after_execution_boundary",
+        lease_token=lease_token,
+    )
+    assert first == RunCommitOutcome.COMMITTED
     assert run.status == RunStatus.CANCELLED
 
     events_after_first = store.list_events(run.run_id)
     event_types_after_first = [event.event_type for event in events_after_first]
     assert event_types_after_first.count("run.cancelled") == 1
 
-    second = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
+    second = store.commit_cancelled_run(
+        run,
+        reason="cancelled_after_execution_boundary",
+        lease_token=lease_token,
+    )
 
-    assert second is False
-    # Same guarantee as finalize_completed_run: a duplicate call must not
+    assert second == RunCommitOutcome.ALREADY_TERMINAL
+    # Same guarantee as commit_completed_run: a duplicate call must not
     # write any new event because the conditional UPDATE affects zero rows
     # once status is no longer QUEUED/RUNNING.
     events_after_second = store.list_events(run.run_id)
@@ -1043,18 +1226,27 @@ def test_finalize_cancelled_run_is_idempotent_on_duplicate_call(tmp_path):
 
 def test_cancellation_event_order_is_cancel_requested_before_cancelled(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_cancel_order",
-        thread_id="cancel-order-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_cancel_order",
+            thread_id="cancel-order-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
 
-    store.request_cancel_atomically(run.run_id, tenant_id="legacy")
-    store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
+    run = store.request_cancel_atomically(run.run_id, tenant_id="legacy")
+    assert (
+        store.commit_cancelled_run(
+            run,
+            reason="cancelled_after_execution_boundary",
+            lease_token=lease_token,
+        )
+        == RunCommitOutcome.COMMITTED
+    )
 
     events = [event.event_type for event in store.list_events(run.run_id)]
     assert events.index("run.cancel_requested") < events.index("run.cancelled")
@@ -1062,15 +1254,17 @@ def test_cancellation_event_order_is_cancel_requested_before_cancelled(tmp_path)
 
 def test_completion_and_cancellation_are_mutually_exclusive_when_cancel_wins(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_race_cancel_wins",
-        thread_id="race-cancel-wins-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_race_cancel_wins",
+            thread_id="race-cancel-wins-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
 
     # Cancel commits first, exactly like the real cancelled_after_execution_
     # boundary path: cancel_requested flips to 1 while the run is still
@@ -1081,11 +1275,15 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_cancel_wins(tmp
     run.output_message = "Planned."
     run.validation_errors = []
 
-    completed = store.finalize_completed_run(run)
-    assert completed is False
+    completed = store.commit_completed_run(run, lease_token=lease_token)
+    assert completed == RunCommitOutcome.CANCEL_REQUESTED
 
-    cancelled = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
-    assert cancelled is True
+    cancelled = store.commit_cancelled_run(
+        run,
+        reason="cancelled_after_execution_boundary",
+        lease_token=lease_token,
+    )
+    assert cancelled == RunCommitOutcome.COMMITTED
 
     persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
@@ -1101,22 +1299,24 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_cancel_wins(tmp
 
 def test_completion_and_cancellation_are_mutually_exclusive_when_completion_wins(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    run = RunRecord(
-        run_id="run_race_completion_wins",
-        thread_id="race-completion-wins-thread",
-        agent_id="travel-agent",
-        agent_version="0.3.0",
-        status=RunStatus.RUNNING,
-        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+    run, lease_token = claim_store_run(
+        store,
+        RunRecord(
+            run_id="run_race_completion_wins",
+            thread_id="race-completion-wins-thread",
+            agent_id="travel-agent",
+            agent_version="0.3.0",
+            status=RunStatus.QUEUED,
+            input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        ),
     )
-    store.create_run(run)
 
     run.state = AgentState(thread_id="race-completion-wins-thread", destination="Tokyo", days=5, budget=9000)
     run.output_message = "Planned."
     run.validation_errors = []
 
-    completed = store.finalize_completed_run(run)
-    assert completed is True
+    completed = store.commit_completed_run(run, lease_token=lease_token)
+    assert completed == RunCommitOutcome.COMMITTED
 
     # A cancel arriving after completion must not be able to flip anything:
     # the row is no longer QUEUED/RUNNING, so the CAS simply does not match.
@@ -1124,8 +1324,12 @@ def test_completion_and_cancellation_are_mutually_exclusive_when_completion_wins
     assert cancel_request_result.cancel_requested is False
     assert cancel_request_result.status == RunStatus.COMPLETED
 
-    finalize_cancel_result = store.finalize_cancelled_run(run, reason="cancelled_after_execution_boundary")
-    assert finalize_cancel_result is False
+    finalize_cancel_result = store.commit_cancelled_run(
+        run,
+        reason="cancelled_after_execution_boundary",
+        lease_token=lease_token,
+    )
+    assert finalize_cancel_result == RunCommitOutcome.ALREADY_TERMINAL
 
     persisted = store.get_run_internal(run.run_id)
     assert persisted is not None
@@ -1251,8 +1455,11 @@ def test_restart_and_idempotent_submit_do_not_revive_failed_run(tmp_path):
         attempt=1,
         error="RuntimeError: persisted failure",
     )
-    store.create_run(failed)
-    store.append_event(failed.run_id, "run.failed", {"error": failed.error})
+    store._seed_historical_run_for_migration(
+        failed,
+        event_type="run.failed",
+        payload={"error": failed.error},
+    )
 
     manager = RuntimeManager(SQLiteRunStore(database_path), build_default_registry())
     manager.start()

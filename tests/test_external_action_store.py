@@ -39,7 +39,7 @@ def _create_run(run_store: SQLiteRunStore, run_id: str) -> None:
             agent_version="1.0.0",
             domain_id="generic",
             schema_version="1",
-            status=RunStatus.RUNNING,
+            status=RunStatus.QUEUED,
             input={"request": "create a record"},
             execution_authority=RuntimeExecutionAuthority(
                 tenant_id="tenant-a",
@@ -48,6 +48,26 @@ def _create_run(run_store: SQLiteRunStore, run_id: str) -> None:
             ),
         )
     )
+    claim = run_store.claim_next_run(
+        owner_id=f"test-owner-{run_id}",
+        lease_duration_seconds=300,
+    )
+    assert claim is not None
+    assert claim.run.run_id == run_id
+
+
+def _current_lease_token(
+    workflow_store: SQLiteWorkflowStore,
+    run_id: str,
+) -> str:
+    with sqlite3.connect(workflow_store.database_path) as connection:
+        row = connection.execute(
+            "SELECT lease_token FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] is not None
+    return str(row[0])
 
 
 def _claim_step(
@@ -57,20 +77,31 @@ def _claim_step(
     tool_name: str = TOOL_NAME,
     input_hash: str = INPUT_HASH,
 ):
-    workflow_store.create_or_get_execution(run_id, WORKFLOW_TYPE, input_hash)
-    workflow_store.mark_running(run_id)
+    lease_token = _current_lease_token(workflow_store, run_id)
+    workflow_store.create_or_get_execution(
+        run_id,
+        WORKFLOW_TYPE,
+        input_hash,
+        lease_token=lease_token,
+    )
+    workflow_store.mark_running(run_id, lease_token=lease_token)
     claim = workflow_store.claim_step(
         run_id,
         "call-0001",
         tool_name,
         input_hash,
         max_attempts=3,
+        lease_token=lease_token,
     )
     assert claim.attempt_token is not None
     return claim
 
 
-def _prepare_values(run_id: str, tool_attempt_token: str) -> dict:
+def _prepare_values(
+    workflow_store: SQLiteWorkflowStore,
+    run_id: str,
+    tool_attempt_token: str,
+) -> dict:
     return {
         "run_id": run_id,
         "step_id": "call-0001",
@@ -85,6 +116,7 @@ def _prepare_values(run_id: str, tool_attempt_token: str) -> dict:
         "arguments_json": ARGUMENTS_JSON,
         "retry_mode": ExternalActionRetryMode.PROVIDER_IDEMPOTENT,
         "idempotency_key": f"idem-{run_id}",
+        "lease_token": _current_lease_token(workflow_store, run_id),
     }
 
 
@@ -99,7 +131,7 @@ def _seed_prepared_action(
     workflow_store = SQLiteWorkflowStore(database_path)
     _create_run(run_store, run_id)
     claim = _claim_step(workflow_store, run_id)
-    values = _prepare_values(run_id, claim.attempt_token)
+    values = _prepare_values(workflow_store, run_id, claim.attempt_token)
     values["retry_mode"] = retry_mode
     prepared = workflow_store.prepare_external_action(**values)
     assert prepared.action is not None
@@ -167,11 +199,19 @@ def test_prepare_requires_current_claim_and_is_idempotent(tmp_path):
     store = SQLiteWorkflowStore(database_path)
     run_id = "run-prepare"
     _create_run(run_store, run_id)
-    store.create_or_get_execution(run_id, WORKFLOW_TYPE, INPUT_HASH)
-    store.mark_running(run_id)
+    lease_token = _current_lease_token(store, run_id)
+    store.create_or_get_execution(
+        run_id,
+        WORKFLOW_TYPE,
+        INPUT_HASH,
+        lease_token=lease_token,
+    )
+    store.mark_running(run_id, lease_token=lease_token)
 
     with pytest.raises(KeyError, match="Step not found"):
-        store.prepare_external_action(**_prepare_values(run_id, "attempt-missing"))
+        store.prepare_external_action(
+            **_prepare_values(store, run_id, "attempt-missing")
+        )
 
     claim = store.claim_step(
         run_id,
@@ -179,13 +219,20 @@ def test_prepare_requires_current_claim_and_is_idempotent(tmp_path):
         TOOL_NAME,
         INPUT_HASH,
         max_attempts=3,
+        lease_token=lease_token,
     )
-    stale = store.prepare_external_action(**_prepare_values(run_id, "attempt-stale"))
+    stale = store.prepare_external_action(
+        **_prepare_values(store, run_id, "attempt-stale")
+    )
     assert stale.outcome == ExternalActionPrepareOutcome.TOOL_ATTEMPT_MISMATCH
     assert stale.action is None
 
-    first = store.prepare_external_action(**_prepare_values(run_id, claim.attempt_token))
-    second = store.prepare_external_action(**_prepare_values(run_id, claim.attempt_token))
+    first = store.prepare_external_action(
+        **_prepare_values(store, run_id, claim.attempt_token)
+    )
+    second = store.prepare_external_action(
+        **_prepare_values(store, run_id, claim.attempt_token)
+    )
 
     assert first.outcome == ExternalActionPrepareOutcome.CREATED
     assert second.outcome == ExternalActionPrepareOutcome.EXISTING
@@ -208,7 +255,7 @@ def test_prepare_binds_tenant_and_subject_to_persisted_run_authority(tmp_path):
     run_id = "run-authority-binding"
     _create_run(run_store, run_id)
     claim = _claim_step(store, run_id)
-    values = _prepare_values(run_id, claim.attempt_token)
+    values = _prepare_values(store, run_id, claim.attempt_token)
     values["subject_id"] = "subject-attacker"
 
     result = store.prepare_external_action(**values)
@@ -242,7 +289,9 @@ def test_prepare_identity_mismatch_never_mutates_existing_action(
         tmp_path,
         run_id=f"run-mismatch-{field}",
     )
-    values = deepcopy(_prepare_values(original.run_id, claim.attempt_token))
+    values = deepcopy(
+        _prepare_values(store, original.run_id, claim.attempt_token)
+    )
     values[field] = replacement
     before_events = store.list_events(original.run_id)
 
@@ -265,9 +314,17 @@ def test_idempotency_key_cannot_be_reused_by_another_action(tmp_path):
     second_claim = store.get_step("run-key-two", "call-0001")
     assert first_claim is not None and first_claim.attempt_token is not None
     assert second_claim is not None and second_claim.attempt_token is not None
-    first_values = _prepare_values("run-key-one", first_claim.attempt_token)
+    first_values = _prepare_values(
+        store,
+        "run-key-one",
+        first_claim.attempt_token,
+    )
     first_values["idempotency_key"] = "shared-key"
-    second_values = _prepare_values("run-key-two", second_claim.attempt_token)
+    second_values = _prepare_values(
+        store,
+        "run-key-two",
+        second_claim.attempt_token,
+    )
     second_values["idempotency_key"] = "shared-key"
 
     assert (
@@ -292,6 +349,7 @@ def test_cancel_that_commits_before_dispatch_keeps_action_prepared(tmp_path):
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
 
     assert dispatch.outcome == ExternalActionDispatchOutcome.RUN_CANCELLED
@@ -324,6 +382,7 @@ def test_retry_rotates_dispatch_token_and_fences_stale_results(tmp_path, retry_m
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert first.outcome == ExternalActionDispatchOutcome.CLAIMED
     assert first.dispatch_token is not None
@@ -334,6 +393,7 @@ def test_retry_rotates_dispatch_token_and_fences_stale_results(tmp_path, retry_m
             action.step_id,
             previous_dispatch_token="dispatch-stale",
             tool_attempt_token=claim.attempt_token,
+            lease_token=_current_lease_token(store, action.run_id),
         )
 
     second = store.retry_external_action_dispatch(
@@ -341,6 +401,7 @@ def test_retry_rotates_dispatch_token_and_fences_stale_results(tmp_path, retry_m
         action.step_id,
         previous_dispatch_token=first.dispatch_token,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert second.outcome == ExternalActionDispatchOutcome.RETRY_CLAIMED
     assert second.dispatch_token is not None
@@ -371,15 +432,22 @@ def test_stale_tool_attempt_rolls_back_action_terminal_transition(tmp_path):
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert dispatch.dispatch_token is not None
-    store.recover_interrupted_step(action.run_id, action.step_id)
+    lease_token = _current_lease_token(store, action.run_id)
+    store.recover_interrupted_step(
+        action.run_id,
+        action.step_id,
+        lease_token=lease_token,
+    )
     newer = store.claim_step(
         action.run_id,
         action.step_id,
         TOOL_NAME,
         INPUT_HASH,
         max_attempts=3,
+        lease_token=lease_token,
     )
     assert newer.attempt_token is not None
 
@@ -409,6 +477,7 @@ def test_success_atomically_finalizes_action_and_tool_and_is_idempotent(tmp_path
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert dispatch.dispatch_token is not None
 
@@ -476,6 +545,7 @@ def test_failure_and_unknown_atomically_finalize_action_and_tool(
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert dispatch.dispatch_token is not None
 
@@ -516,6 +586,7 @@ def test_raw_provider_exception_is_rejected_without_persistence(tmp_path):
         action.run_id,
         action.step_id,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, action.run_id),
     )
     assert dispatch.dispatch_token is not None
 
@@ -542,7 +613,7 @@ def test_unsafe_dispatch_cannot_retry_and_restart_finalizes_unknown(tmp_path):
     run_id = "run-unsafe"
     _create_run(run_store, run_id)
     claim = _claim_step(store, run_id)
-    values = _prepare_values(run_id, claim.attempt_token)
+    values = _prepare_values(store, run_id, claim.attempt_token)
     values["retry_mode"] = ExternalActionRetryMode.UNSAFE
     prepared = store.prepare_external_action(**values)
     assert prepared.action is not None
@@ -550,6 +621,7 @@ def test_unsafe_dispatch_cannot_retry_and_restart_finalizes_unknown(tmp_path):
         run_id,
         "call-0001",
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, run_id),
     )
     assert dispatch.dispatch_token is not None
 
@@ -558,6 +630,7 @@ def test_unsafe_dispatch_cannot_retry_and_restart_finalizes_unknown(tmp_path):
         "call-0001",
         previous_dispatch_token=dispatch.dispatch_token,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, run_id),
     )
     assert retry.outcome == ExternalActionDispatchOutcome.RETRY_UNSAFE
     assert retry.action.dispatch_count == 1
@@ -567,6 +640,7 @@ def test_unsafe_dispatch_cannot_retry_and_restart_finalizes_unknown(tmp_path):
         "call-0001",
         dispatch_token=dispatch.dispatch_token,
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(store, run_id),
     )
     assert unknown.status == ExternalActionStatus.OUTCOME_UNKNOWN
     assert unknown.error_code == "external_action_outcome_unknown"
@@ -580,12 +654,15 @@ def test_external_action_survives_store_reopen(tmp_path):
     run_id = "run-reopen"
     _create_run(run_store, run_id)
     claim = _claim_step(first_store, run_id)
-    prepared = first_store.prepare_external_action(**_prepare_values(run_id, claim.attempt_token))
+    prepared = first_store.prepare_external_action(
+        **_prepare_values(first_store, run_id, claim.attempt_token)
+    )
     assert prepared.action is not None
     dispatch = first_store.begin_external_action_dispatch(
         run_id,
         "call-0001",
         tool_attempt_token=claim.attempt_token,
+        lease_token=_current_lease_token(first_store, run_id),
     )
     assert dispatch.dispatch_token is not None
 
@@ -606,13 +683,14 @@ def test_selective_replay_rejects_external_action_evidence(tmp_path):
     _create_run(run_store, "source")
     source_claim = _claim_step(store, "source")
     prepared = store.prepare_external_action(
-        **_prepare_values("source", source_claim.attempt_token)
+        **_prepare_values(store, "source", source_claim.attempt_token)
     )
     assert prepared.action is not None
     dispatch = store.begin_external_action_dispatch(
         "source",
         "call-0001",
         tool_attempt_token=source_claim.attempt_token,
+        lease_token=_current_lease_token(store, "source"),
     )
     assert dispatch.dispatch_token is not None
     store.finalize_external_action_succeeded(
@@ -623,7 +701,11 @@ def test_selective_replay_rejects_external_action_evidence(tmp_path):
         result_json='{"record_id":"record-source"}',
         provider_reference="record-source",
     )
-    store.finalize_ready("source", result_json='{"status":"ready"}')
+    store.finalize_ready(
+        "source",
+        result_json='{"status":"ready"}',
+        lease_token=_current_lease_token(store, "source"),
+    )
 
     store.create_or_get_execution("target", WORKFLOW_TYPE, INPUT_HASH)
     store.mark_running("target")

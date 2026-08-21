@@ -15,6 +15,15 @@ class RunEventSink(Protocol):
         payload: dict[str, Any] | None = None,
     ) -> Any: ...
 
+    def append_attempt_event(
+        self,
+        run_id: str,
+        *,
+        lease_token: str | None,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any: ...
+
     def list_events(self, run_id: str, *, after_sequence: int = 0) -> list[Any]: ...
 
 
@@ -47,20 +56,32 @@ class EvidenceProjector:
         run_id: str,
         event_type: str,
         payload: dict[str, Any],
+        *,
+        lease_token: str | None = None,
     ) -> None:
         evidence_id = str(payload["evidence_id"])
         existing = self.workflow_evidence(run_id, event_type, evidence_id)
         if existing is None:
-            self.workflow_store.append_event(run_id, event_type, payload)
+            self.workflow_store.append_event(
+                run_id,
+                event_type,
+                payload,
+                lease_token=lease_token,
+            )
             existing = payload
         elif existing != payload:
             raise RuntimeExecutionError(
                 "invalid_planner_decision",
                 f"Durable evidence mismatch for {evidence_id}.",
             )
-        self.ensure_run_evidence(run_id, event_type, existing)
+        self.ensure_run_evidence(
+            run_id,
+            event_type,
+            existing,
+            lease_token=lease_token,
+        )
 
-    def mirror(self, run_id: str) -> None:
+    def mirror(self, run_id: str, *, lease_token: str | None = None) -> None:
         # The public mirror is read-repair over the whole run, so it is on every
         # recovery and terminalization path. For supported string evidence IDs,
         # read the Run stream once and track appends locally instead of
@@ -79,14 +100,24 @@ class EvidenceProjector:
             if not isinstance(evidence_id, str):
                 # Identity comparison stays value-based for anything the fast
                 # path cannot key on.
-                self.ensure_run_evidence(run_id, event.event_type, event.payload)
+                self.ensure_run_evidence(
+                    run_id,
+                    event.event_type,
+                    event.payload,
+                    lease_token=lease_token,
+                )
                 continue
             if mirrored is None:
                 mirrored = self._run_evidence_index(run_id)
             key = (event.event_type, evidence_id)
             if key in mirrored:
                 continue
-            self.run_event_sink.append_event(run_id, event.event_type, event.payload)
+            self._append_run_event(
+                run_id,
+                event.event_type,
+                event.payload,
+                lease_token=lease_token,
+            )
             mirrored.add(key)
 
     def ensure_run_evidence(
@@ -94,12 +125,19 @@ class EvidenceProjector:
         run_id: str,
         event_type: str,
         payload: dict[str, Any],
+        *,
+        lease_token: str | None = None,
     ) -> None:
         evidence_id = payload.get("evidence_id")
         for event in self.run_event_sink.list_events(run_id):
             if event.event_type == event_type and event.payload.get("evidence_id") == evidence_id:
                 return
-        self.run_event_sink.append_event(run_id, event_type, payload)
+        self._append_run_event(
+            run_id,
+            event_type,
+            payload,
+            lease_token=lease_token,
+        )
 
     def workflow_evidence(
         self,
@@ -126,6 +164,8 @@ class EvidenceProjector:
         step_id: str,
         tool_name: str,
         result: dict[str, Any],
+        *,
+        lease_token: str | None = None,
     ) -> None:
         self.record(
             run_id,
@@ -138,6 +178,7 @@ class EvidenceProjector:
                 "result": result,
                 "error_code": None,
             },
+            lease_token=lease_token,
         )
 
     def record_tool_failure(
@@ -146,6 +187,8 @@ class EvidenceProjector:
         step_id: str,
         tool_name: str,
         error_code: str,
+        *,
+        lease_token: str | None = None,
     ) -> None:
         self.record(
             run_id,
@@ -158,4 +201,26 @@ class EvidenceProjector:
                 "result": None,
                 "error_code": error_code,
             },
+            lease_token=lease_token,
+        )
+
+    def _append_run_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        lease_token: str | None,
+    ) -> None:
+        append_attempt = getattr(self.run_event_sink, "append_attempt_event", None)
+        if append_attempt is None:
+            if lease_token is not None:
+                raise RuntimeError("Run event sink cannot enforce a Run lease")
+            self.run_event_sink.append_event(run_id, event_type, payload)
+            return
+        append_attempt(
+            run_id,
+            lease_token=lease_token,
+            event_type=event_type,
+            payload=payload,
         )

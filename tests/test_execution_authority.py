@@ -90,7 +90,9 @@ def test_restarted_manager_uses_persisted_authority_snapshot(tmp_path):
     assert authority.tenant_id == "tenant-a"
     assert authority.subject_id == "original-subject"
     assert authority.permissions == ("runs:create", "tools:execute")
-    assert captured[0].recovered_after_restart is True
+    # A queued Run has no interrupted attempt to recover; startup merely
+    # discovers and freshly claims it from durable storage.
+    assert captured[0].recovered_after_restart is False
 
 
 def test_idempotent_resubmit_does_not_replace_original_authority(tmp_path):

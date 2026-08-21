@@ -18,7 +18,7 @@ flowchart TB
     C["Client"] --> A["Bearer auth and typed RBAC"]
     A --> API["FastAPI control plane"]
     API --> RM["RuntimeManager and AgentRegistry"]
-    RM --> Q["Local worker queue"]
+    RM --> Q["Durable Run claims + local wake signal"]
     RM --> RS[("Runs, events, checkpoints, memories")]
     RM --> DL["DynamicToolLoop"]
     RM --> DAG["Serial validated DAG"]
@@ -107,6 +107,7 @@ Important transitions are append-only events:
 ```text
 run.queued
 run.started
+run.recovered
 checkpoint.loaded
 checkpoint.saved
 run.completed | run.failed | run.cancelled
@@ -172,45 +173,25 @@ retry. `external_action_evidence_incomplete` is also not masked: a later cancel
 cannot erase the fact that the provider succeeded while public run evidence
 remained incomplete.
 
-## Known consistency gaps
+## Atomic lifecycle and execution ownership
 
-`finalize_completed_run`, `finalize_cancelled_run`, and `request_cancel_atomically` close the
-consistency gap between a run's terminal/cancel-requested status and the event that describes
-it: the status write and its describing event commit in a single transaction, so an external
-reader can never observe the new status without the event already being visible.
+The `runs` table is the worker source of truth. `submit()` atomically creates the Run and
+`run.queued`; a local event only reduces polling latency. Claim and takeover atomically rotate an
+opaque lease token, increment `attempt`, set a store-time expiry, and append `run.started` plus
+`run.recovered` when applicable. Completion, failure, running cancellation, checkpoint persistence,
+and their describing events commit under that same current unexpired token.
 
-A repository-wide audit for the same shape of gap found four more places that still use two
-separate commits -- an `update_run` (or `create_run`) followed by a separate `append_event` --
-instead of one transaction:
+Heartbeats renew from current SQLite time, not from a worker clock or the old deadline. At
+`store_now == lease_expires_at` the attempt is expired: it cannot renew or commit, and a different
+Manager may claim it with a new token. The token is also checked in the workflow, memory, evidence,
+and new external-dispatch mutation transactions, so a paused old worker cannot overwrite the newer
+attempt after takeover. Provider responses from an already-authorized dispatch remain governed by
+their dispatch and tool-attempt tokens because rejecting valid provider evidence would not undo the
+external effect.
 
-- `RuntimeManager.submit()`: `SQLiteRunStore.create_run` and the `run.queued` event;
-- `RuntimeManager._execute_run()`'s QUEUED -> RUNNING transition: `update_run` and the
-  `run.started` event;
-- `RuntimeManager._execute_run()`'s RUNNING -> FAILED path: `update_run` and the `run.failed`
-  event;
-- `RuntimeManager.start()`'s restart recovery, RUNNING -> QUEUED: `update_run` and the
-  `run.recovered` event.
-
-**Target invariant for each of these, once fixed:** the moment an external reader observes the
-new status via `GET /runs/{run_id}`, the event describing that transition must already be
-present in `GET /runs/{run_id}/events` -- the status write and its event must commit together,
-the same way `finalize_completed_run`, `finalize_cancelled_run`, and
-`request_cancel_atomically` already do.
-
-Today these four are primarily a **visibility window**, not a true compare-and-set race: for
-each of these specific transitions, only one worker thread ever touches a given `run_id` at a
-time, so there is no second writer genuinely competing for the same transition the way
-completion and cancellation can compete for the same RUNNING row. A reader can only observe a
-status briefly ahead of its event, not two conflicting terminal outcomes.
-
-That does not mean a future fix should skip the compare-and-set discipline established for
-completion and cancellation. Each of these four should still gate its UPDATE on an explicit
-source-status condition -- e.g. `WHERE run_id = ? AND status = 'queued'` for QUEUED ->
-RUNNING, `WHERE run_id = ? AND status = 'running'` for RUNNING -> FAILED and the
-restart-recovery RUNNING -> QUEUED transition -- rather than an unconditional full-row
-`UPDATE ... WHERE run_id = ?`. Even without a competing writer today, an explicit source-status
-condition keeps the invariant machine-checkable and guards against a future caller (a second
-worker pool, a retried recovery pass) re-running the transition and duplicating its event.
+Lease owner, token, heartbeat, and deadline are internal fields and never enter public Run JSON,
+Planner context, tool arguments, events, memory values, or provider requests. The complete model and
+race matrix are in [`durable-run-leasing.md`](durable-run-leasing.md).
 
 ## Tool sandbox
 
@@ -389,14 +370,18 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 
 ## Restart recovery
 
-On startup, the manager scans records left in `queued` or `running`. A previously running run is
-moved back to `queued`, receives `run.recovered`, and is executed again. Startup-recovered queue
-items carry a domain-neutral execution-context marker; the release-validation adapter maps that
-marker to explicit interrupted-step recovery, while normal submissions do not receive it. The
-dynamic loop replays the pinned Planner decision and inspects any linked external action: success
-is reused, a provider-idempotent in-flight dispatch may use its remaining bounded retry with the
-same key, and an unsafe in-flight dispatch becomes `outcome_unknown` without another provider
-call. If thread-state/workflow identity, the registered tool effect/schema,
+Workers continuously poll durable claim candidates. Queued Runs are fresh claims; a `running` Run
+is recoverable only when its lease is expired or it is a legacy pre-leasing row with no token. A
+live unexpired lease is not rewritten when another Manager starts. Every takeover rotates the
+token, increments the attempt, and appends `run.recovered` and `run.started` in the claim
+transaction.
+
+Recovered executions carry a domain-neutral execution-context marker; the release-validation
+adapter maps it to explicit interrupted-step recovery, while normal submissions do not receive it.
+The dynamic loop replays the pinned Planner decision and inspects any linked external action:
+success is reused, a provider-idempotent in-flight dispatch may use its remaining bounded retry
+with the same key, and an unsafe in-flight dispatch becomes `outcome_unknown` without another
+provider call. If thread-state/workflow identity, the registered tool effect/schema,
 persisted permission, provider route/identity/capability, or other dispatch binding has
 drifted, recovery performs no blind provider replay. An in-flight dispatched
 action is finalized/reported as `outcome_unknown`; a ledger-proven success stays
@@ -414,14 +399,15 @@ security, post-dispatch drift, and unrecoverable evidence-mirror gaps.
 
 ## Deliberate limitations
 
-SQLite and an in-process queue keep the repository runnable without external services. The
+SQLite, durable polling, and an in-process wake signal keep the repository runnable without external services. The
 supplied Compose configuration is the loopback-only local demo. A normal container invocation
 remains fail-closed and requires configured credentials. The Kubernetes Deployment reads
 `RUNTIME_API_KEYS_JSON` from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and
 rotation of that Secret are intentionally outside this slice. Therefore:
 
 - deploy one runtime replica only;
-- there is no distributed worker lease or heartbeat;
+- Run leasing and fencing are proven only for Managers sharing one local SQLite database, not for
+  multi-host workers or a distributed database;
 - cancellation occurs at cooperative execution boundaries;
 - authentication and two-role authorization use local static API-key configuration; there is no
   custom role model, per-tool grant, quota, key rotation, or external secret-manager integration;
@@ -429,12 +415,17 @@ rotation of that Secret are intentionally outside this slice. Therefore:
   no live booking, payment, or inventory integration and no claim of an official vendor sandbox;
 - there is no exactly-once guarantee, compensation/rollback workflow, human approval, or
   automated reconciliation for `outcome_unknown` actions;
-- external dispatch has no distributed queue or lease and remains single-replica SQLite coordination;
+- external dispatch has no distributed queue and remains single-replica SQLite coordination;
 - the subprocess sandbox does not isolate host networking or the complete host filesystem;
 - POSIX rlimits are not available on Windows, where timeout and process separation remain but resource enforcement is weaker;
 - there is no arbitrary user-code execution endpoint;
 - descendant reaping depends on `tini` in the provided container image or an equivalent host init/service manager.
 
-A production-oriented next step is PostgreSQL for runs/checkpoints/events/memories/actions, Redis
-or Pub/Sub for distributed dispatch, worker leases and heartbeats, provider-specific reconciliation
-and compensation, OpenTelemetry traces, and a container-backed sandbox implementation.
+A production-oriented next step is PostgreSQL for runs/checkpoints/events/memories/actions while
+preserving the existing lease-token predicates, Redis or Pub/Sub as a wake channel,
+provider-specific reconciliation and compensation, OpenTelemetry traces, and a container-backed
+sandbox implementation.
+
+The first lease-aware rollout must stop and verify all pre-leasing Runtime processes before the
+additive migration, then start only lease-aware binaries. Mixed old/new execution and mixed-version
+rollback are unsupported because old Managers ignore lease columns.

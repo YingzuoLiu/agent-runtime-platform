@@ -304,22 +304,22 @@ def test_cancel_race_persists_the_revalidated_result_state(tmp_path, monkeypatch
         tmp_path / "runtime.db",
         lambda: CapturingResultRuntime(returned_states),
     )
-    original_complete = store.finalize_completed_run
+    original_complete = store.commit_completed_run
 
-    def cancel_before_completion(run):
+    def cancel_before_completion(run, *, lease_token: str):
         store.request_cancel_atomically(run.run_id, tenant_id=run.tenant_id)
-        return original_complete(run)
+        return original_complete(run, lease_token=lease_token)
 
     cancelled_states: list[ContractState] = []
-    original_cancel = store.finalize_cancelled_run
+    original_cancel = store.commit_cancelled_run
 
-    def capture_cancelled_state(run, *, reason: str):
+    def capture_cancelled_state(run, *, reason: str, lease_token: str):
         assert isinstance(run.state, ContractState)
         cancelled_states.append(run.state)
-        return original_cancel(run, reason=reason)
+        return original_cancel(run, reason=reason, lease_token=lease_token)
 
-    monkeypatch.setattr(store, "finalize_completed_run", cancel_before_completion)
-    monkeypatch.setattr(store, "finalize_cancelled_run", capture_cancelled_state)
+    monkeypatch.setattr(store, "commit_completed_run", cancel_before_completion)
+    monkeypatch.setattr(store, "commit_cancelled_run", capture_cancelled_state)
     manager.start()
     try:
         result = submit_and_wait(manager)

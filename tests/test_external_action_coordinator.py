@@ -68,8 +68,12 @@ def build_coordinator(
 ) -> ExternalActionCoordinator:
     store = StubWorkflowStore(actions or [])
 
-    def fail(run_id: str, code: str, detail: str) -> NoReturn:
-        del run_id, detail
+    def fail(
+        context: RuntimeExecutionContext,
+        code: str,
+        detail: str,
+    ) -> NoReturn:
+        del context, detail
         # host_fail_code models a host whose own terminalization diverges, which
         # is what makes the coordinator fall through to its own message.
         raise RuntimeExecutionError(host_fail_code or code, "stub failure")
@@ -126,7 +130,11 @@ def test_unranked_action_status_mirrors_before_staying_reconciliation_pending(
     action = dispatched_action("quarantined")
     coordinator = build_coordinator(actions=[] if explicit_action else [action])
     mirror_calls: list[str] = []
-    monkeypatch.setattr(coordinator, "_mirror_evidence", mirror_calls.append)
+    monkeypatch.setattr(
+        coordinator,
+        "_mirror_evidence",
+        lambda context: mirror_calls.append(context.run_id),
+    )
 
     # An unranked status cannot prove a safe terminal outcome, whether it is
     # discovered from the run ledger or supplied by an existing recovery path.
@@ -158,7 +166,11 @@ def test_unreconcilable_status_blocks_a_terminal_sibling(
         actions=actions,
     )
     mirror_calls: list[str] = []
-    monkeypatch.setattr(coordinator, "_mirror_evidence", mirror_calls.append)
+    monkeypatch.setattr(
+        coordinator,
+        "_mirror_evidence",
+        lambda context: mirror_calls.append(context.run_id),
+    )
 
     # A known terminal sibling must not hide either a status the runtime cannot
     # understand or a PREPARED row that corruptly claims a dispatch occurred.
@@ -178,7 +190,7 @@ def test_mirror_failure_cannot_replace_reconciliation_pending(
     action = dispatched_action("quarantined")
     coordinator = build_coordinator(actions=[] if explicit_action else [action])
 
-    def fail_mirror(_run_id: str) -> None:
+    def fail_mirror(_context: RuntimeExecutionContext) -> None:
         raise OSError("public evidence unavailable")
 
     monkeypatch.setattr(coordinator, "_mirror_evidence", fail_mirror)
@@ -214,7 +226,7 @@ def test_reconciliation_early_returns_do_not_mirror(
 ):
     coordinator = build_coordinator(actions=actions)
 
-    def unexpected_mirror(_run_id: str) -> None:
+    def unexpected_mirror(_context: RuntimeExecutionContext) -> None:
         raise AssertionError("early-return reconciliation must not mirror")
 
     monkeypatch.setattr(coordinator, "_mirror_evidence", unexpected_mirror)

@@ -45,7 +45,15 @@ from .memory import (
     RetrievedMemory,
     SQLiteMemoryStore,
 )
-from .models import AgentDescriptor, RunCreateRequest, RunEvent, RunRecord, RunStatus
+from .models import (
+    AgentDescriptor,
+    RunCommitOutcome,
+    RunCreateRequest,
+    RunEvent,
+    RunLeaseRecoveryReason,
+    RunRecord,
+    RunStatus,
+)
 from .planner import (
     CallToolDecision,
     FinishDecision,
@@ -68,7 +76,7 @@ from .sandbox import (
     ToolSandbox,
     ToolSpec,
 )
-from .store import SQLiteRunStore
+from .store import RunLeaseLostError, SQLiteRunStore
 
 
 def build_default_tool_registry() -> ToolRegistry:
@@ -122,7 +130,10 @@ __all__ = [
     "Principal",
     "ReferencedRunNotFoundError",
     "RunCreateRequest",
+    "RunCommitOutcome",
     "RunEvent",
+    "RunLeaseLostError",
+    "RunLeaseRecoveryReason",
     "RunRecord",
     "RunStatus",
     "RetrievedMemory",

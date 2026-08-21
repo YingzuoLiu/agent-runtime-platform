@@ -42,6 +42,16 @@ def create_run(
     )
 
 
+def claim_run(store: SQLiteRunStore, run_id: str) -> str:
+    claim = store.claim_next_run(
+        owner_id=f"manager-{run_id}",
+        lease_duration_seconds=30,
+    )
+    assert claim is not None
+    assert claim.run.run_id == run_id
+    return claim.lease_token
+
+
 def write_preference(value: bool) -> MemoryWrite:
     return MemoryWrite(
         kind=MemoryKind.PREFERENCE,
@@ -301,6 +311,7 @@ def test_retry_mirrors_committed_memory_audit_without_duplicate_run_events(tmp_p
     run_store = SQLiteRunStore(database_path)
     memory_store = SQLiteMemoryStore(database_path)
     create_run(run_store, "run-retry", thread_id="thread-retry")
+    lease_token = claim_run(run_store, "run-retry")
     context = RuntimeExecutionContext(
         run_id="run-retry",
         thread_id="thread-retry",
@@ -310,6 +321,7 @@ def test_retry_mirrors_committed_memory_audit_without_duplicate_run_events(tmp_p
             subject_id="subject-a",
             permissions=("memory:read", "memory:write"),
         ),
+        lease_token=lease_token,
     )
     governed = GovernedMemory(memory_store, run_store)
 
@@ -329,7 +341,10 @@ def test_retry_mirrors_committed_memory_audit_without_duplicate_run_events(tmp_p
         domain_id="travel",
         allowed_keys=("flight.avoid_red_eye",),
     )
-    assert run_store.list_events("run-retry") == []
+    assert not any(
+        event.event_type.startswith("memory.")
+        for event in run_store.list_events("run-retry")
+    )
 
     governed.retrieve(
         context,
@@ -354,7 +369,11 @@ def test_retry_mirrors_committed_memory_audit_without_duplicate_run_events(tmp_p
         writes=(write_preference(True),),
     )
 
-    events = run_store.list_events("run-retry")
+    events = [
+        event
+        for event in run_store.list_events("run-retry")
+        if event.event_type.startswith("memory.")
+    ]
     assert [event.event_type for event in events] == [
         "memory.retrieved",
         "memory.created",
@@ -366,6 +385,7 @@ def test_mutation_mirroring_reads_run_events_once_per_batch(tmp_path, monkeypatc
     run_store = SQLiteRunStore(database_path)
     memory_store = SQLiteMemoryStore(database_path)
     create_run(run_store, "run-batch", thread_id="thread-batch")
+    lease_token = claim_run(run_store, "run-batch")
     context = RuntimeExecutionContext(
         run_id="run-batch",
         thread_id="thread-batch",
@@ -374,6 +394,7 @@ def test_mutation_mirroring_reads_run_events_once_per_batch(tmp_path, monkeypatc
             subject_id="subject-a",
             permissions=("memory:write",),
         ),
+        lease_token=lease_token,
     )
     governed = GovernedMemory(memory_store, run_store)
     writes = (
@@ -414,7 +435,11 @@ def test_mutation_mirroring_reads_run_events_once_per_batch(tmp_path, monkeypatc
     )
 
     assert list_events_calls == 2
-    assert [event.event_type for event in original_list_events("run-batch")] == [
+    assert [
+        event.event_type
+        for event in original_list_events("run-batch")
+        if event.event_type.startswith("memory.")
+    ] == [
         "memory.created",
         "memory.created",
         "memory.created",

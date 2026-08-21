@@ -20,6 +20,7 @@ from .external_actions import (
 )
 from .planner import ToolObservation
 from .sandbox import ToolRetryMode, ToolSpec
+from .store import RunLeaseLostError
 from .workflow_store import (
     ClaimOutcome,
     ExternalActionDispatchOutcome,
@@ -75,7 +76,7 @@ class ExternalActionCoordinator:
         dispatcher: ExternalActionDispatcher | None,
         workflow_type: str,
         evidence_projector: EvidenceProjector,
-        fail: Callable[[str, str, str], NoReturn],
+        fail: Callable[[RuntimeExecutionContext, str, str], NoReturn],
         failure_messages: Mapping[str, str] | Callable[[], Mapping[str, str]],
         max_dispatches: int | Callable[[], int] = 2,
     ) -> None:
@@ -182,7 +183,9 @@ class ExternalActionCoordinator:
                 return
 
         try:
-            self._mirror_evidence(context.run_id)
+            self._mirror_evidence(context)
+        except RunLeaseLostError:
+            raise
         except Exception:
             pass
         if reconciliation_pending or action is None:
@@ -210,7 +213,7 @@ class ExternalActionCoordinator:
 
         try:
             self._fail(
-                context.run_id,
+                context,
                 code,
                 "Dispatched external action could not be reconciled.",
             )
@@ -236,14 +239,14 @@ class ExternalActionCoordinator:
             # the execution boundary fail-closed if a caller invokes it
             # independently or mutates server configuration between phases.
             self._fail(
-                context.run_id,
+                context,
                 "external_action_not_configured",
                 "External action provider is not configured.",
             )
         provider = self.dispatcher.registry.resolve(provider_name)
         if provider is None:
             self._fail(
-                context.run_id,
+                context,
                 "external_action_not_configured",
                 "External action provider is not configured.",
             )
@@ -279,7 +282,7 @@ class ExternalActionCoordinator:
         if existing is not None and existing.status == ToolCallStatus.RUNNING:
             if not context.recovered_after_restart:
                 self._fail(
-                    context.run_id,
+                    context,
                     "tool_execution_failed",
                     "External action is already running without a recovery boundary.",
                 )
@@ -295,6 +298,7 @@ class ExternalActionCoordinator:
                 tool_name,
                 input_hash,
                 max_attempts=1,
+                lease_token=context.lease_token,
             )
             if claim.outcome == ClaimOutcome.CACHED:
                 assert claim.step is not None
@@ -311,7 +315,7 @@ class ExternalActionCoordinator:
                 ClaimOutcome.DEFINITION_MISMATCH,
             }:
                 self._fail(
-                    context.run_id,
+                    context,
                     "invalid_planner_decision",
                     "Persisted external action identity does not match the decision.",
                 )
@@ -320,7 +324,7 @@ class ExternalActionCoordinator:
                 ClaimOutcome.ATTEMPTS_EXHAUSTED,
             }:
                 self._fail(
-                    context.run_id,
+                    context,
                     "tool_execution_failed",
                     f"External action step could not be claimed: {claim.outcome.value}.",
                 )
@@ -345,6 +349,7 @@ class ExternalActionCoordinator:
                 arguments_json=arguments_json,
                 retry_mode=spec.retry_mode.value,
                 idempotency_key=idempotency_key,
+                lease_token=context.lease_token,
             )
         except Exception:
             if recovered_dispatch:
@@ -353,11 +358,11 @@ class ExternalActionCoordinator:
                 # both Workflow and Run non-terminal for startup recovery.
                 raise ExternalActionReconciliationPendingError() from None
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "External action preparation failed before dispatch.",
             )
-        self._mirror_evidence(context.run_id)
+        self._mirror_evidence(context)
         if prepared.outcome in {
             ExternalActionPrepareOutcome.IDENTITY_MISMATCH,
             ExternalActionPrepareOutcome.TOOL_ATTEMPT_MISMATCH,
@@ -381,7 +386,7 @@ class ExternalActionCoordinator:
                     action=mismatched_action,
                 )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Persisted external action binding does not match this execution.",
             )
@@ -407,7 +412,7 @@ class ExternalActionCoordinator:
                     action=action,
                 )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Prepared external action cannot form a provider request.",
             )
@@ -417,8 +422,9 @@ class ExternalActionCoordinator:
                 context.run_id,
                 step_id,
                 tool_attempt_token=attempt_token,
+                lease_token=context.lease_token,
             )
-            self._mirror_evidence(context.run_id)
+            self._mirror_evidence(context)
             if dispatch.outcome == ExternalActionDispatchOutcome.RUN_CANCELLED:
                 raise RuntimeExecutionError(
                     "run_cancel_requested",
@@ -436,7 +442,7 @@ class ExternalActionCoordinator:
                 )
             if dispatch.outcome != ExternalActionDispatchOutcome.CLAIMED:
                 self._fail(
-                    context.run_id,
+                    context,
                     "tool_execution_failed",
                     f"External action dispatch could not be claimed: {dispatch.outcome.value}.",
                 )
@@ -445,7 +451,7 @@ class ExternalActionCoordinator:
         elif action.status == ExternalActionStatus.DISPATCHING:
             if not recovered_dispatch:
                 self._fail(
-                    context.run_id,
+                    context,
                     "tool_execution_failed",
                     "External action dispatch is already in progress.",
                 )
@@ -472,7 +478,7 @@ class ExternalActionCoordinator:
 
         if dispatch_token is None:
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Claimed external action dispatch has no token.",
             )
@@ -514,10 +520,11 @@ class ExternalActionCoordinator:
                     step.step_id,
                     dispatch_token=dispatch_token,
                     tool_attempt_token=attempt_token,
+                    lease_token=context.lease_token,
                 ),
             )
         if action.dispatch_count >= self.max_dispatches:
-            self._finalize_external_unknown(
+            self._finalize_reconciliation_unknown(
                 context=context,
                 step=step,
                 dispatch_token=dispatch_token,
@@ -529,8 +536,9 @@ class ExternalActionCoordinator:
             step.step_id,
             previous_dispatch_token=dispatch_token,
             tool_attempt_token=attempt_token,
+            lease_token=context.lease_token,
         )
-        self._mirror_evidence(context.run_id)
+        self._mirror_evidence(context)
         if retry.outcome == ExternalActionDispatchOutcome.TERMINAL:
             return self._handle_external_terminal(
                 context=context,
@@ -546,7 +554,7 @@ class ExternalActionCoordinator:
             or retry.dispatch_token is None
         ):
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 f"Persisted external action could not be safely recovered: {retry.outcome.value}.",
             )
@@ -584,7 +592,7 @@ class ExternalActionCoordinator:
                 # The dispatch claim already won its durable race. If routing
                 # changes after preparation, do not send the key to a different
                 # provider/account ledger; conservatively close as unknown.
-                self._finalize_external_unknown(
+                self._finalize_reconciliation_unknown(
                     context=context,
                     step=step,
                     dispatch_token=dispatch_token,
@@ -643,7 +651,7 @@ class ExternalActionCoordinator:
                     attempt_token=attempt_token,
                 )
                 if retry is None:
-                    self._finalize_external_unknown(
+                    self._finalize_provider_unknown(
                         context=context,
                         step=step,
                         dispatch_token=dispatch_token,
@@ -685,7 +693,7 @@ class ExternalActionCoordinator:
                     attempt_token=attempt_token,
                 )
                 if retry is None:
-                    self._finalize_external_unknown(
+                    self._finalize_provider_unknown(
                         context=context,
                         step=step,
                         dispatch_token=dispatch_token,
@@ -756,8 +764,9 @@ class ExternalActionCoordinator:
             step.step_id,
             previous_dispatch_token=dispatch_token,
             tool_attempt_token=attempt_token,
+            lease_token=context.lease_token,
         )
-        self._mirror_evidence(context.run_id)
+        self._mirror_evidence(context)
         if (
             retry.outcome == ExternalActionDispatchOutcome.RETRY_CLAIMED
             and retry.dispatch_token is not None
@@ -768,19 +777,19 @@ class ExternalActionCoordinator:
             # without revalidating its tool/result binding. Treat it as a
             # durable integrity failure rather than dispatching again.
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "External action became terminal during an ambiguous retry.",
             )
         if retry.outcome == ExternalActionDispatchOutcome.RETRY_UNSAFE:
             return None
         self._fail(
-            context.run_id,
+            context,
             "invalid_planner_decision",
             f"External action retry state is invalid: {retry.outcome.value}.",
         )
 
-    def _finalize_external_unknown(
+    def _finalize_provider_unknown(
         self,
         *,
         context: RuntimeExecutionContext,
@@ -799,6 +808,31 @@ class ExternalActionCoordinator:
                 dispatch_token=dispatch_token,
                 tool_attempt_token=attempt_token,
                 error_code="external_action_outcome_unknown",
+            ),
+        )
+
+    def _finalize_reconciliation_unknown(
+        self,
+        *,
+        context: RuntimeExecutionContext,
+        step: ToolCallRecord,
+        dispatch_token: str,
+        attempt_token: str,
+    ) -> NoReturn:
+        self._raise_external_outcome_unknown(
+            context=context,
+            step=step,
+            dispatch_token=dispatch_token,
+            attempt_token=attempt_token,
+            finalizer=lambda: (
+                self.workflow_store.finalize_external_action_reconciliation_unknown(
+                    context.run_id,
+                    step.step_id,
+                    dispatch_token=dispatch_token,
+                    tool_attempt_token=attempt_token,
+                    error_code="external_action_outcome_unknown",
+                    lease_token=context.lease_token,
+                )
             ),
         )
 
@@ -953,9 +987,9 @@ class ExternalActionCoordinator:
         # retry repairs either side of that gap without invoking the provider.
         for _ in range(2):
             try:
-                self._mirror_evidence(context.run_id)
+                self._mirror_evidence(context)
                 self._record_tool_success(
-                    context.run_id,
+                    context,
                     step.step_id,
                     step.tool_name,
                     result,
@@ -979,9 +1013,9 @@ class ExternalActionCoordinator:
 
         for _ in range(2):
             try:
-                self._mirror_evidence(context.run_id)
+                self._mirror_evidence(context)
                 self._record_tool_failure(
-                    context.run_id,
+                    context,
                     step.step_id,
                     step.tool_name,
                     error_code,
@@ -991,7 +1025,7 @@ class ExternalActionCoordinator:
                 continue
         try:
             self._fail(
-                context.run_id,
+                context,
                 error_code,
                 "Persisted external action failed.",
             )
@@ -1013,6 +1047,8 @@ class ExternalActionCoordinator:
     ) -> NoReturn:
         try:
             finalizer()
+        except RunLeaseLostError:
+            raise
         except Exception:
             # A wrapper or connection cleanup can raise after SQLite committed.
             # Trust only an exact terminal read-back.  If the action is still
@@ -1026,9 +1062,9 @@ class ExternalActionCoordinator:
             ):
                 raise ExternalActionReconciliationPendingError() from None
         try:
-            self._mirror_evidence(context.run_id)
+            self._mirror_evidence(context)
             self._record_tool_failure(
-                context.run_id,
+                context,
                 step.step_id,
                 step.tool_name,
                 "external_action_outcome_unknown",
@@ -1037,7 +1073,7 @@ class ExternalActionCoordinator:
             pass
         try:
             self._fail(
-                context.run_id,
+                context,
                 "external_action_outcome_unknown",
                 "External action outcome could not be durably proven.",
             )
@@ -1108,7 +1144,7 @@ class ExternalActionCoordinator:
         current_step = self.workflow_store.get_step(context.run_id, step.step_id)
         if current_step is None:
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Terminal external action lost its tool step.",
             )
@@ -1134,7 +1170,7 @@ class ExternalActionCoordinator:
                 idempotency_key=idempotency_key,
             )
         self._fail(
-            context.run_id,
+            context,
             "invalid_planner_decision",
             "External action was reported terminal with a non-terminal status.",
         )
@@ -1155,7 +1191,7 @@ class ExternalActionCoordinator:
         )
         if action is None:
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Completed external-write step has no durable action.",
             )
@@ -1265,7 +1301,7 @@ class ExternalActionCoordinator:
         )
         if action is None:
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Failed external-write step has no durable action.",
             )
@@ -1362,7 +1398,7 @@ class ExternalActionCoordinator:
                     action=action,
                 )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Durable external action binding does not match the execution context.",
             )
@@ -1378,7 +1414,7 @@ class ExternalActionCoordinator:
                     action=action,
                 )
             self._fail(
-                context.run_id,
+                context,
                 "invalid_planner_decision",
                 "Durable external action dispatch state is invalid.",
             )
@@ -1402,12 +1438,15 @@ class ExternalActionCoordinator:
             step=step,
             dispatch_token=dispatch_token,
             attempt_token=attempt_token,
-            finalizer=lambda: self.workflow_store.finalize_external_action_outcome_unknown(
-                context.run_id,
-                step.step_id,
-                dispatch_token=dispatch_token,
-                tool_attempt_token=attempt_token,
-                error_code="external_action_outcome_unknown",
+            finalizer=lambda: (
+                self.workflow_store.finalize_external_action_reconciliation_unknown(
+                    context.run_id,
+                    step.step_id,
+                    dispatch_token=dispatch_token,
+                    tool_attempt_token=attempt_token,
+                    error_code="external_action_outcome_unknown",
+                    lease_token=context.lease_token,
+                )
             ),
         )
 
@@ -1482,32 +1521,47 @@ class ExternalActionCoordinator:
 
     def _fail(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         code: str,
         unsafe_detail: str,
     ) -> NoReturn:
-        self.fail(run_id, code, unsafe_detail)
+        self.fail(context, code, unsafe_detail)
 
-    def _mirror_evidence(self, run_id: str) -> None:
-        self.evidence_projector.mirror(run_id)
+    def _mirror_evidence(self, context: RuntimeExecutionContext) -> None:
+        self.evidence_projector.mirror(
+            context.run_id,
+            lease_token=context.lease_token,
+        )
 
     def _record_tool_success(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         step_id: str,
         tool_name: str,
         result: dict[str, Any],
     ) -> None:
-        self.evidence_projector.record_tool_success(run_id, step_id, tool_name, result)
+        self.evidence_projector.record_tool_success(
+            context.run_id,
+            step_id,
+            tool_name,
+            result,
+            lease_token=context.lease_token,
+        )
 
     def _record_tool_failure(
         self,
-        run_id: str,
+        context: RuntimeExecutionContext,
         step_id: str,
         tool_name: str,
         error_code: str,
     ) -> None:
-        self.evidence_projector.record_tool_failure(run_id, step_id, tool_name, error_code)
+        self.evidence_projector.record_tool_failure(
+            context.run_id,
+            step_id,
+            tool_name,
+            error_code,
+            lease_token=context.lease_token,
+        )
 
     def _fail_restored_step(
         self,
@@ -1522,7 +1576,7 @@ class ExternalActionCoordinator:
                 context=context,
                 action=action,
             )
-        self._fail(context.run_id, code, detail)
+        self._fail(context, code, detail)
 
     def fail_restored_step(
         self,
