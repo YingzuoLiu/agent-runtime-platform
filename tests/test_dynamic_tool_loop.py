@@ -475,16 +475,30 @@ def test_step_limit_wins_before_unknown_tool_and_does_not_claim_an_extra_step(tm
 
 
 @pytest.mark.parametrize(
-    ("status", "expected_code"),
+    ("status", "expected_code", "expected_message"),
     [
-        (ToolExecutionStatus.TIMED_OUT, "tool_timed_out"),
-        (ToolExecutionStatus.FAILED, "tool_execution_failed"),
+        (
+            ToolExecutionStatus.CAPABILITY_UNSUPPORTED,
+            "tool_capability_unsupported",
+            "The configured executor cannot enforce the tool's required capability.",
+        ),
+        (
+            ToolExecutionStatus.TIMED_OUT,
+            "tool_timed_out",
+            "Tool execution exceeded its configured deadline.",
+        ),
+        (
+            ToolExecutionStatus.FAILED,
+            "tool_execution_failed",
+            "Tool execution failed.",
+        ),
     ],
 )
 def test_tool_terminal_failures_have_stable_codes_and_durable_failed_steps(
     tmp_path,
     status,
     expected_code,
+    expected_message,
 ):
     run_id = f"tool-{status.value}"
     sandbox = FakeSandbox(failed_result(status))
@@ -503,10 +517,11 @@ def test_tool_terminal_failures_have_stable_codes_and_durable_failed_steps(
         event_sink=event_sink,
     )
 
-    assert_failure_code(
+    failure = assert_failure_code(
         expected_code,
         lambda: execute_loop(loop, execution_context(run_id)),
     )
+    assert str(failure) == expected_message
 
     step = workflow_store.get_step(run_id, "call-0001")
     assert step is not None
@@ -517,6 +532,19 @@ def test_tool_terminal_failures_have_stable_codes_and_durable_failed_steps(
         for event in event_sink.events
         if event.event_type == "tool.result"
     ] == [expected_code]
+    outcomes = [
+        event.payload
+        for event in workflow_store.list_events(run_id)
+        if event.event_type == "loop.outcome"
+    ]
+    assert outcomes == [
+        {
+            "evidence_id": "loop:outcome",
+            "outcome": "failed",
+            "error_code": expected_code,
+            "message": expected_message,
+        }
+    ]
 
 
 def test_sandbox_exception_maps_to_tool_execution_failed(tmp_path):

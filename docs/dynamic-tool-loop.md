@@ -123,6 +123,7 @@ The run exposes a stable `error_code` when the runtime fails:
 | `unknown_tool` | Planner selected a tool outside the allowlist. |
 | `invalid_tool_arguments` | Arguments failed the registered schema. |
 | `tool_permission_denied` | Persisted authority lacks tool execution permission. |
+| `tool_capability_unsupported` | The configured executor cannot enforce the registered tool's required capability. |
 | `tool_timed_out` | The registered subprocess exceeded its deadline. |
 | `tool_execution_failed` | A registered handler or executor failed. |
 | `step_limit_exceeded` | Planner requested another tool after the bounded limit. |

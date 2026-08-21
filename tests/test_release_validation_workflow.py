@@ -473,6 +473,28 @@ def test_default_policy_only_retries_timed_out_not_failed_with_marker_text(workf
     assert steps["run_compatibility"].attempt_count == 1
 
 
+def test_capability_unsupported_is_a_permanent_failure(workflow):
+    scripted = ScriptedFaultSandbox(
+        workflow.sandbox,
+        {
+            "run_compatibility_check": [
+                fabricated_result(
+                    "run_compatibility_check",
+                    ToolExecutionStatus.CAPABILITY_UNSUPPORTED,
+                    error="filesystem=readonly cannot be enforced",
+                )
+            ]
+        },
+    )
+    workflow.sandbox = scripted
+
+    with pytest.raises(StepPermanentFailureError):
+        workflow.run("run-1", make_valid_manifest())
+
+    steps = {step.step_id: step for step in workflow.store.list_steps("run-1")}
+    assert steps["run_compatibility"].attempt_count == 1
+
+
 def test_injected_classifier_can_treat_a_specific_failed_result_as_transient(tmp_path):
     store = SQLiteWorkflowStore(tmp_path / "workflow.db")
     sandbox = ToolSandbox(build_release_validation_tool_registry())

@@ -16,9 +16,14 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
+WORKER_CAPABILITY_UNSUPPORTED_EXIT_CODE = 5
+WORKER_CAPABILITY_UNSUPPORTED_PREFIX = "CAPABILITY_UNSUPPORTED: "
+
+
 class ToolExecutionStatus(str, Enum):
     COMPLETED = "completed"
     DENIED = "denied"
+    CAPABILITY_UNSUPPORTED = "capability_unsupported"
     INVALID_INPUT = "invalid_input"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
@@ -40,11 +45,25 @@ class ToolRetryMode(str, Enum):
 
 
 class ToolPolicy(BaseModel):
+    """Server-declared requirements for one registered tool execution.
+
+    Capability declarations are requirements, not proof. ``ToolSandbox`` must
+    reject an execution unless its subprocess layer supports the requested
+    mode at the requested enforcement strength.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     max_output_bytes: int = Field(default=16_384, ge=256, le=1_048_576)
     max_memory_mb: int = Field(default=256, ge=32, le=1024)
     max_cpu_seconds: int = Field(default=2, ge=1, le=30)
-    network_mode: Literal["host"] = "host"
+    filesystem_mode: Literal["none", "readonly", "readwrite"] = "readwrite"
+    filesystem_enforcement: Literal["process", "kernel"] = "process"
+    network_mode: Literal["none", "host"] = "host"
+    network_enforcement: Literal["process", "kernel"] = "process"
+    environment_mode: Literal["restricted", "inherited"] = "restricted"
+    environment_enforcement: Literal["process", "kernel"] = "process"
 
 
 class ToolExecutionRequest(BaseModel):
@@ -165,10 +184,19 @@ class ToolSandbox:
 
     This is intentionally not an arbitrary-code sandbox. The service controls
     the executable, worker script, tool allowlist, schemas, environment and
-    resource policy. The process backend does not isolate host networking or
-    the full host filesystem; those require a container, gVisor or microVM
-    execution backend.
+    resource policy. ``network_mode='none'`` installs a Python socket guard in
+    the worker. That is process-level prevention for trusted registered tools,
+    not a kernel security boundary. The subprocess cannot enforce a private or
+    read-only filesystem; unsupported requirements fail closed before start.
     """
+
+    _PROCESS_CAPABILITY_SUPPORT = {
+        "filesystem": frozenset({("readwrite", "process")}),
+        "network": frozenset({("none", "process"), ("host", "process")}),
+        "environment": frozenset(
+            {("restricted", "process"), ("inherited", "process")}
+        ),
+    }
 
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
@@ -199,6 +227,16 @@ class ToolSandbox:
                 duration_ms=self._duration_ms(started),
             )
 
+        unsupported_capability = self._unsupported_capability(spec.policy)
+        if unsupported_capability is not None:
+            return ToolExecutionResult(
+                execution_id=execution_id,
+                tool_name=tool_name,
+                status=ToolExecutionStatus.CAPABILITY_UNSUPPORTED,
+                error=unsupported_capability,
+                duration_ms=self._duration_ms(started),
+            )
+
         try:
             validated = spec.input_model.model_validate(arguments)
         except ValidationError as exc:
@@ -211,7 +249,15 @@ class ToolSandbox:
             )
 
         assert spec.handler_entrypoint is not None
-        command = [sys.executable, str(self._worker_path), spec.handler_entrypoint]
+        command = [
+            sys.executable,
+            "-I",
+            "-X",
+            "utf8",
+            "-u",
+            str(self._worker_path),
+            spec.handler_entrypoint,
+        ]
         environment = self._sanitized_environment(spec.policy)
 
         with tempfile.TemporaryDirectory(prefix="agent-runtime-sandbox-") as workspace:
@@ -254,8 +300,22 @@ class ToolSandbox:
         stdout = stdout[: spec.policy.max_output_bytes]
         stderr = stderr[: spec.policy.max_output_bytes]
 
+        error = stderr.decode("utf-8", errors="replace").strip()
+        if (
+            process.returncode == WORKER_CAPABILITY_UNSUPPORTED_EXIT_CODE
+            and error.startswith(WORKER_CAPABILITY_UNSUPPORTED_PREFIX)
+        ):
+            return ToolExecutionResult(
+                execution_id=execution_id,
+                tool_name=tool_name,
+                status=ToolExecutionStatus.CAPABILITY_UNSUPPORTED,
+                error=error,
+                duration_ms=self._duration_ms(started),
+                exit_code=process.returncode,
+                output_truncated=output_truncated,
+            )
+
         if process.returncode != 0:
-            error = stderr.decode("utf-8", errors="replace").strip()
             return ToolExecutionResult(
                 execution_id=execution_id,
                 tool_name=tool_name,
@@ -302,19 +362,53 @@ class ToolSandbox:
 
     @staticmethod
     def _sanitized_environment(policy: ToolPolicy) -> dict[str, str]:
-        environment = {
+        environment = (
+            dict(os.environ) if policy.environment_mode == "inherited" else {}
+        )
+        # Preserve legacy handler-visible values. Isolated mode ignores them for
+        # interpreter startup; ``-X utf8`` owns the worker's encoding contract.
+        environment.update({
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
             "PATH": os.environ.get("PATH", ""),
             "SANDBOX_MAX_CPU_SECONDS": str(policy.max_cpu_seconds),
             "SANDBOX_MAX_MEMORY_MB": str(policy.max_memory_mb),
+            "SANDBOX_FILESYSTEM_MODE": policy.filesystem_mode,
+            "SANDBOX_FILESYSTEM_ENFORCEMENT": policy.filesystem_enforcement,
             "SANDBOX_NETWORK_MODE": policy.network_mode,
-        }
-        for key in ("LANG", "LC_ALL", "TZ", "SYSTEMROOT", "WINDIR"):
-            value = os.environ.get(key)
-            if value:
-                environment[key] = value
+            "SANDBOX_NETWORK_ENFORCEMENT": policy.network_enforcement,
+            "SANDBOX_ENVIRONMENT_MODE": policy.environment_mode,
+            "SANDBOX_ENVIRONMENT_ENFORCEMENT": policy.environment_enforcement,
+        })
+        if policy.environment_mode == "restricted":
+            for key in ("LANG", "LC_ALL", "TZ", "SYSTEMROOT", "WINDIR"):
+                value = os.environ.get(key)
+                if value:
+                    environment[key] = value
         return environment
+
+    @classmethod
+    def _unsupported_capability(cls, policy: ToolPolicy) -> str | None:
+        requirements = (
+            (
+                "filesystem",
+                policy.filesystem_mode,
+                policy.filesystem_enforcement,
+            ),
+            ("network", policy.network_mode, policy.network_enforcement),
+            (
+                "environment",
+                policy.environment_mode,
+                policy.environment_enforcement,
+            ),
+        )
+        for capability, mode, enforcement in requirements:
+            if (mode, enforcement) not in cls._PROCESS_CAPABILITY_SUPPORT[capability]:
+                return (
+                    "Tool capability cannot be enforced by the subprocess executor: "
+                    f"{capability}={mode}, enforcement={enforcement}."
+                )
+        return None
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
