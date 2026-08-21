@@ -251,7 +251,8 @@ class ToolSandbox:
         assert spec.handler_entrypoint is not None
         command = [
             sys.executable,
-            "-I",
+            "-E",
+            "-P",
             "-X",
             "utf8",
             "-u",
@@ -365,7 +366,7 @@ class ToolSandbox:
         environment = (
             dict(os.environ) if policy.environment_mode == "inherited" else {}
         )
-        # Preserve legacy handler-visible values. Isolated mode ignores them for
+        # Preserve legacy handler-visible values. ``-E`` ignores them for
         # interpreter startup; ``-X utf8`` owns the worker's encoding contract.
         environment.update({
             "PYTHONIOENCODING": "utf-8",

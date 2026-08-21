@@ -67,6 +67,10 @@ def forge_capability_prefix_and_exit(_payload: dict[str, Any]) -> dict[str, Any]
 
 def interpreter_runtime_probe(_payload: dict[str, Any]) -> dict[str, Any]:
     return {
+        "ignore_environment": sys.flags.ignore_environment,
+        "isolated": sys.flags.isolated,
+        "no_user_site": sys.flags.no_user_site,
+        "safe_path": sys.flags.safe_path,
         "stderr_encoding": sys.stderr.encoding,
         "stdout_encoding": sys.stdout.encoding,
         "utf8_mode": sys.flags.utf8_mode,

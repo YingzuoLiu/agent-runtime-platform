@@ -419,11 +419,13 @@ def test_worker_errors_use_utf8_independently_of_host_locale():
     assert result.error == f"ModuleNotFoundError: No module named '{module_name}'"
 
 
-def test_worker_utf8_and_unbuffered_modes_override_inherited_python_settings(
+def test_worker_flags_preserve_user_site_and_override_inherited_python_settings(
     monkeypatch,
+    tmp_path,
 ):
     monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
     monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "invalid-python-home"))
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
@@ -442,6 +444,10 @@ def test_worker_utf8_and_unbuffered_modes_override_inherited_python_settings(
 
     assert result.status == ToolExecutionStatus.COMPLETED
     assert result.result == {
+        "ignore_environment": 1,
+        "isolated": 0,
+        "no_user_site": 0,
+        "safe_path": True,
         "stderr_encoding": "utf-8",
         "stdout_encoding": "utf-8",
         "utf8_mode": 1,
@@ -551,12 +557,13 @@ def test_explicit_host_network_capability_allows_connection():
             "_network_allowed_probe",
             {"host": host, "port": port},
         )
+
+        assert result.status == ToolExecutionStatus.COMPLETED
+        assert result.result == {"connected": True}
+
         listener.settimeout(1.0)
         connection, _address = listener.accept()
         connection.close()
-
-    assert result.status == ToolExecutionStatus.COMPLETED
-    assert result.result == {"connected": True}
 
 
 @pytest.mark.parametrize(

@@ -275,12 +275,13 @@ unsupported requirement returns `capability_unsupported` without starting the ha
 | --- | --- | --- | --- |
 | Filesystem | `none`, `readonly`, `readwrite` | `readwrite` | Only `readwrite` is supported. It means the runtime OS user's existing host access with a fresh temporary working directory; there is no mount boundary. `none` and `readonly` fail closed. |
 | Network | `none`, `host` | `host` | Both modes are supported. `none` installs a Python socket guard before importing the registered handler; `host` preserves the existing behavior and explicitly leaves host networking available. |
-| Environment | `restricted`, `inherited` | `restricted` | Both modes are enforced by the environment passed to the worker. `restricted` includes only runtime-owned control variables and a small OS allowlist; `inherited` explicitly exposes the parent environment to the handler. The worker starts Python in isolated mode, so inherited interpreter-control variables such as `PYTHONPATH` cannot redirect registered handler imports. |
+| Environment | `restricted`, `inherited` | `restricted` | Both modes are enforced by the environment passed to the worker. `restricted` includes only runtime-owned control variables and a small OS allowlist; `inherited` explicitly exposes the parent environment to the handler. The worker ignores interpreter-control variables such as `PYTHONPATH`, so they cannot redirect registered handler imports. |
 
-Isolated mode also ignores user-site packages and unsafe implicit script paths. Registered handler
-modules must therefore be importable from the repository root or the interpreter's normal
-system/virtual-environment package paths. The worker explicitly selects Python UTF-8 mode so its
-stderr contract does not depend on the host locale.
+The worker also suppresses unsafe implicit script paths while preserving normal system,
+virtual-environment, and user-site package discovery. Registered handler modules must therefore
+be importable from the repository root or one of those normal interpreter package paths. The
+worker explicitly selects Python UTF-8 mode so its stderr contract does not depend on the host
+locale.
 
 The subprocess executor supports only `enforcement="process"`. Any capability requiring
 `enforcement="kernel"` fails closed. Process network prevention is deliberately narrower than

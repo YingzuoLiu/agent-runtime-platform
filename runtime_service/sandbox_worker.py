@@ -89,8 +89,11 @@ def install_python_network_guard() -> None:
     def deny_network(*_args: Any, **_kwargs: Any) -> None:
         raise PermissionError(NETWORK_DENIED_MESSAGE)
 
-    socket.socket = NetworkDeniedSocket
-    socket.SocketType = NetworkDeniedSocket
+    # Both public constructor aliases are replaced deliberately. ``setattr``
+    # keeps this runtime patch explicit without pretending the typeshed class
+    # declaration is assignable.
+    setattr(socket, "socket", NetworkDeniedSocket)
+    setattr(socket, "SocketType", NetworkDeniedSocket)
     for function_name in (
         "create_connection",
         "create_server",
@@ -113,10 +116,10 @@ def load_handler(entrypoint: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
     if not separator or not module_name or not function_name or ":" in function_name:
         raise ValueError("handler entrypoint must use 'module:function' format")
 
-    # The worker runs from a fresh temporary directory and Python isolated mode
-    # ignores interpreter-control environment variables such as PYTHONPATH. Add
-    # only this checked-out repository root so registered handlers are resolved
-    # from server-owned application code.
+    # The worker runs from a fresh temporary directory. ``-E`` ignores
+    # interpreter-control environment variables such as PYTHONPATH, and ``-P``
+    # suppresses unsafe implicit script paths. Add only this checked-out
+    # repository root so registered handlers resolve from server-owned code.
     repository_root = str(Path(__file__).resolve().parents[1])
     if repository_root not in sys.path:
         sys.path.insert(0, repository_root)
@@ -148,6 +151,8 @@ def main() -> int:
         result = handler(payload)
         if not isinstance(result, dict):
             raise TypeError("tool result must be a JSON object")
+    # Catch BaseException so a trusted handler cannot accidentally turn
+    # SystemExit(5) into the worker's reserved capability-rejection status.
     except BaseException as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 4
