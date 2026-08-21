@@ -222,7 +222,7 @@ The boundary applies:
 - Pydantic input validation with unknown fields rejected;
 - a fixed Python executable and fixed worker script;
 - a fresh temporary working directory per execution;
-- a minimal environment that does not forward API keys or database credentials;
+- a restricted-by-default environment that does not forward API keys or database credentials;
 - wall-clock timeout with process-group termination on POSIX;
 - stdout/stderr size caps;
 - POSIX CPU, address-space, open-file, and core-dump limits;
@@ -266,7 +266,30 @@ curl -X POST http://127.0.0.1:8000/tools/route_cost_summary/execute \
   }'
 ```
 
-This is deliberately a **registered-tool process sandbox**, not an arbitrary-code sandbox. The current backend reports `network_mode: host`: it does not claim to block outbound network access. It also does not provide a private mount namespace or prevent a malicious registered tool from reading files available to the runtime user. Registered tools are therefore still trusted application code.
+Capability declaration and enforcement are separate. Every `ToolPolicy` declares a mode and
+required enforcement strength for filesystem, network, and environment access. Before starting a
+worker, `ToolSandbox` checks the declaration against the subprocess executor's support matrix; an
+unsupported requirement returns `capability_unsupported` without starting the handler.
+
+| Capability | Modes | Default | Process enforcement and current support |
+| --- | --- | --- | --- |
+| Filesystem | `none`, `readonly`, `readwrite` | `readwrite` | Only `readwrite` is supported. It means the runtime OS user's existing host access with a fresh temporary working directory; there is no mount boundary. `none` and `readonly` fail closed. |
+| Network | `none`, `host` | `host` | Both modes are supported. `none` installs a Python socket guard before importing the registered handler; `host` preserves the existing behavior and explicitly leaves host networking available. |
+| Environment | `restricted`, `inherited` | `restricted` | Both modes are enforced by the environment passed to the worker. `restricted` includes only runtime-owned control variables and a small OS allowlist; `inherited` explicitly exposes the parent environment to the handler. The worker ignores interpreter-control variables such as `PYTHONPATH`, so they cannot redirect registered handler imports. |
+
+The worker also suppresses unsafe implicit script paths while preserving normal system,
+virtual-environment, and user-site package discovery. Registered handler modules must therefore
+be importable from the repository root or one of those normal interpreter package paths. The
+worker explicitly selects Python UTF-8 mode so its stderr contract does not depend on the host
+locale.
+
+The subprocess executor supports only `enforcement="process"`. Any capability requiring
+`enforcement="kernel"` fails closed. Process network prevention is deliberately narrower than
+kernel isolation: it protects trusted, first-party Python handlers from accidental policy
+violations, but hostile code using lower-level/native modules or child processes could bypass it.
+The sandbox also has no private mount namespace and cannot prevent a malicious registered tool
+from reading files available to the runtime user. Registered tools therefore remain trusted
+application code.
 
 The dynamic Agent loop invokes this sandbox for allowed `READ_ONLY` decisions.
 The direct tool endpoint remains available for registered read-only tools, but

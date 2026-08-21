@@ -99,6 +99,9 @@ class DynamicToolLoop:
         "tool_permission_denied": (
             "Execution authority does not allow tool execution."
         ),
+        "tool_capability_unsupported": (
+            "The configured executor cannot enforce the tool's required capability."
+        ),
         "tool_timed_out": "Tool execution exceeded its configured deadline.",
         "tool_execution_failed": "Tool execution failed.",
         "step_limit_exceeded": "The dynamic tool-call limit was exceeded.",
@@ -1261,6 +1264,7 @@ class DynamicToolLoop:
     def _tool_error_code(status: ToolExecutionStatus) -> str:
         return {
             ToolExecutionStatus.DENIED: "unknown_tool",
+            ToolExecutionStatus.CAPABILITY_UNSUPPORTED: "tool_capability_unsupported",
             ToolExecutionStatus.INVALID_INPUT: "invalid_tool_arguments",
             ToolExecutionStatus.TIMED_OUT: "tool_timed_out",
             ToolExecutionStatus.FAILED: "tool_execution_failed",

@@ -545,15 +545,17 @@ remain durable even if cancellation later wins the run's completion boundary.
 - independent `external-actions:execute` permission for provider dispatch;
 - service-derived execution authority excluded from API responses;
 - server-owned tool registry and Pydantic arguments with unknown fields rejected;
-- fixed subprocess worker, fresh temporary working directory, scrubbed environment, timeout,
-  bounded output, process-group termination, and POSIX resource limits;
+- fixed subprocess worker, fresh temporary working directory, restricted-by-default environment,
+  process-enforced network deny when declared, timeout, bounded output, process-group termination,
+  and POSIX resource limits;
 - `tini` configured as container PID 1 for signal forwarding and orphan reaping;
 - external-write tools excluded from direct sandbox/API execution and routed only through the
   prepared action ledger.
 
-The process sandbox protects trusted registered tools from accidental or unauthorized selection
-and resource leakage. It is not a general untrusted-code sandbox: it does not isolate host
-networking or create a private mount namespace.
+The process sandbox protects trusted registered tools from accidental or unauthorized selection,
+network-policy mistakes, and resource leakage. Capability requirements fail closed when the
+subprocess executor cannot enforce them. Its Python socket guard is not kernel network isolation,
+and it does not create a private mount namespace, so it is not a general untrusted-code sandbox.
 
 ## API surface
 

@@ -9,6 +9,22 @@ from pathlib import Path
 from typing import Any
 
 
+NETWORK_DENIED_MESSAGE = "Tool network access is denied by process policy."
+CAPABILITY_UNSUPPORTED_EXIT_CODE = 5
+CAPABILITY_UNSUPPORTED_PREFIX = "CAPABILITY_UNSUPPORTED: "
+PROCESS_CAPABILITY_SUPPORT = {
+    "filesystem": frozenset({("readwrite", "process")}),
+    "network": frozenset({("none", "process"), ("host", "process")}),
+    "environment": frozenset(
+        {("restricted", "process"), ("inherited", "process")}
+    ),
+}
+
+
+class UnsupportedCapabilityError(RuntimeError):
+    pass
+
+
 def apply_resource_limits() -> None:
     if os.name != "posix":
         return
@@ -23,14 +39,87 @@ def apply_resource_limits() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def apply_capability_policy() -> None:
+    """Apply the subprocess executor's supported capability requirements.
+
+    This validates the parent preflight again inside the worker. The network
+    guard prevents accidental socket use by trusted Python handlers; it is not
+    designed to contain hostile code using lower-level modules or child processes.
+    """
+
+    try:
+        requirements = {
+            "filesystem": (
+                os.environ["SANDBOX_FILESYSTEM_MODE"],
+                os.environ["SANDBOX_FILESYSTEM_ENFORCEMENT"],
+            ),
+            "network": (
+                os.environ["SANDBOX_NETWORK_MODE"],
+                os.environ["SANDBOX_NETWORK_ENFORCEMENT"],
+            ),
+            "environment": (
+                os.environ["SANDBOX_ENVIRONMENT_MODE"],
+                os.environ["SANDBOX_ENVIRONMENT_ENFORCEMENT"],
+            ),
+        }
+    except KeyError as exc:
+        raise UnsupportedCapabilityError(
+            f"missing worker capability requirement: {exc.args[0]}"
+        ) from exc
+
+    for capability, requirement in requirements.items():
+        if requirement not in PROCESS_CAPABILITY_SUPPORT[capability]:
+            mode, enforcement = requirement
+            raise UnsupportedCapabilityError(
+                "unsupported worker capability requirement: "
+                f"{capability}={mode}, enforcement={enforcement}"
+            )
+
+    if requirements["network"] == ("none", "process"):
+        install_python_network_guard()
+
+
+def install_python_network_guard() -> None:
+    import socket
+
+    class NetworkDeniedSocket(socket.socket):
+        def __new__(cls, *_args: Any, **_kwargs: Any) -> NetworkDeniedSocket:
+            raise PermissionError(NETWORK_DENIED_MESSAGE)
+
+    def deny_network(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError(NETWORK_DENIED_MESSAGE)
+
+    # Both public constructor aliases are replaced deliberately. ``setattr``
+    # keeps this runtime patch explicit without pretending the typeshed class
+    # declaration is assignable.
+    setattr(socket, "socket", NetworkDeniedSocket)
+    setattr(socket, "SocketType", NetworkDeniedSocket)
+    for function_name in (
+        "create_connection",
+        "create_server",
+        "dup",
+        "fromfd",
+        "fromshare",
+        "getaddrinfo",
+        "gethostbyaddr",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "getnameinfo",
+        "socketpair",
+    ):
+        if hasattr(socket, function_name):
+            setattr(socket, function_name, deny_network)
+
+
 def load_handler(entrypoint: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
     module_name, separator, function_name = entrypoint.partition(":")
     if not separator or not module_name or not function_name or ":" in function_name:
         raise ValueError("handler entrypoint must use 'module:function' format")
 
-    # The worker runs from a fresh temporary directory. Add only this checked-out
-    # repository root so server-registered domain handlers remain importable;
-    # caller-controlled PYTHONPATH is intentionally absent from the environment.
+    # The worker runs from a fresh temporary directory. ``-E`` ignores
+    # interpreter-control environment variables such as PYTHONPATH, and ``-P``
+    # suppresses unsafe implicit script paths. Add only this checked-out
+    # repository root so registered handlers resolve from server-owned code.
     repository_root = str(Path(__file__).resolve().parents[1])
     if repository_root not in sys.path:
         sys.path.insert(0, repository_root)
@@ -49,6 +138,12 @@ def main() -> int:
         return 2
 
     try:
+        apply_capability_policy()
+    except UnsupportedCapabilityError as exc:
+        print(f"{CAPABILITY_UNSUPPORTED_PREFIX}{exc}", file=sys.stderr)
+        return CAPABILITY_UNSUPPORTED_EXIT_CODE
+
+    try:
         handler = load_handler(sys.argv[1])
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
         if not isinstance(payload, dict):
@@ -56,7 +151,9 @@ def main() -> int:
         result = handler(payload)
         if not isinstance(result, dict):
             raise TypeError("tool result must be a JSON object")
-    except Exception as exc:
+    # Catch BaseException so a trusted handler cannot accidentally turn
+    # SystemExit(5) into the worker's reserved capability-rejection status.
+    except BaseException as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 4
 
