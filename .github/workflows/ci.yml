@@ -24,3 +24,29 @@ jobs:
       - run: mypy
       - run: pytest -q
       - run: docker compose config --quiet
+
+  action-recovery-proof:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: arp-proof-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python examples/action_recovery_proof.py
+      - if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: action-recovery-proof-${{ github.run_attempt }}
+          path: artifacts/action-recovery-proof.json
+          if-no-files-found: error
+          retention-days: 7
+      - if: failure()
+        run: |
+          docker compose ps -a || true
+          docker compose logs --no-color --tail=200 || true
+      - if: always()
+        run: docker compose down --volumes --remove-orphans

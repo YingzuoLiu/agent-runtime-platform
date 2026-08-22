@@ -101,6 +101,26 @@ offline Planner, and enables an ephemeral demo Operator session. Do not publish 
 `RUNTIME_DEMO_MODE=true`, `/demo` and its browser session endpoint do not exist, and protected API
 routes remain fail-closed.
 
+### Prove Action recovery across a real restart
+
+The Console demonstrates the governed Agent loop. A separate one-command proof exercises the
+Durable Action Gateway against the real HTTP sidecar and kills only the Runtime container after the
+provider has durably committed an effect:
+
+```bash
+python examples/action_recovery_proof.py
+```
+
+The proof runs two deployment-owned destinations. `safe-retry` replays the same server-derived key
+after restart and recovers the provider's stored receipt. `unsafe-no-retry` makes no second provider
+call and terminates as `outcome_unknown`. Before either recovery, the proof verifies that a restarted
+Manager cannot steal the killed attempt's live Run lease; at an injected exact store-time expiry it
+then requires attempt 2 and one `run.recovered(reason=lease_expired)` event. Both paths assert one
+provider effect, restart continuity, ordered Runtime/provider evidence, and duplicate-POST reuse. A
+passing run writes a sanitized local artifact to `artifacts/action-recovery-proof.json`. See
+[`docs/action-recovery-proof.md`](docs/action-recovery-proof.md) for the failure injection, network
+topology, expected output, and short interview walkthrough.
+
 ### Fallback without Docker
 
 ```bash
@@ -739,6 +759,8 @@ input signatures still match; the source run is never mutated.
   partial results, local replanning, and semantic-analyzer boundary;
 - [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md): trusted extension seam,
   executable incident-triage reference, API walkthrough, and version/recovery rules;
+- [`docs/action-recovery-proof.md`](docs/action-recovery-proof.md): one-command Action Gateway
+  restart proof, evidence assertions, and interview walkthrough;
 - [`FINDINGS.md`](FINDINGS.md): evaluation methodology and behavioral findings;
 - [`docs/sample_trace.md`](docs/sample_trace.md): an annotated application-runtime trace.
 
@@ -783,8 +805,13 @@ Phase 7D covers canonical Action idempotency, a private single-step domain, serv
 routing, provider-capability recovery, terminal uncertainty, cancellation precedence, safe status
 and event projection, tenant/RBAC isolation, bounded asynchronous waiting, multi-manager SQLite
 races, threadpool-pressure behavior, and the ten-line external-Agent example.
+The local recovery proof additionally covers provider-side commit-before-response injection,
+independent Runtime restart, live-lease non-stealing, exact-expiry takeover, one-effect receipt
+replay, unsafe no-retry, and sanitized cross-ledger evidence.
 
-GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
+GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12. After
+both matrix legs pass, one Python 3.12 job runs the Docker Action-recovery proof and uploads only its
+sanitized artifact.
 
 ## Deployment boundary
 
