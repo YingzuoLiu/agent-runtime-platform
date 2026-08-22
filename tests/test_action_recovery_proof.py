@@ -364,6 +364,48 @@ def test_compose_lease_probe_uses_one_off_container_only_while_runtime_is_stoppe
     ]
 
 
+def test_compose_runtime_restart_excludes_dependencies_and_disables_recreation(monkeypatch):
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_run(*arguments: str, capture: bool = False) -> str:
+        calls.append((arguments, capture))
+        return ""
+
+    monkeypatch.setattr(ComposeRuntime, "_run", staticmethod(fake_run))
+    compose = ComposeRuntime(build=True)
+
+    compose.start()
+    compose.restart_runtime()
+
+    assert calls == [
+        (
+            (
+                "up",
+                "-d",
+                "--build",
+                "--wait",
+                "--wait-timeout",
+                "120",
+                "runtime",
+            ),
+            False,
+        ),
+        (
+            (
+                "up",
+                "-d",
+                "--no-deps",
+                "--no-recreate",
+                "--wait",
+                "--wait-timeout",
+                "120",
+                "runtime",
+            ),
+            False,
+        ),
+    ]
+
+
 def test_documented_proof_script_entrypoint_can_import_its_probe():
     completed = subprocess.run(
         [sys.executable, "examples/action_recovery_proof.py", "--help"],

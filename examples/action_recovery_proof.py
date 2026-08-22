@@ -159,6 +159,20 @@ class ComposeRuntime:
         arguments.extend(["--wait", "--wait-timeout", "120", "runtime"])
         self._run(*arguments)
 
+    def restart_runtime(self) -> None:
+        # Keep the provider outside Compose's convergence graph and prevent
+        # replacement of the existing killed Runtime container.
+        self._run(
+            "up",
+            "-d",
+            "--no-deps",
+            "--no-recreate",
+            "--wait",
+            "--wait-timeout",
+            "120",
+            "runtime",
+        )
+
     def kill_runtime(self) -> None:
         self._run("kill", "-s", "SIGKILL", "runtime")
 
@@ -527,7 +541,7 @@ def _run_scenario(
             lambda state: "response.ambiguous" in _event_types(state),
             description=f"{spec.name} injected ambiguous response",
         )
-        compose.start(include_build=False)
+        compose.restart_runtime()
         runtime_was_killed = False
     finally:
         if runtime_was_killed:
@@ -540,7 +554,7 @@ def _run_scenario(
                 )
             except ProofFailure:
                 pass
-            compose.start(include_build=False)
+            compose.restart_runtime()
 
     runtime_started_after = compose.started_at("runtime")
     _require(
