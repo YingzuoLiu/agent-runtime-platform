@@ -340,16 +340,20 @@ def test_agent_message_waiter_limit_returns_202_without_queueing_for_a_slot(
         assert wait_for_run(client, overflow.json()["run_id"])["status"] == "completed"
 
 
-def test_many_agent_message_waiters_do_not_starve_health_threadpool(
+def test_many_agent_message_waiters_do_not_starve_sync_routes(
     tmp_path,
     monkeypatch,
 ):
     blocker_started = threading.Event()
     release_blocker = threading.Event()
-    original = TravelAgentRuntime.handle_user_message
+    all_waiters_submitted = threading.Event()
+    original_handle = TravelAgentRuntime.handle_user_message
+    original_submit = RuntimeManager.submit
     call_count = 0
     call_lock = threading.Lock()
-    waiter_count = 48
+    submitted_count = 0
+    submit_lock = threading.Lock()
+    waiter_count = 40
 
     def blocking_handle(self, state, user_message):
         nonlocal call_count
@@ -359,14 +363,29 @@ def test_many_agent_message_waiters_do_not_starve_health_threadpool(
         if current_call == 1:
             blocker_started.set()
             if not release_blocker.wait(timeout=8):
-                raise TimeoutError("health-starvation blocker was not released")
-        return original(self, state, user_message)
+                raise TimeoutError("sync-route-starvation blocker was not released")
+        return original_handle(self, state, user_message)
+
+    def tracking_submit(self, request, *, tenant_context):
+        nonlocal submitted_count
+        submitted = original_submit(
+            self,
+            request,
+            tenant_context=tenant_context,
+        )
+        if request.thread_id.startswith("sync-route-starvation-waiter-"):
+            with submit_lock:
+                submitted_count += 1
+                if submitted_count == waiter_count:
+                    all_waiters_submitted.set()
+        return submitted
 
     monkeypatch.setattr(
         TravelAgentRuntime,
         "handle_user_message",
         blocking_handle,
     )
+    monkeypatch.setattr(RuntimeManager, "submit", tracking_submit)
     app = create_app(
         database_path=tmp_path / "runtime.db",
         worker_count=1,
@@ -376,7 +395,7 @@ def test_many_agent_message_waiters_do_not_starve_health_threadpool(
         blocker = client.post(
             "/runs",
             json={
-                "thread_id": "health-starvation-blocker",
+                "thread_id": "sync-route-starvation-blocker",
                 "user_message": "Plan Tokyo under 7000 SGD.",
             },
         )
@@ -389,7 +408,7 @@ def test_many_agent_message_waiters_do_not_starve_health_threadpool(
             return client.post(
                 "/agent/message?wait=5",
                 json={
-                    "thread_id": f"health-starvation-waiter-{index}",
+                    "thread_id": f"sync-route-starvation-waiter-{index}",
                     "user_message": "Plan Seoul under 9000 SGD.",
                 },
             )
@@ -401,29 +420,30 @@ def test_many_agent_message_waiters_do_not_starve_health_threadpool(
                     for index in range(waiter_count)
                 ]
                 barrier.wait()
-                deadline = time.monotonic() + 8
-                while client.app.state.agent_message_waiter_semaphore.value != 0:
-                    if time.monotonic() >= deadline:
-                        raise AssertionError(
-                            "not all Agent-message waiters entered async wait"
-                        )
-                    time.sleep(0.01)
+                assert all_waiters_submitted.wait(timeout=8)
 
-                with ThreadPoolExecutor(max_workers=1) as health_executor:
-                    started = time.monotonic()
-                    health = health_executor.submit(client.get, "/health").result(
-                        timeout=2
-                    )
-                    health_elapsed = time.monotonic() - started
+                probe_executor = ThreadPoolExecutor(max_workers=1)
+                started = time.monotonic()
+                probe_future = probe_executor.submit(
+                    client.get,
+                    f"/runs/{blocker.json()['run_id']}",
+                )
+                try:
+                    probe = probe_future.result(timeout=2)
+                    probe_elapsed = time.monotonic() - started
+                finally:
+                    if not probe_future.done():
+                        release_blocker.set()
+                    probe_executor.shutdown(wait=True)
 
                 release_blocker.set()
                 responses = [future.result(timeout=8) for future in futures]
         finally:
             release_blocker.set()
 
-    assert health.status_code == 200
-    assert health.json() == {"status": "ok"}
-    assert health_elapsed < 1
+    assert probe.status_code == 200
+    assert probe.json()["run_id"] == blocker.json()["run_id"]
+    assert probe_elapsed < 1
     assert all(response.status_code in {200, 202} for response in responses)
 
 

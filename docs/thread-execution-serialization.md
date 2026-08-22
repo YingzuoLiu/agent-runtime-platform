@@ -433,6 +433,12 @@ uses async sleep and offloaded store reads capped by both the remaining request 
 known nonterminal `202`; it does not occupy the shared sync endpoint threadpool or fail the durable
 Run. A client disconnect or timeout does not authorize inline fallback and does not cancel the Run.
 
+The `wait` budget begins only after durable submission succeeds. Authentication, checkpoint
+preflight, and Run creation retain their ordinary storage-operation timeout. The route must not
+abandon an in-flight submission merely to satisfy the observation budget: that write could still
+commit without returning a `run_id` to the caller. This is the same durable-acceptance boundary used
+by `POST /runs`; `wait` bounds terminal observation, not the database submission transaction.
+
 The optional `state` is accepted only when the tenant-qualified thread has no checkpoint and no
 queued or running Run. Otherwise the endpoint returns `409`; continuing an existing thread requires
 omitting `state` so the managed Run loads durable history. This is an intentional breaking safety

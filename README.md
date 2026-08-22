@@ -609,13 +609,13 @@ to the private `travel-agent:1.2.0` durable registry. The direct POST route stil
 recognizes that name so an authorized attempt receives `409` instead of falling
 through to sandbox execution.
 
-`POST /agent/message` preserves the legacy `200` completed-response shape but waits for at most
-`wait=0..5` seconds (five by default). If the managed Run is still queued or running, it returns
-`202` with the durable `run_id`, `Location`, and `Retry-After`; the Run continues after timeout or
-client disconnect. Its optional `state` now initializes only a tenant-qualified thread with no
-checkpoint and no queued/running Run. Existing-thread callers must omit `state` so the Run loads the
-durable checkpoint; callers that previously echoed `updated_state` into every request will receive
-`409` and must update.
+`POST /agent/message` preserves the legacy `200` completed-response shape. After durable submission,
+it waits for at most `wait=0..5` seconds (five by default). If the managed Run is still queued or
+running, it returns `202` with the durable `run_id`, `Location`, and `Retry-After`; the Run continues
+after timeout or client disconnect. Its optional `state` now initializes only a tenant-qualified
+thread with no checkpoint and no queued/running Run. Existing-thread callers must omit `state` so
+the Run loads the durable checkpoint; callers that previously echoed `updated_state` into every
+request will receive `409` and must update.
 
 Outside explicit demo mode, `RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
 `viewer` or `operator`; missing or unknown roles fail configuration loading without retaining the
