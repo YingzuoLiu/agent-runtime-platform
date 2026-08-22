@@ -10,6 +10,8 @@ services:
       - --port
       - "8100"
       - --no-access-log
+    environment:
+      DEMO_PROVIDER_DB_PATH: /app/provider_data/provider.db
     # This sidecar owns the shared network namespace, so it publishes both its
     # control port and the Runtime's port. The Runtime must not declare ports.
     ports:
@@ -42,6 +44,26 @@ services:
       RUNTIME_WORKER_COUNT: "1"
       RUNTIME_PLANNER_PROVIDER: scripted
       RUNTIME_DEMO_MODE: "true"
+      # Both endpoints are loopback-only because runtime shares this sidecar's
+      # network namespace. Capability is deployment-owned and selects whether
+      # restart recovery may safely replay the same server-derived key.
+      RUNTIME_ACTION_PROVIDERS_JSON: >-
+        {
+          "safe-retry": {
+            "endpoint": "http://127.0.0.1:8100/actions/idempotent",
+            "provider_identity": "demo-idempotent-provider-v1",
+            "allow_insecure_localhost": true,
+            "supports_idempotency": true,
+            "timeout_seconds": 60
+          },
+          "unsafe-no-retry": {
+            "endpoint": "http://127.0.0.1:8100/actions/unsafe",
+            "provider_identity": "demo-unsafe-provider-v1",
+            "allow_insecure_localhost": true,
+            "supports_idempotency": false,
+            "timeout_seconds": 60
+          }
+        }
     volumes:
       - runtime-data:/app/runtime_data
     restart: "no"
