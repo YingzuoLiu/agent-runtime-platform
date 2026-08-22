@@ -166,6 +166,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
+| Store conformance | Adapter-driven SQLite reference contracts for ownership, fencing, checkpoint CAS, recovery, and quarantine | [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md), [`tests/conformance`](tests/conformance) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Action gateway | `webhook.send` façade over a private single-step domain and the existing Run lifecycle | [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md), [`examples/external_agent.py`](examples/external_agent.py) |
@@ -762,6 +763,8 @@ input signatures still match; the source run is never mutated.
   exact-expiry takeover, fencing tokens, and deployment migration boundary;
 - [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md):
   tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
+- [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): three-layer
+  executable store contracts and the invariant-to-test matrix;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
   retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
