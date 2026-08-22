@@ -27,7 +27,7 @@ from .scenarios import (
 )
 
 
-def test_workflow_identity_event_order_and_restart_visibility(
+def test_workflow_execution_identity_outcomes(
     store_backend: SQLiteConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
@@ -50,9 +50,15 @@ def test_workflow_identity_event_order_and_restart_visibility(
     assert wrong_input.outcome == ExecutionOutcome.INPUT_MISMATCH
     assert wrong_workflow.outcome == ExecutionOutcome.WORKFLOW_TYPE_MISMATCH
 
-    store.mark_running("workflow-identity")
+
+def test_workflow_step_identity_checks_do_not_append_events(
+    store_backend: SQLiteConformanceBackend,
+) -> None:
+    store = store_backend.open_workflow_store()
+    store.create_or_get_execution("workflow-step-identity", WORKFLOW_TYPE, INPUT_HASH)
+    store.mark_running("workflow-step-identity")
     claim = store.claim_step(
-        "workflow-identity",
+        "workflow-step-identity",
         "step-1",
         "read_evidence",
         INPUT_HASH,
@@ -61,40 +67,63 @@ def test_workflow_identity_event_order_and_restart_visibility(
     assert claim.outcome == ClaimOutcome.CLAIMED
     assert claim.attempt_token is not None
     store.complete_step(
-        "workflow-identity",
+        "workflow-step-identity",
         "step-1",
         claim.attempt_token,
         result_json='{"ok":true}',
     )
-    before_identity_checks = store.list_events("workflow-identity")
+    before_identity_checks = store.list_events("workflow-step-identity")
     cached = store.claim_step(
-        "workflow-identity",
+        "workflow-step-identity",
         "step-1",
         "read_evidence",
         INPUT_HASH,
         max_attempts=2,
     )
     wrong_step_input = store.claim_step(
-        "workflow-identity",
+        "workflow-step-identity",
         "step-1",
         "read_evidence",
         "sha256:" + "c" * 64,
         max_attempts=2,
     )
     wrong_step_tool = store.claim_step(
-        "workflow-identity",
+        "workflow-step-identity",
         "step-1",
         "different_tool",
         INPUT_HASH,
         max_attempts=2,
     )
+
     assert cached.outcome == ClaimOutcome.CACHED
     assert wrong_step_input.outcome == ClaimOutcome.INPUT_MISMATCH
     assert wrong_step_tool.outcome == ClaimOutcome.DEFINITION_MISMATCH
-    assert store.list_events("workflow-identity") == before_identity_checks
-    store.finalize_ready("workflow-identity", result_json='{"status":"ready"}')
+    assert store.list_events("workflow-step-identity") == before_identity_checks
 
-    events = store.list_events("workflow-identity")
+
+def test_workflow_event_order_cursor_and_restart_visibility(
+    store_backend: SQLiteConformanceBackend,
+) -> None:
+    store = store_backend.open_workflow_store()
+    store.create_or_get_execution("workflow-events", WORKFLOW_TYPE, INPUT_HASH)
+    store.mark_running("workflow-events")
+    claim = store.claim_step(
+        "workflow-events",
+        "step-1",
+        "read_evidence",
+        INPUT_HASH,
+        max_attempts=2,
+    )
+    assert claim.attempt_token is not None
+    store.complete_step(
+        "workflow-events",
+        "step-1",
+        claim.attempt_token,
+        result_json='{"ok":true}',
+    )
+    store.finalize_ready("workflow-events", result_json='{"status":"ready"}')
+
+    events = store.list_events("workflow-events")
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
     assert [event.event_type for event in events] == [
         "workflow.started",
@@ -102,17 +131,20 @@ def test_workflow_identity_event_order_and_restart_visibility(
         "step.completed",
         "workflow.ready",
     ]
-    assert store.list_events(
-        "workflow-identity",
-        after_sequence=events[1].sequence,
-    ) == events[2:]
+    assert (
+        store.list_events(
+            "workflow-events",
+            after_sequence=events[1].sequence,
+        )
+        == events[2:]
+    )
 
     reopened = store_backend.open_workflow_store()
-    execution = reopened.get_execution("workflow-identity")
-    step = reopened.get_step("workflow-identity", "step-1")
+    execution = reopened.get_execution("workflow-events")
+    step = reopened.get_step("workflow-events", "step-1")
     assert execution is not None and execution.status == WorkflowStatus.READY
     assert step is not None and step.status == ToolCallStatus.COMPLETED
-    assert reopened.list_events("workflow-identity") == events
+    assert reopened.list_events("workflow-events") == events
 
 
 def test_i2_stale_tool_attempt_cannot_mutate_durable_state(

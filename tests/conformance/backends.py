@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
-import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from agent.contracts import BaseRuntimeState
 from runtime_service.registry import AgentRegistry, build_default_registry
@@ -19,36 +17,23 @@ class InjectedConformanceFailure(RuntimeError):
     """Stable failure used to prove transactional rollback at event boundaries."""
 
 
-class ManualStoreClock:
-    """Thread-safe store clock advanced explicitly by conformance scenarios."""
+class AdjustableStoreClock(Protocol):
+    def __call__(self) -> int: ...
 
-    def __init__(self, now_ms: int | None = None) -> None:
-        self._now_ms = int(time.time() * 1_000) if now_ms is None else now_ms
-        self._lock = threading.Lock()
-
-    def __call__(self) -> int:
-        with self._lock:
-            return self._now_ms
-
-    def advance(self, delta_ms: int) -> int:
-        if delta_ms < 0:
-            raise ValueError("Manual store clock cannot move backwards")
-        with self._lock:
-            self._now_ms += delta_ms
-            return self._now_ms
+    def advance(self, delta_ms: int) -> int: ...
 
 
 @dataclass(frozen=True)
 class SQLiteConformanceBackend:
     """Test-only adapter that binds generic scenarios to the SQLite reference stores.
 
-    This is intentionally not a production store abstraction. A future backend adds
-    another test adapter and pytest parameter; RuntimeManager remains typed to
-    SQLiteRunStore until a real second implementation justifies a production seam.
+    This is intentionally not a production store abstraction or evidence of
+    cross-backend compatibility. RuntimeManager remains typed to SQLiteRunStore
+    until a real second implementation justifies a production seam.
     """
 
     database_path: Path
-    clock: ManualStoreClock
+    clock: AdjustableStoreClock
     backend_id: str = "sqlite"
 
     def open_workflow_store(self) -> WorkflowStore:
@@ -91,9 +76,7 @@ class SQLiteConformanceBackend:
             payload: dict[str, Any] | None = None,
         ):
             if actual_event_type == event_type:
-                raise InjectedConformanceFailure(
-                    f"injected workflow event failure: {event_type}"
-                )
+                raise InjectedConformanceFailure(f"injected workflow event failure: {event_type}")
             return original(connection, run_id, actual_event_type, payload)
 
         store._append_event_with_connection = injected  # type: ignore[method-assign]
@@ -117,9 +100,7 @@ class SQLiteConformanceBackend:
             payload: dict[str, Any] | None = None,
         ):
             if actual_event_type == event_type:
-                raise InjectedConformanceFailure(
-                    f"injected run event failure: {event_type}"
-                )
+                raise InjectedConformanceFailure(f"injected run event failure: {event_type}")
             return original(connection, run_id, actual_event_type, payload)
 
         store._append_event_with_connection = injected  # type: ignore[method-assign]
@@ -143,7 +124,10 @@ class SQLiteConformanceBackend:
         equivalent fault injection for the same externally observed contract.
         """
 
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path, timeout=30)) as connection, connection:
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
             cursor = connection.execute(
                 """
                 UPDATE thread_states
@@ -157,7 +141,6 @@ class SQLiteConformanceBackend:
                     expected_revision,
                 ),
             )
-        if cursor.rowcount != 1:
-            raise AssertionError(
-                "Checkpoint drift injection did not match the expected revision"
-            )
+            rowcount = cursor.rowcount
+        if rowcount != 1:
+            raise AssertionError("Checkpoint drift injection did not match the expected revision")

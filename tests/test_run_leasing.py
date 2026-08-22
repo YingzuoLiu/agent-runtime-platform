@@ -44,23 +44,6 @@ def test_manager_rejects_heartbeat_configuration_without_renewal_margin(tmp_path
         )
 
 
-class ManualLeaseClock:
-    """Thread-safe store clock controlled explicitly by each test."""
-
-    def __init__(self, now_ms: int = 1_000_000) -> None:
-        self._now_ms = now_ms
-        self._lock = threading.Lock()
-
-    def __call__(self) -> int:
-        with self._lock:
-            return self._now_ms
-
-    def advance(self, delta_ms: int) -> int:
-        with self._lock:
-            self._now_ms += delta_ms
-            return self._now_ms
-
-
 class DroppedWakeSignal:
     """Event-shaped test double that drops every in-process wake hint."""
 
@@ -160,103 +143,12 @@ def submit_test_run(manager: RuntimeManager, *, thread_id: str) -> RunRecord:
     )
 
 
-def test_store_lease_expiry_is_an_exact_fencing_boundary(tmp_path) -> None:
-    clock = ManualLeaseClock()
-    store = SQLiteRunStore(tmp_path / "runtime.db", lease_clock_ms=clock)
-    run = RunRecord(
-        run_id="run_store_lease_boundary",
-        tenant_id=TENANT_CONTEXT.tenant_id,
-        thread_id="store-lease-boundary",
-        agent_id="lease-test-agent",
-        agent_version="1.0.0",
-        status=RunStatus.QUEUED,
-        input={"user_message": "exercise lease fencing"},
-    )
-    store.create_run_with_event(run, event_type="run.queued")
-
-    first_claim = store.claim_next_run(
-        owner_id="manager-a",
-        lease_duration_seconds=LEASE_DURATION_SECONDS,
-    )
-    assert first_claim is not None
-    assert first_claim.run.attempt == 1
-    assert first_claim.run.lease_heartbeat_at == clock()
-    assert first_claim.run.lease_expires_at == (
-        clock() + LEASE_DURATION_SECONDS * 1000
-    )
-
-    clock.advance(LEASE_DURATION_SECONDS * 1000 - 1)
-    assert (
-        store.claim_next_run(
-            owner_id="manager-b",
-            lease_duration_seconds=LEASE_DURATION_SECONDS,
-        )
-        is None
-    )
-
-    clock.advance(1)
-    assert not store.renew_run_lease(
-        run.run_id,
-        lease_token=first_claim.lease_token,
-        lease_duration_seconds=LEASE_DURATION_SECONDS,
-    )
-    assert (
-        store.commit_completed_run(
-            first_claim.run,
-            lease_token=first_claim.lease_token,
-        )
-        == RunCommitOutcome.LEASE_LOST
-    )
-    assert (
-        store.commit_failed_run(
-            first_claim.run,
-            lease_token=first_claim.lease_token,
-            error_code="stale_attempt_failed",
-            error="the expired attempt must not persist this failure",
-        )
-        == RunCommitOutcome.LEASE_LOST
-    )
-
-    second_claim = store.claim_next_run(
-        owner_id="manager-b",
-        lease_duration_seconds=LEASE_DURATION_SECONDS,
-    )
-    assert second_claim is not None
-    assert second_claim.recovery_reason == RunLeaseRecoveryReason.LEASE_EXPIRED
-    assert second_claim.run.attempt == 2
-    assert second_claim.lease_token != first_claim.lease_token
-
-    second_claim.run.state = AgentState(
-        thread_id=second_claim.run.thread_id,
-        destination="Tokyo",
-    )
-    second_claim.run.output_message = "winner"
-    assert (
-        store.commit_completed_run(
-            second_claim.run,
-            lease_token=second_claim.lease_token,
-        )
-        == RunCommitOutcome.COMMITTED
-    )
-
-    persisted = store.get_run_internal(run.run_id)
-    assert persisted is not None
-    assert persisted.status == RunStatus.COMPLETED
-    assert persisted.attempt == 2
-    assert persisted.output_message == "winner"
-    event_types = [event.event_type for event in store.list_events(run.run_id)]
-    assert event_types.count("run.started") == 2
-    assert event_types.count("run.recovered") == 1
-    assert event_types.count("checkpoint.saved") == 1
-    assert event_types.count("run.completed") == 1
-    assert "run.failed" not in event_types
-
-
 def test_second_manager_cannot_execute_a_live_unexpired_lease(
     tmp_path,
     monkeypatch,
+    manual_store_clock,
 ) -> None:
-    clock = ManualLeaseClock()
+    clock = manual_store_clock
     database_path = tmp_path / "runtime.db"
     store_a = SQLiteRunStore(database_path, lease_clock_ms=clock)
     store_b = SQLiteRunStore(database_path, lease_clock_ms=clock)
@@ -376,8 +268,9 @@ def test_manager_polling_discovers_queued_run_when_wake_hint_is_lost(
 def test_shutdown_fences_claim_paused_before_heartbeat_registration(
     tmp_path,
     monkeypatch,
+    manual_store_clock,
 ) -> None:
-    clock = ManualLeaseClock()
+    clock = manual_store_clock
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path, lease_clock_ms=clock)
     execution = SequencedExecution()
@@ -535,8 +428,9 @@ def test_concurrent_stop_calls_cannot_corrupt_a_restarted_manager(
 def test_stop_join_error_still_disables_renewal_and_fences_the_attempt(
     tmp_path,
     monkeypatch,
+    manual_store_clock,
 ) -> None:
-    clock = ManualLeaseClock()
+    clock = manual_store_clock
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path, lease_clock_ms=clock)
     execution = SequencedExecution()
@@ -599,9 +493,10 @@ def test_stop_join_error_still_disables_renewal_and_fences_the_attempt(
 def test_two_managers_fence_a_stale_late_attempt(
     tmp_path,
     monkeypatch,
+    manual_store_clock,
     first_attempt_fails: bool,
 ) -> None:
-    clock = ManualLeaseClock()
+    clock = manual_store_clock
     database_path = tmp_path / "runtime.db"
     store_a = SQLiteRunStore(database_path, lease_clock_ms=clock)
     store_b = SQLiteRunStore(database_path, lease_clock_ms=clock)
@@ -755,8 +650,9 @@ def test_two_managers_fence_a_stale_late_attempt(
 def test_manager_heartbeat_renews_the_same_attempt_without_public_events(
     tmp_path,
     monkeypatch,
+    manual_store_clock,
 ) -> None:
-    clock = ManualLeaseClock()
+    clock = manual_store_clock
     store = SQLiteRunStore(tmp_path / "runtime.db", lease_clock_ms=clock)
     execution = SequencedExecution()
     registry = sequenced_registry(execution)
@@ -811,12 +707,9 @@ def test_manager_heartbeat_renews_the_same_attempt_without_public_events(
         assert before is not None
         assert before.lease_token is not None
         assert before.lease_heartbeat_at == clock()
-        assert before.lease_expires_at == (
-            clock() + LEASE_DURATION_SECONDS * 1000
-        )
+        assert before.lease_expires_at == (clock() + LEASE_DURATION_SECONDS * 1000)
         events_before = [
-            (event.event_type, event.payload)
-            for event in store.list_events(submitted.run_id)
+            (event.event_type, event.payload) for event in store.list_events(submitted.run_id)
         ]
 
         clock.advance(5_000)
@@ -827,12 +720,9 @@ def test_manager_heartbeat_renews_the_same_attempt_without_public_events(
         assert renewed.attempt == before.attempt
         assert renewed.lease_token == before.lease_token
         assert renewed.lease_heartbeat_at == renewal_target_ms
-        assert renewed.lease_expires_at == (
-            renewal_target_ms + LEASE_DURATION_SECONDS * 1000
-        )
+        assert renewed.lease_expires_at == (renewal_target_ms + LEASE_DURATION_SECONDS * 1000)
         assert [
-            (event.event_type, event.payload)
-            for event in store.list_events(submitted.run_id)
+            (event.event_type, event.payload) for event in store.list_events(submitted.run_id)
         ] == events_before
 
         execution.release[0].set()

@@ -106,19 +106,44 @@ def test_i3_one_running_run_per_tenant_qualified_thread(
     live_claims = [claim for claim in claims if claim is not None]
     assert len(live_claims) == 1
     assert live_claims[0].run.run_id == "run-thread-first"
+    assert live_claims[0].run.checkpoint_base_revision == 0
     queued = first_store.get_run_internal("run-thread-second")
     assert queued is not None
     assert queued.status == RunStatus.QUEUED
     assert queued.attempt == 0
 
 
-def test_i4_different_threads_remain_independently_schedulable(
+@pytest.mark.parametrize(
+    ("first_tenant", "first_thread", "second_tenant", "second_thread"),
+    [
+        (TENANT_ID, "thread-a", TENANT_ID, "thread-b"),
+        ("tenant-a", "shared-name", "tenant-b", "shared-name"),
+    ],
+    ids=["different-threads", "same-thread-name-different-tenants"],
+)
+def test_i4_thread_scope_allows_independent_claims(
     store_backend: SQLiteConformanceBackend,
+    first_tenant: str,
+    first_thread: str,
+    second_tenant: str,
+    second_thread: str,
 ) -> None:
     first_store = store_backend.open_run_store()
     second_store = store_backend.open_run_store()
-    create_queued_run(first_store, "run-thread-a", thread_id="thread-a", order=1)
-    create_queued_run(first_store, "run-thread-b", thread_id="thread-b", order=2)
+    create_queued_run(
+        first_store,
+        "run-thread-a",
+        tenant_id=first_tenant,
+        thread_id=first_thread,
+        order=1,
+    )
+    create_queued_run(
+        first_store,
+        "run-thread-b",
+        tenant_id=second_tenant,
+        thread_id=second_thread,
+        order=2,
+    )
 
     claims = claim_concurrently(first_store, second_store)
 
@@ -187,15 +212,26 @@ def test_i5_checkpoint_load_and_completion_require_expected_revision(
     assert persisted.status == RunStatus.FAILED
     assert persisted.error_code == "thread_checkpoint_conflict"
     assert persisted.lease_token is None
+    assert "expected 1, observed 2" in (persisted.error or "")
     assert snapshot.revision == 2
     assert isinstance(snapshot.state, AgentState)
     assert snapshot.state.budget == 7_777
-    assert [event.event_type for event in reopened.list_events(stale.run.run_id)] == [
+    events = reopened.list_events(stale.run.run_id)
+    event_types = [event.event_type for event in events]
+    assert event_types == [
         "run.queued",
         "run.started",
         "checkpoint.conflict",
         "run.failed",
     ]
+    conflict = next(event for event in events if event.event_type == "checkpoint.conflict")
+    assert conflict.payload == {
+        "phase": "completion",
+        "expected_revision": 1,
+        "observed_revision": 2,
+    }
+    assert "checkpoint.saved" not in event_types
+    assert "run.completed" not in event_types
 
 
 def test_i6_completion_checkpoint_and_required_events_commit_atomically(
@@ -323,11 +359,48 @@ def test_lease_expiry_uses_the_injected_store_clock_exactly(
     create_queued_run(store, "run-exact-expiry", thread_id="exact-expiry", order=1)
     first = claim_run(store, "exact-expiry-owner")
     assert first is not None
+    assert first.run.attempt == 1
+    assert first.run.lease_heartbeat_at == store_backend.clock()
     assert first.run.lease_expires_at == store_backend.clock() + LEASE_SECONDS * 1_000
 
     store_backend.clock.advance(LEASE_SECONDS * 1_000 - 1)
     assert claim_run(store_backend.open_run_store(), "too-early-owner") is None
     store_backend.clock.advance(1)
+    assert not store.renew_run_lease(
+        first.run.run_id,
+        lease_token=first.lease_token,
+        lease_duration_seconds=LEASE_SECONDS,
+    )
+    assert (
+        store.commit_completed_run(first.run, lease_token=first.lease_token)
+        == RunCommitOutcome.LEASE_LOST
+    )
+    assert (
+        store.commit_failed_run(
+            first.run,
+            lease_token=first.lease_token,
+            error_code="stale_attempt_failed",
+            error="the expired attempt must not persist this failure",
+        )
+        == RunCommitOutcome.LEASE_LOST
+    )
     recovered = claim_run(store_backend.open_run_store(), "boundary-owner")
     assert recovered is not None
     assert recovered.recovery_reason == RunLeaseRecoveryReason.LEASE_EXPIRED
+    assert recovered.run.attempt == 2
+    assert recovered.lease_token != first.lease_token
+
+    assert complete_with_budget(store, recovered, budget=8_000) == RunCommitOutcome.COMMITTED
+    persisted = store_backend.open_run_store().get_run_internal(first.run.run_id)
+    assert persisted is not None
+    assert persisted.status == RunStatus.COMPLETED
+    assert persisted.attempt == 2
+    assert persisted.output_message == "budget=8000"
+    event_types = [
+        event.event_type for event in store_backend.open_run_store().list_events(first.run.run_id)
+    ]
+    assert event_types.count("run.started") == 2
+    assert event_types.count("run.recovered") == 1
+    assert event_types.count("checkpoint.saved") == 1
+    assert event_types.count("run.completed") == 1
+    assert "run.failed" not in event_types

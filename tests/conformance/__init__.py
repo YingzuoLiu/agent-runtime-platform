@@ -1,1 +1,1 @@
-"""Backend-parameterized executable contracts for durable store semantics."""
+"""Adapter-driven executable contracts for durable store semantics."""
