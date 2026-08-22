@@ -619,8 +619,14 @@ class SQLiteRunStore:
             ).fetchone()
         return self._row_to_run(row) if row else None
 
-    def get_run_for_tenant(self, run_id: str, tenant_id: str) -> RunRecord | None:
-        with self._connect() as connection:
+    def get_run_for_tenant(
+        self,
+        run_id: str,
+        tenant_id: str,
+        *,
+        timeout_seconds: float = 30,
+    ) -> RunRecord | None:
+        with self._connect(timeout_seconds=timeout_seconds) as connection:
             row = connection.execute(
                 "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
                 (run_id, tenant_id),
@@ -805,6 +811,16 @@ class SQLiteRunStore:
                                 OR lease_expires_at IS NULL
                                 OR lease_expires_at <= ?
                             )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM runs AS live_thread_run
+                                WHERE live_thread_run.tenant_id = runs.tenant_id
+                                    AND live_thread_run.thread_id = runs.thread_id
+                                    AND live_thread_run.run_id != runs.run_id
+                                    AND live_thread_run.status = ?
+                                    AND live_thread_run.lease_token IS NOT NULL
+                                    AND live_thread_run.lease_expires_at IS NOT NULL
+                                    AND live_thread_run.lease_expires_at > ?
+                            )
                         )
                     )
                 """,
@@ -823,6 +839,8 @@ class SQLiteRunStore:
                     RunStatus.RUNNING.value,
                     RunStatus.RUNNING.value,
                     THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                    now_ms,
+                    RunStatus.RUNNING.value,
                     now_ms,
                 ),
             )

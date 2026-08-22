@@ -236,8 +236,13 @@ class RuntimeManager:
         run_id: str,
         *,
         tenant_context: TenantContext,
+        operation_timeout_seconds: float = 30,
     ) -> RunRecord | None:
-        return self.store.get_run_for_tenant(run_id, tenant_context.tenant_id)
+        return self.store.get_run_for_tenant(
+            run_id,
+            tenant_context.tenant_id,
+            timeout_seconds=operation_timeout_seconds,
+        )
 
     def request_cancel(
         self,

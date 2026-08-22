@@ -242,9 +242,12 @@ WHERE status = 'running';
 The claim query must still filter blocked candidates before attempting an update. The index catches
 implementation mistakes and cross-connection races; it is not the scheduling algorithm.
 
-Add a claim-oriented index suitable for the concrete SQLite query, for example on status, tenant,
-thread, and persisted order. Exact index shape should follow `EXPLAIN QUERY PLAN` for the final SQL
-rather than become a cross-backend contract.
+The implementation retains the existing
+`idx_runs_claimable(status, lease_expires_at, created_at)` index. `EXPLAIN QUERY PLAN` for the final
+selector shows the same-thread anti-joins using the partial unique index, while the global
+`(created_at, run_id)` ordering still uses a temporary B-tree. A speculative thread-shaped index
+did not remove that sort in backlog probes, so this milestone adds no unproven index. Revisit the
+query and index together only with measured nonterminal-backlog data.
 
 ## Client-provided state contract
 
@@ -337,15 +340,18 @@ payload may contain `source` and `revision`; neither is an authority token.
 `commit_completed_run()` remains one `BEGIN IMMEDIATE` transaction. It must:
 
 1. verify Run status, tenant, current unexpired Run lease token, and cancellation predicate;
-2. compare the current logical thread revision with `checkpoint_base_revision`;
-3. insert revision `1` when the base is `0`, or update `N -> N + 1` with `WHERE revision = N`;
-4. transition the Run to `completed` and clear its lease;
-5. append `checkpoint.saved` with `base_revision` and `revision`;
-6. append `run.completed`;
-7. commit all changes together.
+2. require a validated checkpoint state for a successful managed completion;
+3. compare the current logical thread revision with `checkpoint_base_revision`;
+4. insert revision `1` when the base is `0`, or update `N -> N + 1` with `WHERE revision = N`;
+5. transition the Run to `completed` and clear its lease;
+6. append `checkpoint.saved` with `base_revision` and `revision`;
+7. append `run.completed`;
+8. commit all changes together.
 
 Any zero-row checkpoint CAS rolls back the whole transaction. In particular, it must not leave a
 completed Run without its checkpoint or append terminal evidence for a rejected result.
+Calling the public store method with no state is a programming error: it raises before mutation and
+leaves the Run `running` with its current lease and checkpoint unchanged.
 
 `commit_failed_run()` and `commit_cancelled_run()` continue to require the current Run lease but do
 not compare or increment checkpoint revision because they do not save state. Their terminal status
@@ -365,8 +371,9 @@ Use a stable durable failure code:
 thread_checkpoint_conflict
 ```
 
-Use a distinct nonterminal quarantine code when unresolved external-action evidence and checkpoint
-drift coexist:
+Use a distinct nonterminal quarantine code when checkpoint drift is detected while external-action
+recovery or reconciliation precedence is active. This includes an in-flight dispatch and a
+terminal dispatched Action whose recovery ordering or evidence projection still has to complete:
 
 ```text
 thread_checkpoint_conflict_reconciliation_pending
@@ -378,16 +385,26 @@ The behaviors are:
 | --- | --- |
 | Same-thread predecessor is running | Successor stays queued; this is not a failure. |
 | Run lease token is stale or expired | Existing `lease_lost` behavior; do not relabel it as a checkpoint conflict. |
-| Revision mismatch before Runtime execution, with no unresolved external action | Do not call the Runtime; fenced terminal failure with `thread_checkpoint_conflict`. |
-| Revision mismatch while external-action reconciliation is unresolved | Do not call the Runtime. Quarantine the Run as nonterminal, clear its lease, exclude it from automatic takeover, and retain the thread slot for a future controlled operator-repair flow. |
+| Revision mismatch before Runtime execution, with no external-action recovery/reconciliation precedence | Do not call the Runtime; fenced terminal failure with `thread_checkpoint_conflict`. |
+| Revision mismatch while external-action recovery/reconciliation precedence is active | Do not call the Runtime. Quarantine the Run as nonterminal, clear its lease, exclude it from automatic takeover, and retain the thread slot for a future controlled operator-repair flow. |
 | Revision mismatch at completion | Roll back completion and checkpoint writes, then fenced terminal failure with `thread_checkpoint_conflict`. |
 | Seed targets a nonempty or busy thread | Reject submission with a stable conflict; no Run is queued. |
 | Multiple running Runs violate the unique thread invariant | Fail startup/claim closed; do not select a winner automatically. |
 | Conflict terminalization loses the Run lease | Accept no result; normal takeover encounters the same base-revision mismatch and fails before re-execution. |
 
-Checkpoint conflict is permanent. The Manager must not turn it into a transparent retry because
-the rejected attempt may already have durable workflow or external-action evidence. An operator or
-caller can inspect the Run and submit a new Run against the current checkpoint.
+An ordinary `thread_checkpoint_conflict` is permanent for that execution result. The Manager must
+not turn it into a transparent retry because the rejected attempt may already have durable workflow
+or external-action evidence. After that Run is terminal, a caller may submit a state-less Run that
+loads the current checkpoint. This advice does not apply to
+`thread_checkpoint_conflict_reconciliation_pending`: that marker is nonterminal and intentionally
+retains the thread slot, so a same-thread replacement remains blocked.
+
+A completion-time mismatch is terminal only after the registered Runtime has returned a completed
+state. Supported external-action runtimes do not return while reconciliation is nonterminal: they
+raise `ExternalActionReconciliationPendingError` and bypass completion. The conflict transaction
+rejects Run success and checkpoint persistence; it does not rewrite or delete provider, Action,
+tool, or workflow outcomes. A future Runtime that can return while dispatched work remains
+nonterminal would invalidate this assumption and must quarantine at completion instead.
 
 Expected and actual revision numbers may appear in sanitized error/event metadata. State contents,
 lease tokens, owner IDs, and credentials must not.
@@ -402,13 +419,24 @@ Instead it:
 1. creates a managed `travel-agent:0.3.0` Run through `RuntimeManager.submit()` using the effective
    authenticated execution authority;
 2. uses the same state-seed rule as `POST /runs`;
-3. waits for the durable Run to become terminal;
-4. maps the completed Run's message, state, and validation errors into the compatibility response.
+3. waits at most the requested `wait=0..5` seconds, defaulting to five seconds, under a bounded
+   async waiter pool;
+4. maps a completed Run's message, state, and validation errors into the legacy `200` response;
+5. otherwise returns `202` with `run_id`, current `status`, `Location`, and `Retry-After` while the
+   durable Run continues independently.
 
-The endpoint remains synchronous from the caller's perspective, as it was before this milestone,
-but execution authority is now durable. A client disconnect does not authorize inline fallback or
-cancel the Run. If a future bounded-wait response is added, it must return the `run_id` for later
-observation rather than executing outside the Manager.
+The endpoint preserves the legacy completed-response shape, not unbounded synchronous waiting or
+the old state-replacement behavior. `RUNTIME_AGENT_MESSAGE_WAITER_LIMIT` bounds concurrent waiters;
+an exhausted waiter pool returns `202` immediately instead of queueing for a waiter slot. Polling
+uses async sleep and offloaded store reads capped by both the remaining request budget and a
+250-millisecond SQLite timeout. A busy/locked or over-budget observation ends waiting with the last
+known nonterminal `202`; it does not occupy the shared sync endpoint threadpool or fail the durable
+Run. A client disconnect or timeout does not authorize inline fallback and does not cancel the Run.
+
+The optional `state` is accepted only when the tenant-qualified thread has no checkpoint and no
+queued or running Run. Otherwise the endpoint returns `409`; continuing an existing thread requires
+omitting `state` so the managed Run loads durable history. This is an intentional breaking safety
+change for callers that previously echoed `updated_state` into every request.
 
 The unrestricted `save_unmanaged_thread_state()` method is removed. Keeping it as a public store
 surface, even without a production caller, would retain a bypass around the new invariant.
@@ -434,15 +462,60 @@ changing checkpoint revision. Running cancellation continues to require the curr
 When external-action evidence requires reconciliation, the Run remains `running` until that safety
 decision is resolved; queued successors stay blocked.
 
-External-action safety and checkpoint safety fail closed together. A recovered Run with unresolved
-provider evidence and a revision mismatch must not enter the ordinary Runtime: a completion CAS
-could reject stale state but could not undo tools or external effects produced before completion.
+External-action safety and checkpoint safety fail closed together. A recovered Run with active
+external-action recovery/reconciliation precedence and a revision mismatch must not enter the
+ordinary Runtime: a completion CAS could reject stale state but could not undo tools or external
+effects produced before completion.
 The Manager therefore writes durable conflict evidence, keeps the Run `running`, clears its lease,
 and excludes that quarantine code from automatic takeover. The same-thread successor remains
 blocked. This state requires controlled operator repair; the runtime neither guesses a checkpoint
 base nor hides an unresolved provider outcome behind an ordinary terminal conflict. This milestone
-only creates and preserves the quarantine. It does not add an automatic retry, repair primitive,
-or operator runbook; those remain a follow-up.
+only creates and preserves the quarantine. It does not add an automatic retry or repair primitive.
+
+### Quarantine operations: detect and contain
+
+`thread_checkpoint_conflict_reconciliation_pending` is an invariant-breach sentinel, not a normal
+retry state. In a homogeneous deployment it should be unreachable; observing it indicates a mixed
+writer, manual checkpoint change, store corruption, or an implementation defect.
+
+Operators may locate affected rows using read-only inspection of a consistent SQLite backup:
+
+```sql
+SELECT run_id, tenant_id, thread_id, agent_id, agent_version,
+       status, error_code, cancel_requested, attempt,
+       checkpoint_base_revision, created_at, updated_at
+FROM runs
+WHERE status = 'running'
+  AND error_code =
+      'thread_checkpoint_conflict_reconciliation_pending';
+```
+
+For a public Run, inspect `GET /runs/{run_id}` and `GET /runs/{run_id}/events`, including the
+`checkpoint.conflict` event with disposition
+`external_action_reconciliation_quarantined`. For an Action-owned private Run, inspect the existing
+Action through `GET /actions/{action_id}` and `GET /actions/{action_id}/events`; generic Run routes
+intentionally hide private Action Runs. Preserve the workflow/Action ledger and provider-side
+evidence even when a late authorized provider result has not yet been mirrored into public events.
+
+Operational handling is containment only:
+
+1. Stop new submissions for the affected `(tenant_id, thread_id)` at ingress. Other threads remain
+   usable.
+2. Preserve a consistent Runtime database backup and corresponding provider evidence. Do not copy
+   only the main SQLite file while WAL is active.
+3. Do not directly update Run status, error code, lease fields, `checkpoint_base_revision`, or
+   `thread_states`. Do not delete or rewrite tool, Action, workflow, idempotency, or event evidence.
+4. Do not use cancellation as an unquarantine operation. It records intent but cannot terminalize
+   this lease-free running row.
+5. Do not repeat the operation under a new Run or thread. External-action idempotency is Run-scoped,
+   so a replacement may receive a different provider key and duplicate the effect.
+6. Leave the row quarantined and escalate to a release with an audited repair primitive or a
+   provider-specific incident procedure that can prove the external outcome.
+
+This release has no supported unquarantine or force-terminalization operation. A future repair
+primitive must compare-and-set the exact quarantine state, require resolved Action evidence, avoid
+Runtime/provider invocation and checkpoint rewrites, preserve every ledger, append operator identity
+and reason, and atomically terminalize the Run before releasing its thread slot.
 
 Run heartbeat renewal does not update checkpoint revision and does not create thread events.
 

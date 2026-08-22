@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 
@@ -335,6 +336,86 @@ def test_expired_predecessor_is_recovered_before_same_thread_successor(tmp_path)
     )
     assert isinstance(snapshot.state, AgentState)
     assert snapshot.state.budget == 8_000
+
+
+def test_takeover_conditional_update_rechecks_no_live_running_sibling(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    clock = ManualLeaseClock()
+    database_path = tmp_path / "runtime.db"
+    store = make_store(database_path, clock=clock)
+    create_queued_run(store, "run-expired", thread_id="defense-thread", order=1)
+    expired_claim = store.claim_next_run(
+        owner_id="manager-expired",
+        lease_duration_seconds=LEASE_DURATION_SECONDS,
+    )
+    assert expired_claim is not None
+    create_queued_run(store, "run-sibling", thread_id="defense-thread", order=2)
+    assert expired_claim.run.lease_expires_at is not None
+    clock.advance(expired_claim.run.lease_expires_at - clock())
+
+    # Simulate loss of the unique-index backstop, then inject a live sibling
+    # after candidate selection but before the conditional UPDATE. The UPDATE
+    # must independently repeat the selector's live-sibling predicate.
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX idx_runs_one_running_per_thread")
+
+    original_connect = store._lease_connect
+    injected = False
+
+    class InjectingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters=()):
+            nonlocal injected
+            if not injected and sql.lstrip().startswith("UPDATE runs SET"):
+                injected = True
+                self._connection.execute(
+                    """
+                    UPDATE runs SET
+                        status = ?, attempt = 1,
+                        checkpoint_base_revision = 0,
+                        lease_owner_id = ?, lease_token = ?,
+                        lease_heartbeat_at = ?, lease_expires_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        RunStatus.RUNNING.value,
+                        "manager-sibling",
+                        "lease_sibling",
+                        clock(),
+                        clock() + LEASE_DURATION_SECONDS * 1000,
+                        "run-sibling",
+                    ),
+                )
+            return self._connection.execute(sql, parameters)
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def injecting_connect():
+        with original_connect() as connection:
+            yield InjectingConnection(connection)
+
+    monkeypatch.setattr(store, "_lease_connect", injecting_connect)
+
+    assert (
+        store.claim_next_run(
+            owner_id="manager-takeover",
+            lease_duration_seconds=LEASE_DURATION_SECONDS,
+        )
+        is None
+    )
+    assert injected
+    expired = store.get_run_internal("run-expired")
+    sibling = store.get_run_internal("run-sibling")
+    assert expired is not None and expired.attempt == 1
+    assert expired.lease_token == expired_claim.lease_token
+    assert sibling is not None and sibling.status == RunStatus.RUNNING
+    assert sibling.lease_token == "lease_sibling"
 
 
 def test_checkpoint_revision_conflict_fails_durably_without_overwrite(tmp_path) -> None:

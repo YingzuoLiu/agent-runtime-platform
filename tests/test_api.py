@@ -12,6 +12,7 @@ from runtime_service import (
     ApiKeyCredential,
     AuthorizationError,
     RuntimePermission,
+    RuntimeManager,
     RuntimeRole,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
@@ -134,6 +135,384 @@ def test_fastapi_agent_message_endpoint(tmp_path):
     body = response.json()
     assert body["updated_state"]["destination"] == "Tokyo"
     assert body["updated_state"]["budget"] == 7000
+
+
+def test_agent_message_wait_zero_returns_durable_202(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        response = client.post(
+            "/agent/message?wait=0",
+            json={
+                "thread_id": "agent-message-no-wait",
+                "user_message": "Plan Tokyo under 7000 SGD.",
+            },
+        )
+        body = response.json()
+        completed = wait_for_run(client, body["run_id"])
+
+    assert response.status_code == 202
+    assert body["status"] in {"queued", "running"}
+    assert response.headers["location"] == f"/runs/{body['run_id']}"
+    assert response.headers["retry-after"] == "1"
+    assert completed["status"] == "completed"
+
+
+def test_agent_message_bounded_wait_does_not_block_behind_unrelated_run(
+    tmp_path,
+    monkeypatch,
+):
+    first_started = threading.Event()
+    release_first = threading.Event()
+    call_count = 0
+    call_lock = threading.Lock()
+    original = TravelAgentRuntime.handle_user_message
+
+    def blocking_handle(self, state, user_message):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            current_call = call_count
+        if current_call == 1:
+            first_started.set()
+            if not release_first.wait(timeout=5):
+                raise TimeoutError("unrelated Run was not released")
+        return original(self, state, user_message)
+
+    monkeypatch.setattr(
+        TravelAgentRuntime,
+        "handle_user_message",
+        blocking_handle,
+    )
+    app = create_app(database_path=tmp_path / "runtime.db", worker_count=1)
+    with TestClient(app) as client:
+        blocker = client.post(
+            "/runs",
+            json={
+                "thread_id": "unrelated-blocker",
+                "user_message": "Plan Tokyo under 7000 SGD.",
+            },
+        )
+        assert blocker.status_code == 202
+        assert first_started.wait(timeout=5)
+        try:
+            started = time.monotonic()
+            pending = client.post(
+                "/agent/message?wait=0.05",
+                json={
+                    "thread_id": "independent-agent-message",
+                    "user_message": "Plan Seoul under 9000 SGD.",
+                },
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_first.set()
+
+        assert pending.status_code == 202
+        assert pending.json()["status"] == "queued"
+        assert elapsed < 1
+        assert wait_for_run(client, blocker.json()["run_id"])["status"] == "completed"
+        assert wait_for_run(client, pending.json()["run_id"])["status"] == "completed"
+
+
+def test_agent_message_wait_deadline_bounds_an_over_budget_store_read(
+    tmp_path,
+    monkeypatch,
+):
+    read_started = threading.Event()
+    release_read = threading.Event()
+    observed_timeouts: list[float] = []
+    original = RuntimeManager.get_run
+
+    def blocking_get_run(
+        self,
+        run_id,
+        *,
+        tenant_context,
+        operation_timeout_seconds=30,
+    ):
+        if operation_timeout_seconds < 30:
+            observed_timeouts.append(operation_timeout_seconds)
+            read_started.set()
+            if not release_read.wait(timeout=5):
+                raise TimeoutError("bounded store read was not released")
+        return original(
+            self,
+            run_id,
+            tenant_context=tenant_context,
+            operation_timeout_seconds=operation_timeout_seconds,
+        )
+
+    monkeypatch.setattr(RuntimeManager, "get_run", blocking_get_run)
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        try:
+            started = time.monotonic()
+            response = client.post(
+                "/agent/message?wait=0.2",
+                json={
+                    "thread_id": "agent-message-read-deadline",
+                    "user_message": "Plan Tokyo under 7000 SGD.",
+                },
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_read.set()
+
+    assert read_started.is_set()
+    assert response.status_code == 202
+    assert elapsed < 1
+    assert observed_timeouts
+    assert max(observed_timeouts) <= 0.25
+
+
+def test_agent_message_waiter_limit_returns_202_without_queueing_for_a_slot(
+    tmp_path,
+    monkeypatch,
+):
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    original = TravelAgentRuntime.handle_user_message
+    call_count = 0
+    call_lock = threading.Lock()
+
+    def blocking_handle(self, state, user_message):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            current_call = call_count
+        if current_call == 1:
+            blocker_started.set()
+            if not release_blocker.wait(timeout=8):
+                raise TimeoutError("waiter-limit blocker was not released")
+        return original(self, state, user_message)
+
+    monkeypatch.setattr(
+        TravelAgentRuntime,
+        "handle_user_message",
+        blocking_handle,
+    )
+    app = create_app(
+        database_path=tmp_path / "runtime.db",
+        worker_count=1,
+        agent_message_waiter_limit=1,
+    )
+    with TestClient(app) as client:
+        blocker = client.post(
+            "/runs",
+            json={
+                "thread_id": "waiter-limit-blocker",
+                "user_message": "Plan Tokyo under 7000 SGD.",
+            },
+        )
+        assert blocker_started.wait(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first_waiter = executor.submit(
+                client.post,
+                "/agent/message?wait=5",
+                json={
+                    "thread_id": "waiter-one",
+                    "user_message": "Plan Tokyo under 8000 SGD.",
+                },
+            )
+            deadline = time.monotonic() + 5
+            while client.app.state.agent_message_waiter_semaphore.value != 0:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("first Agent-message waiter did not acquire its slot")
+                time.sleep(0.01)
+            try:
+                started = time.monotonic()
+                overflow = client.post(
+                    "/agent/message?wait=5",
+                    json={
+                        "thread_id": "waiter-two",
+                        "user_message": "Plan Seoul under 9000 SGD.",
+                    },
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                release_blocker.set()
+            first = first_waiter.result(timeout=8)
+
+        assert overflow.status_code == 202
+        assert elapsed < 0.5
+        assert first.status_code == 200
+        assert wait_for_run(client, blocker.json()["run_id"])["status"] == "completed"
+        assert wait_for_run(client, overflow.json()["run_id"])["status"] == "completed"
+
+
+def test_many_agent_message_waiters_do_not_starve_health_threadpool(
+    tmp_path,
+    monkeypatch,
+):
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    original = TravelAgentRuntime.handle_user_message
+    call_count = 0
+    call_lock = threading.Lock()
+    waiter_count = 48
+
+    def blocking_handle(self, state, user_message):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            current_call = call_count
+        if current_call == 1:
+            blocker_started.set()
+            if not release_blocker.wait(timeout=8):
+                raise TimeoutError("health-starvation blocker was not released")
+        return original(self, state, user_message)
+
+    monkeypatch.setattr(
+        TravelAgentRuntime,
+        "handle_user_message",
+        blocking_handle,
+    )
+    app = create_app(
+        database_path=tmp_path / "runtime.db",
+        worker_count=1,
+        agent_message_waiter_limit=waiter_count,
+    )
+    with TestClient(app) as client:
+        blocker = client.post(
+            "/runs",
+            json={
+                "thread_id": "health-starvation-blocker",
+                "user_message": "Plan Tokyo under 7000 SGD.",
+            },
+        )
+        assert blocker.status_code == 202
+        assert blocker_started.wait(timeout=5)
+        barrier = threading.Barrier(waiter_count + 1)
+
+        def wait_request(index: int):
+            barrier.wait()
+            return client.post(
+                "/agent/message?wait=5",
+                json={
+                    "thread_id": f"health-starvation-waiter-{index}",
+                    "user_message": "Plan Seoul under 9000 SGD.",
+                },
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=waiter_count) as executor:
+                futures = [
+                    executor.submit(wait_request, index)
+                    for index in range(waiter_count)
+                ]
+                barrier.wait()
+                deadline = time.monotonic() + 8
+                while client.app.state.agent_message_waiter_semaphore.value != 0:
+                    if time.monotonic() >= deadline:
+                        raise AssertionError(
+                            "not all Agent-message waiters entered async wait"
+                        )
+                    time.sleep(0.01)
+
+                with ThreadPoolExecutor(max_workers=1) as health_executor:
+                    started = time.monotonic()
+                    health = health_executor.submit(client.get, "/health").result(
+                        timeout=2
+                    )
+                    health_elapsed = time.monotonic() - started
+
+                release_blocker.set()
+                responses = [future.result(timeout=8) for future in futures]
+        finally:
+            release_blocker.set()
+
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert health_elapsed < 1
+    assert all(response.status_code in {200, 202} for response in responses)
+
+
+def test_agent_message_failure_response_does_not_expose_runtime_error(
+    tmp_path,
+    monkeypatch,
+):
+    secret = "private-provider-token-in-exception"
+
+    def fail_with_secret(_self, _state, _user_message):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        TravelAgentRuntime,
+        "handle_user_message",
+        fail_with_secret,
+    )
+    app = create_app(database_path=tmp_path / "runtime.db")
+    with TestClient(app) as client:
+        response = client.post(
+            "/agent/message?wait=5",
+            json={
+                "thread_id": "agent-message-failure",
+                "user_message": "Trigger the test failure.",
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Managed Run did not complete successfully"}
+    assert secret not in response.text
+    assert "RuntimeError" not in response.text
+    assert response.headers["location"].startswith("/runs/run_")
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["wait=-1", "wait=6", "wait=nan", "wait=invalid", "wait=1&wait=2"],
+)
+def test_agent_message_rejects_invalid_wait_without_submitting_run(tmp_path, query):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/agent/message?{query}",
+            json={
+                "thread_id": "invalid-agent-message-wait",
+                "user_message": "Plan Tokyo.",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_agent_message_wait_contract_is_explicit_in_openapi(tmp_path):
+    app = create_app(database_path=tmp_path / "runtime.db")
+    operation = app.openapi()["paths"]["/agent/message"]["post"]
+    responses = operation["responses"]
+    wait_parameter = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["name"] == "wait"
+    )
+
+    assert responses["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentMessageResponse"
+    }
+    assert responses["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AgentMessagePendingResponse"
+    }
+    assert wait_parameter["in"] == "query"
+    assert wait_parameter["required"] is False
+    assert wait_parameter["schema"] == {
+        "type": "number",
+        "maximum": 5.0,
+        "minimum": 0.0,
+        "default": 5.0,
+        "title": "Wait",
+    }
+
+
+def test_agent_message_waiter_limit_does_not_treat_zero_as_omitted(tmp_path):
+    with pytest.raises(ValueError, match="agent message waiter limit"):
+        create_app(
+            database_path=tmp_path / "runtime.db",
+            agent_message_waiter_limit=0,
+        )
 
 
 def test_agent_message_uses_managed_run_and_client_state_only_seeds_empty_thread(

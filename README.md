@@ -601,13 +601,21 @@ and it does not create a private mount namespace, so it is not a general untrust
 | `POST /actions` | Submit one allowlisted durable side effect with optional bounded wait | no | yes |
 | `POST /runs/{id}/cancel` | Request cooperative cancellation | no | yes |
 | `POST /tools/{tool}/execute` | Execute a registered read-only tool directly; external writes return `409` | no | yes |
-| `POST /agent/message` | Call the synchronous Travel adapter through the managed Run lifecycle | no | yes |
+| `POST /agent/message` | Call the bounded-wait Travel adapter through the managed Run lifecycle | no | yes |
 | `DELETE /memories/{id}` | Forget one logical memory key for future runs | no | yes |
 
 `create_trip_hold` is intentionally absent from `GET /tools`; it belongs only
 to the private `travel-agent:1.2.0` durable registry. The direct POST route still
 recognizes that name so an authorized attempt receives `409` instead of falling
 through to sandbox execution.
+
+`POST /agent/message` preserves the legacy `200` completed-response shape but waits for at most
+`wait=0..5` seconds (five by default). If the managed Run is still queued or running, it returns
+`202` with the durable `run_id`, `Location`, and `Retry-After`; the Run continues after timeout or
+client disconnect. Its optional `state` now initializes only a tenant-qualified thread with no
+checkpoint and no queued/running Run. Existing-thread callers must omit `state` so the Run loads the
+durable checkpoint; callers that previously echoed `updated_state` into every request will receive
+`409` and must update.
 
 Outside explicit demo mode, `RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
 `viewer` or `operator`; missing or unknown roles fail configuration loading without retaining the
