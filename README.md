@@ -765,6 +765,8 @@ input signatures still match; the source run is never mutated.
   tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
 - [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): three-layer
   executable store contracts and the invariant-to-test matrix;
+- [`docs/state-boundaries.md`](docs/state-boundaries.md): persisted state ownership,
+  cross-turn dependencies, governed-memory authority, and checkpoint-growth characterization;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
   retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
