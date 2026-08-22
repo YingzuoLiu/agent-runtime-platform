@@ -13,10 +13,17 @@ from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+if __package__:
+    from examples.runtime_lease_probe import LeaseProbeFailure, LeaseProbeSnapshot
+else:
+    from runtime_lease_probe import LeaseProbeFailure, LeaseProbeSnapshot
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNTIME_URL = "http://127.0.0.1:8000"
 DEFAULT_PROVIDER_URL = "http://127.0.0.1:8100"
+RUNTIME_DATABASE_PATH = "/app/runtime_data/runtime.db"
+LEASE_OBSERVATION_SECONDS = 1.0
 TERMINAL_ACTION_STATUSES = frozenset({"succeeded", "failed", "cancelled", "outcome_unknown"})
 
 
@@ -83,8 +90,9 @@ def _json_request(
     except HTTPError as exc:
         status = exc.code
         raw = exc.read()
-    except URLError as exc:
-        raise ProofFailure(f"Could not reach {url}: {exc.reason}") from None
+    except (URLError, TimeoutError, ConnectionError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ProofFailure(f"Could not reach {url}: {reason}") from None
     if status not in accepted_statuses:
         detail = raw.decode("utf-8", errors="replace")[:500]
         raise ProofFailure(f"Unexpected HTTP {status} from {url}: {detail}")
@@ -104,15 +112,19 @@ def _wait_until(
 ):
     deadline = time.monotonic() + timeout
     last_value = None
+    last_error: str | None = None
     while time.monotonic() < deadline:
         try:
             last_value = operation()
-        except ProofFailure:
+            last_error = None
+        except ProofFailure as exc:
             last_value = None
+            last_error = str(exc)
         if last_value is not None and predicate(last_value):
             return last_value
         time.sleep(interval)
-    raise ProofFailure(f"Timed out waiting for {description}; last value: {last_value!r}")
+    detail = repr(last_value) if last_value is not None else (last_error or "no observation")
+    raise ProofFailure(f"Timed out waiting for {description}; last observation: {detail}")
 
 
 class ComposeRuntime:
@@ -173,6 +185,49 @@ class ComposeRuntime:
                 f"Could not inspect the {service!r} container: {exc.stderr.strip()}"
             ) from None
         return completed.stdout.strip()
+
+    def lease_probe(
+        self,
+        operation: str,
+        run_id: str,
+        *,
+        expected_attempt: int | None = None,
+        runtime_stopped: bool = False,
+    ) -> LeaseProbeSnapshot:
+        probe_arguments = [
+            "examples/runtime_lease_probe.py",
+            operation,
+            RUNTIME_DATABASE_PATH,
+            run_id,
+        ]
+        if expected_attempt is not None:
+            probe_arguments.extend(["--expected-attempt", str(expected_attempt)])
+        if runtime_stopped:
+            output = self._run(
+                "run",
+                "--rm",
+                "--no-deps",
+                "-T",
+                "--entrypoint",
+                "python",
+                "runtime",
+                *probe_arguments,
+                capture=True,
+            )
+        else:
+            output = self._run(
+                "exec",
+                "-T",
+                "runtime",
+                "python",
+                *probe_arguments,
+                capture=True,
+            )
+        try:
+            payload = json.loads(output)
+            return LeaseProbeSnapshot.from_payload(payload)
+        except (json.JSONDecodeError, LeaseProbeFailure) as exc:
+            raise ProofFailure(f"Invalid lease probe output: {exc}") from None
 
 
 def _demo_headers(runtime_url: str) -> dict[str, str]:
@@ -239,6 +294,81 @@ def _event_types(provider_state: dict[str, Any]) -> list[str]:
     if not isinstance(events, list):
         raise ProofFailure("Provider proof events are missing.")
     return [str(event.get("event_type")) for event in events if isinstance(event, dict)]
+
+
+def _verify_lease_transition(
+    scenario_name: str,
+    *,
+    before_kill: LeaseProbeSnapshot,
+    armed_while_stopped: LeaseProbeSnapshot,
+    live_after_restart: tuple[LeaseProbeSnapshot, LeaseProbeSnapshot],
+    expired: LeaseProbeSnapshot,
+    recovered: LeaseProbeSnapshot,
+) -> None:
+    prefix = f"{scenario_name}:"
+    _require(
+        before_kill.status == "running"
+        and before_kill.attempt == 1
+        and before_kill.lease_present
+        and before_kill.lease_live,
+        f"{prefix} initial Run attempt did not hold a live lease.",
+    )
+    _require(
+        before_kill.run_started_count == 1
+        and before_kill.run_recovered_count == 0
+        and not before_kill.recovery_reasons,
+        f"{prefix} initial Run event evidence is wrong.",
+    )
+    for snapshot in (armed_while_stopped, *live_after_restart):
+        _require(
+            snapshot.status == "running"
+            and snapshot.attempt == before_kill.attempt
+            and snapshot.lease_present
+            and snapshot.lease_live,
+            f"{prefix} restarted Runtime stole or lost the live lease.",
+        )
+        _require(
+            snapshot.run_started_count == before_kill.run_started_count
+            and snapshot.run_recovered_count == before_kill.run_recovered_count
+            and snapshot.recovery_reasons == before_kill.recovery_reasons,
+            f"{prefix} recovery evidence appeared before lease expiry.",
+        )
+    _require(
+        expired.status == "running"
+        and expired.attempt == before_kill.attempt
+        and expired.lease_present
+        and not expired.lease_live,
+        f"{prefix} exact store-time lease expiry was not injected.",
+    )
+    _require(
+        expired.run_started_count == before_kill.run_started_count
+        and expired.run_recovered_count == before_kill.run_recovered_count
+        and expired.recovery_reasons == before_kill.recovery_reasons,
+        f"{prefix} recovery evidence changed inside the expiry transaction.",
+    )
+    _require(
+        recovered.attempt == before_kill.attempt + 1
+        and recovered.run_started_count == before_kill.run_started_count + 1
+        and recovered.run_recovered_count == before_kill.run_recovered_count + 1
+        and recovered.recovery_reasons == ("lease_expired",),
+        f"{prefix} expired Run was not recovered exactly once by a new attempt.",
+    )
+
+
+def _lease_transition_artifact(
+    before_kill: LeaseProbeSnapshot,
+    recovered: LeaseProbeSnapshot,
+) -> dict[str, Any]:
+    return {
+        "pre_expiry_no_takeover": True,
+        "post_expiry_takeover": True,
+        "attempt_before": before_kill.attempt,
+        "attempt_after": recovered.attempt,
+        "run_started_count": recovered.run_started_count,
+        "run_recovered_count": recovered.run_recovered_count,
+        "recovery_reason": recovered.recovery_reasons[-1],
+        "exact_store_time_expiry_injected": True,
+    }
 
 
 def _verify_scenario(
@@ -373,6 +503,7 @@ def _run_scenario(
         waiting_state.get("attempt_count") == 1,
         f"{spec.name}: more than one attempt occurred before restart.",
     )
+    before_kill = compose.lease_probe("snapshot", action_id)
 
     runtime_started_before = compose.started_at("runtime")
     runtime_was_killed = False
@@ -380,6 +511,12 @@ def _run_scenario(
         compose.kill_runtime()
         runtime_was_killed = True
         print("  Runtime killed after provider commit")
+        armed_while_stopped = compose.lease_probe(
+            "arm",
+            action_id,
+            expected_attempt=before_kill.attempt,
+            runtime_stopped=True,
+        )
         _json_request(
             f"{provider_url}/proof/actions/{action_id}/release",
             method="POST",
@@ -394,6 +531,15 @@ def _run_scenario(
         runtime_was_killed = False
     finally:
         if runtime_was_killed:
+            try:
+                _json_request(
+                    f"{provider_url}/proof/actions/{action_id}/release",
+                    method="POST",
+                    payload={},
+                    accepted_statuses=frozenset({200, 404}),
+                )
+            except ProofFailure:
+                pass
             compose.start(include_build=False)
 
     runtime_started_after = compose.started_at("runtime")
@@ -401,9 +547,51 @@ def _run_scenario(
         runtime_started_before != runtime_started_after,
         f"{spec.name}: Runtime container did not restart.",
     )
-    print("  Runtime restarted from the persisted dispatching state")
+    print("  Runtime restarted; live lease remains owned by the killed attempt")
 
     headers = _demo_headers(runtime_url)
+    first_live_after_restart = compose.lease_probe("snapshot", action_id)
+    action_before_expiry = _action_state(runtime_url, action_id, headers)
+    provider_before_expiry = _provider_state(provider_url, action_id)
+    time.sleep(LEASE_OBSERVATION_SECONDS)
+    second_live_after_restart = compose.lease_probe("snapshot", action_id)
+    action_after_observation = _action_state(runtime_url, action_id, headers)
+    provider_after_observation = _provider_state(provider_url, action_id)
+    _require(
+        action_before_expiry.get("status") not in TERMINAL_ACTION_STATUSES
+        and action_after_observation.get("status") not in TERMINAL_ACTION_STATUSES,
+        f"{spec.name}: Action became terminal before lease expiry.",
+    )
+    _require(
+        provider_before_expiry.get("attempt_count") == 1
+        and provider_after_observation.get("attempt_count") == 1,
+        f"{spec.name}: provider was called again before lease expiry.",
+    )
+    expired = compose.lease_probe(
+        "expire",
+        action_id,
+        expected_attempt=before_kill.attempt,
+    )
+    recovered = _wait_until(
+        lambda: compose.lease_probe("snapshot", action_id),
+        lambda snapshot: (
+            snapshot.attempt == before_kill.attempt + 1
+            and snapshot.run_started_count == before_kill.run_started_count + 1
+            and snapshot.run_recovered_count == before_kill.run_recovered_count + 1
+        ),
+        description=f"{spec.name} lease-expiry takeover",
+        interval=0.25,
+    )
+    _verify_lease_transition(
+        spec.name,
+        before_kill=before_kill,
+        armed_while_stopped=armed_while_stopped,
+        live_after_restart=(first_live_after_restart, second_live_after_restart),
+        expired=expired,
+        recovered=recovered,
+    )
+    print("  live lease was not stolen; exact expiry produced attempt 2")
+
     action = _wait_until(
         lambda: _action_state(runtime_url, action_id, headers),
         lambda state: state.get("status") in TERMINAL_ACTION_STATUSES,
@@ -452,11 +640,14 @@ def _run_scenario(
             "runtime_started_after": runtime_started_after,
             "observed": True,
         },
+        "run_lease_recovery": _lease_transition_artifact(before_kill, recovered),
         "duplicate_submission_reused_action": True,
     }
 
 
 def run_proof(*, build: bool, runtime_url: str, provider_url: str) -> Path:
+    artifact_path = REPOSITORY_ROOT / "artifacts" / "action-recovery-proof.json"
+    artifact_path.unlink(missing_ok=True)
     compose = ComposeRuntime(build=build)
     print("Starting the local Runtime and provider sidecar...")
     compose.start()
@@ -479,7 +670,7 @@ def run_proof(*, build: bool, runtime_url: str, provider_url: str) -> Path:
     )
 
     artifact = {
-        "proof": "durable-action-recovery:1",
+        "proof": "durable-action-recovery:2",
         "generated_at": datetime.now(UTC).isoformat(),
         "proof_id": proof_id,
         "result": "passed",
@@ -489,7 +680,6 @@ def run_proof(*, build: bool, runtime_url: str, provider_url: str) -> Path:
         },
         "scenarios": results,
     }
-    artifact_path = REPOSITORY_ROOT / "artifacts" / "action-recovery-proof.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(
         json.dumps(artifact, indent=2, sort_keys=True) + "\n",
@@ -523,6 +713,7 @@ def main() -> int:
     print("\nACTION GATEWAY RECOVERY PROOF: PASSED")
     print("  safe-retry:       2 attempts, 1 effect, succeeded with stored receipt")
     print("  unsafe-no-retry:  1 attempt, 1 effect, outcome_unknown without replay")
+    print("  each live lease resisted takeover, then recovered once at exact expiry")
     print("  Runtime restarted twice; provider lifecycle stayed unchanged")
     print(f"  Sanitized artifact: {artifact_path}")
     return 0

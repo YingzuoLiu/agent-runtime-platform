@@ -13,3 +13,4 @@ runtime_data
 *.db
 *.sqlite*
 traces
+artifacts

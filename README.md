@@ -113,9 +113,11 @@ python examples/action_recovery_proof.py
 
 The proof runs two deployment-owned destinations. `safe-retry` replays the same server-derived key
 after restart and recovers the provider's stored receipt. `unsafe-no-retry` makes no second provider
-call and terminates as `outcome_unknown`. Both paths assert one provider effect, restart continuity,
-ordered Runtime/provider evidence, and duplicate-POST reuse. A passing run writes a sanitized local
-artifact to `artifacts/action-recovery-proof.json`. See
+call and terminates as `outcome_unknown`. Before either recovery, the proof verifies that a restarted
+Manager cannot steal the killed attempt's live Run lease; at an injected exact store-time expiry it
+then requires attempt 2 and one `run.recovered(reason=lease_expired)` event. Both paths assert one
+provider effect, restart continuity, ordered Runtime/provider evidence, and duplicate-POST reuse. A
+passing run writes a sanitized local artifact to `artifacts/action-recovery-proof.json`. See
 [`docs/action-recovery-proof.md`](docs/action-recovery-proof.md) for the failure injection, network
 topology, expected output, and short interview walkthrough.
 
@@ -804,10 +806,12 @@ routing, provider-capability recovery, terminal uncertainty, cancellation preced
 and event projection, tenant/RBAC isolation, bounded asynchronous waiting, multi-manager SQLite
 races, threadpool-pressure behavior, and the ten-line external-Agent example.
 The local recovery proof additionally covers provider-side commit-before-response injection,
-independent Runtime restart, one-effect receipt replay, unsafe no-retry, and sanitized dual-ledger
-evidence.
+independent Runtime restart, live-lease non-stealing, exact-expiry takeover, one-effect receipt
+replay, unsafe no-retry, and sanitized cross-ledger evidence.
 
-GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12.
+GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12. After
+both matrix legs pass, one Python 3.12 job runs the Docker Action-recovery proof and uploads only its
+sanitized artifact.
 
 ## Deployment boundary
 

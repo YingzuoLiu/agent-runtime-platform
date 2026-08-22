@@ -2,8 +2,8 @@
 
 This local proof makes the Phase 7D recovery boundary visible without replacing it with a mock
 workflow. It uses the published `POST /actions` API, the real `HttpExternalActionProvider`, the real
-external-action ledger and `RuntimeManager` recovery path, and a separate provider process with its
-own SQLite effect ledger.
+external-action ledger and lease-aware `RuntimeManager` recovery path, and a separate provider
+process with its own SQLite effect ledger.
 
 ## Run it
 
@@ -22,8 +22,12 @@ python examples/action_recovery_proof.py --no-build
 
 The script starts the two Compose services, submits each Action, waits until the provider proves the
 effect is committed, sends `SIGKILL` to the exact Compose `runtime` service, releases an injected
-provider-side `503`, and restarts the Runtime over its existing volume. It never removes volumes or
-resets repository state. If any assertion fails, the command exits nonzero.
+provider-side `503`, and restarts the Runtime over its existing volume. Before restart, a local-only
+probe extends the killed attempt's still-live lease to create a deterministic observation window.
+The restarted Manager must leave that attempt untouched. The probe then moves that exact attempt to
+the SQLite store-time expiry boundary, after which the Manager must recover it exactly once. The
+script never removes volumes or resets repository state. If any assertion fails, the command exits
+nonzero.
 
 A passing summary is:
 
@@ -31,13 +35,17 @@ A passing summary is:
 ACTION GATEWAY RECOVERY PROOF: PASSED
   safe-retry:       2 attempts, 1 effect, succeeded with stored receipt
   unsafe-no-retry:  1 attempt, 1 effect, outcome_unknown without replay
+  each live lease resisted takeover, then recovered once at exact expiry
   Runtime restarted twice; provider lifecycle stayed unchanged
   Sanitized artifact: .../artifacts/action-recovery-proof.json
 ```
 
 The generated artifact is ignored by Git. It excludes the demo API key, client/provider
 idempotency keys, request body, tenant and subject, endpoint configuration, credentials, dispatch
-tokens, and raw upstream responses.
+tokens, Run lease tokens and owners, lease timestamps, and raw upstream responses. Its Run-lease
+section contains only attempt numbers, event counts, the public recovery reason, and proof booleans.
+The script removes the previous generated artifact before starting, so a failed rerun cannot leave a
+stale PASS artifact behind.
 
 ## What the two paths prove
 
@@ -53,6 +61,12 @@ Runtime deliberately reports uncertainty rather than risking a duplicate real-wo
 Submitting the same public Action again must also return the original `action_id` and terminal
 status without another provider attempt.
 
+For both paths, the enclosing private Run must remain at attempt 1 while the killed attempt's lease
+is live. At exact expiry it must advance to attempt 2 with one additional `run.started` event and
+exactly one `run.recovered` event whose reason is `lease_expired`. This is the cross-milestone
+property: Run takeover and external-action reconciliation must remain correct when exercised
+together.
+
 ## Failure injection and evidence order
 
 The sidecar does not merely echo the request. On the first dispatch it:
@@ -61,11 +75,18 @@ The sidecar does not merely echo the request. On the first dispatch it:
 2. writes the effect and sanitized provider events to its own SQLite ledger;
 3. holds the HTTP response so the proof script can observe `effect.committed`;
 4. after the Runtime is killed, records `fault.release_requested` and `response.ambiguous`, then
-   returns `503` to the now-lost connection.
+   returns `503` to the now-lost connection;
+5. while that attempt still has a live lease, observes that the restarted Runtime neither advances
+   the Run attempt nor calls the provider again;
+6. injects exact store-time expiry and waits for durable `run.recovered(reason=lease_expired)` plus
+   the second `run.started` event before checking the Action outcome.
 
 Provider event order comes from its monotonically increasing `event_sequence`; the proof never
 compares clocks across the Runtime and sidecar. Runtime Action events use the existing durable
-workflow sequence.
+workflow sequence. Run ownership evidence comes from a strict allowlist in
+`examples/runtime_lease_probe.py`; its SQL never selects the lease token or owner. The probe uses
+SQLite's same `julianday('now')` expression and `BEGIN IMMEDIATE` transaction boundary as the Run
+store.
 
 For `safe-retry`, the post-restart request finds the existing hashed key and canonical request hash,
 adds `receipt.replayed`, and returns `200 application/json` with the strict provider result:
@@ -113,7 +134,9 @@ Then run the warmed command and point to the two PASS lines:
    server-derived key, recovered the stored receipt, and still produced only one effect.”
 2. **Unsafe retry:** “This destination does not promise idempotency, so the Runtime did not
    resend. It reported `outcome_unknown`; that is safer than silently duplicating the action.”
-3. **Durability:** “The Runtime process restarted twice, while the provider process and both
+3. **Fenced takeover:** “The restarted Manager first left the live attempt alone. At exact lease
+   expiry, attempt 2 took over with one `lease_expired` recovery event.”
+4. **Durability:** “The Runtime process restarted twice, while the provider process and both
    SQLite ledgers survived. Repeating the public request reused the same Action.”
 
 If the interviewer wants implementation detail, open the sanitized artifact and show only:
@@ -121,6 +144,7 @@ If the interviewer wants implementation detail, open the sanitized artifact and 
 - final Action status;
 - Runtime event `dispatch_count` and `retry_mode`;
 - provider `attempt_count=1|2` and `effect_count=1`;
+- Run attempt `1 -> 2`, one recovery event, and `reason=lease_expired`;
 - ordered provider events ending in `receipt.replayed` only for the idempotent path.
 
 The Travel Runtime Console remains the first, product-facing demonstration. This recovery proof is
@@ -130,6 +154,10 @@ calling.
 ## Boundaries
 
 This is a deterministic local proof, not a production provider. Its control endpoints are
-unauthenticated and published only on `127.0.0.1`; the Compose file is marked local-demo-only. Phase
-7D still does not claim distributed exactly-once execution, compensation, provider-status queries,
-automatic terminal-unknown resolution, arbitrary webhooks, or production sidecar deployment.
+unauthenticated and published only on `127.0.0.1`; the Compose file is marked local-demo-only. The
+lease probe is a test-only direct-database fault-injection seam, not a Runtime API or an operational
+lease-management tool. Lease-deadline and exact-expiry fencing semantics remain covered by the Run
+leasing test suite; this proof covers the real Docker restart wiring and its interaction with
+Action reconciliation. Phase 7D still does not claim distributed exactly-once execution,
+compensation, provider-status queries, automatic terminal-unknown resolution, arbitrary webhooks,
+or production sidecar deployment.
