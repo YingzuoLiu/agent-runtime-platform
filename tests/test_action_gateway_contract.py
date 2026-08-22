@@ -17,7 +17,11 @@ from runtime_service import (
     StaticApiKeyAuthenticator,
 )
 from runtime_service.action_gateway import (
+    ACTION_AGENT_ID,
+    ACTION_AGENT_VERSION,
+    ACTION_DOMAIN_ID,
     ACTION_REQUEST_NAMESPACE_PREFIX,
+    ACTION_SCHEMA_VERSION,
     ActionCreateRequest,
     WebhookSendInput,
     action_client_request_id,
@@ -26,6 +30,12 @@ from runtime_service.action_gateway import (
     load_action_providers_from_environment,
     to_durable_action_input,
 )
+from runtime_service.action_gateway_service import (
+    ActionEvidenceIncompleteError,
+    ActionProjector,
+)
+from runtime_service.models import RunRecord, RunStatus
+from runtime_service.workflow_store import SQLiteWorkflowStore
 from tests.test_api import TestClient
 
 
@@ -56,6 +66,36 @@ def action_request(**overrides) -> ActionCreateRequest:
     }
     payload.update(overrides)
     return ActionCreateRequest.model_validate(payload)
+
+
+def test_quarantined_action_without_ledger_fails_projection_closed(tmp_path):
+    request = action_request()
+    runtime_input = to_durable_action_input(request)
+    tenant_id = "projection-tenant"
+    run = RunRecord(
+        run_id="run-quarantined-without-ledger",
+        tenant_id=tenant_id,
+        thread_id=action_thread_id(
+            tenant_id,
+            runtime_input.action_type,
+            runtime_input.idempotency_key,
+        ),
+        agent_id=ACTION_AGENT_ID,
+        agent_version=ACTION_AGENT_VERSION,
+        domain_id=ACTION_DOMAIN_ID,
+        schema_version=ACTION_SCHEMA_VERSION,
+        status=RunStatus.RUNNING,
+        input=runtime_input.model_dump(mode="json"),
+        client_request_id=action_client_request_id(runtime_input.idempotency_key),
+        error_code="thread_checkpoint_conflict_reconciliation_pending",
+    )
+    projector = ActionProjector(SQLiteWorkflowStore(tmp_path / "runtime.db"))
+
+    with pytest.raises(
+        ActionEvidenceIncompleteError,
+        match="marker has no external-action ledger row",
+    ):
+        projector.project(run)
 
 
 def test_action_identity_uses_exact_client_key_and_versioned_canonical_material():

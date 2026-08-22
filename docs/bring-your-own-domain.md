@@ -286,9 +286,12 @@ by itself.
 `REQUEST_CLARIFICATION` completes the current Run and saves the checkpoint. A caller continues by
 submitting another Run on the same Agent version and thread; it is not a durable paused worker.
 
-Runs on the same tenant-qualified thread must also be submitted serially. Multiple workers can
-otherwise read the same checkpoint concurrently and the last completion can overwrite the other
-update; the current checkpoint store has no per-thread lease or revision compare-and-swap.
+Runs may be submitted concurrently, but the store executes them serially per tenant-qualified
+thread. A `running` predecessor retains the thread slot through lease recovery; queued successors
+cannot enter Runtime code until it terminalizes. Each first claim captures a checkpoint base
+revision, and successful completion conditionally advances that revision in the same transaction
+as the Run and events. Different thread keys remain parallel. Client-provided `state` may only seed
+an empty thread; continuing an existing thread must omit it and load the durable checkpoint.
 
 ## Security and product boundary
 

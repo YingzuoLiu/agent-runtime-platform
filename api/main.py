@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -40,7 +41,6 @@ from domains.travel.preferences import (
     parse_legacy_travel_preferences,
 )
 from domains.travel.state import AgentState
-from domains.travel.runtime import TravelAgentRuntime
 from domains.travel.tools import (
     SQLiteTripHoldProvider,
     build_travel_external_action_tool_registry,
@@ -64,6 +64,7 @@ from runtime_service import (
     RunCreateRequest,
     RunEvent,
     RunRecord,
+    RunStatus,
     RuntimeManager,
     RuntimeExtension,
     RuntimeExtensionContext,
@@ -72,6 +73,7 @@ from runtime_service import (
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
+    ThreadStateConflictError,
     ToolDescriptor,
     ToolEffect,
     ToolExecutionRequest,
@@ -143,7 +145,10 @@ class AgentMessageRequest(BaseModel):
     user_message: str = Field(..., description="User message to process.")
     state: Optional[AgentState] = Field(
         default=None,
-        description="Optional client-provided state. If omitted, server loads the durable thread checkpoint.",
+        description=(
+            "Optional state used only to initialize an empty thread. "
+            "Omit it to continue an existing durable checkpoint."
+        ),
     )
 
 
@@ -599,17 +604,18 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> AgentMessageResponse:
-        """Backward-compatible synchronous endpoint backed by the durable thread store."""
+        """Backward-compatible response shape backed by the managed Run lifecycle."""
         require_permission(principal, RuntimePermission.AGENT_MESSAGE_EXECUTE)
         store: SQLiteRunStore = request.app.state.run_store
-        runtime = TravelAgentRuntime(retry_limit=2)
         if payload.state is not None and payload.state.thread_id != payload.thread_id:
             raise HTTPException(
                 status_code=422,
                 detail="state.thread_id must match request.thread_id",
             )
         try:
-            persisted_state = store.load_thread_state(
+            # Preserve the compatibility endpoint's immediate cross-domain
+            # conflict while execution itself now goes through a managed Run.
+            store.load_thread_state(
                 payload.thread_id,
                 tenant_id=principal.tenant_id,
                 domain_id=AgentState.domain_id,
@@ -617,19 +623,47 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        state_value = payload.state or persisted_state or AgentState(thread_id=payload.thread_id)
-        result = runtime.handle_user_message(state_value, payload.user_message)
+
+        authority = effective_execution_authority(principal, resolved_authorizer)
         try:
-            store.save_unmanaged_thread_state(
-                result.state,
-                tenant_id=principal.tenant_id,
+            submitted = get_manager(request).submit(
+                RunCreateRequest(
+                    thread_id=payload.thread_id,
+                    agent_id="travel-agent",
+                    agent_version="0.3.0",
+                    input={"user_message": payload.user_message},
+                    state=payload.state,
+                ),
+                tenant_context=TenantContext(
+                    tenant_id=authority.tenant_id,
+                    subject_id=authority.subject_id,
+                    permissions=authority.permissions,
+                ),
             )
-        except ValueError as exc:
+        except ThreadStateConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        while True:
+            completed = get_manager(request).get_run(
+                submitted.run_id,
+                tenant_context=principal.tenant_context,
+            )
+            if completed is None:
+                raise HTTPException(status_code=500, detail="Managed Run disappeared")
+            if completed.status.is_terminal:
+                break
+            time.sleep(0.01)
+
+        if completed.status != RunStatus.COMPLETED or completed.state is None:
+            raise HTTPException(
+                status_code=500,
+                detail=completed.error or "Managed Run did not complete successfully",
+            )
+        result_state = AgentState.model_validate(completed.state)
         return AgentMessageResponse(
-            assistant_message=result.message,
-            updated_state=result.state,
-            validation_errors=result.validation_errors,
+            assistant_message=completed.output_message or "",
+            updated_state=result_state,
+            validation_errors=completed.validation_errors,
         )
 
     @app.post("/runs", response_model=RunRecord, status_code=status.HTTP_202_ACCEPTED)
@@ -678,6 +712,8 @@ def create_app(
             )
         except ReferencedRunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Referenced run not found") from exc
+        except ThreadStateConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

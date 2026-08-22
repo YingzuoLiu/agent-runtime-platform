@@ -30,7 +30,10 @@ from .external_actions import ExternalActionProviderRegistry
 from .manager import RuntimeManager
 from .models import RunCreateRequest, RunRecord, RunStatus
 from .sandbox import ToolRetryMode
-from .store import SQLiteRunStore
+from .store import (
+    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+    SQLiteRunStore,
+)
 from .workflow_store import (
     ExternalActionRecord,
     ExternalActionStatus,
@@ -153,7 +156,10 @@ class ActionProjector:
             )
 
         if action is None:
-            if run.error_code == "external_action_reconciliation_pending":
+            if run.error_code in {
+                "external_action_reconciliation_pending",
+                THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+            }:
                 raise ActionEvidenceIncompleteError(
                     "Reconciliation marker has no external-action ledger row"
                 )
@@ -206,7 +212,11 @@ class ActionProjector:
                 )
             status = (
                 ActionStatus.RECONCILING
-                if run.error_code == "external_action_reconciliation_pending"
+                if run.error_code
+                in {
+                    "external_action_reconciliation_pending",
+                    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                }
                 else ActionStatus.RUNNING
             )
             return self._resource(run, runtime_input, status, action=action)

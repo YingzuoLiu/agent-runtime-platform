@@ -1,9 +1,13 @@
+import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient as FastAPITestClient
 
 from api.main import create_app as create_runtime_app
+from domains.travel.runtime import TravelAgentRuntime
 from runtime_service import (
     ApiKeyCredential,
     AuthorizationError,
@@ -11,6 +15,7 @@ from runtime_service import (
     RuntimeRole,
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
+    build_default_registry,
 )
 from runtime_service.workflow_store import SQLiteWorkflowStore
 
@@ -129,6 +134,155 @@ def test_fastapi_agent_message_endpoint(tmp_path):
     body = response.json()
     assert body["updated_state"]["destination"] == "Tokyo"
     assert body["updated_state"]["budget"] == 7000
+
+
+def test_agent_message_uses_managed_run_and_client_state_only_seeds_empty_thread(
+    tmp_path,
+):
+    database_path = tmp_path / "runtime.db"
+    app = create_app(database_path=database_path)
+    with TestClient(app) as client:
+        seeded = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "managed-message-thread",
+                "user_message": "Change the budget to 8000 SGD.",
+                "state": {
+                    "thread_id": "managed-message-thread",
+                    "destination": "Tokyo",
+                    "budget": 7000,
+                },
+            },
+        )
+        replacement = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "managed-message-thread",
+                "user_message": "Change the budget to 9000 SGD.",
+                "state": {
+                    "thread_id": "managed-message-thread",
+                    "destination": "Seoul",
+                    "budget": 5000,
+                },
+            },
+        )
+        continued = client.post(
+            "/agent/message",
+            json={
+                "thread_id": "managed-message-thread",
+                "user_message": "Change the budget to 9000 SGD.",
+            },
+        )
+
+    assert seeded.status_code == 200
+    assert seeded.json()["updated_state"]["destination"] == "Tokyo"
+    assert seeded.json()["updated_state"]["budget"] == 8000
+    assert replacement.status_code == 409
+    assert replacement.json()["detail"] == (
+        "Client-provided state can only initialize an empty thread; "
+        "omit state to continue thread 'managed-message-thread'"
+    )
+    assert continued.status_code == 200
+    assert continued.json()["updated_state"]["destination"] == "Tokyo"
+    assert continued.json()["updated_state"]["budget"] == 9000
+
+    store = SQLiteRunStore(database_path, state_registry=build_default_registry())
+    snapshot = store.load_thread_state_snapshot(
+        "managed-message-thread",
+        tenant_id=TENANT_A_ID,
+    )
+    assert snapshot.revision == 2
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT run_id, status FROM runs WHERE tenant_id = ? AND thread_id = ? "
+            "ORDER BY created_at, run_id",
+            (TENANT_A_ID, "managed-message-thread"),
+        ).fetchall()
+    assert len(rows) == 2
+    assert [row[1] for row in rows] == ["completed", "completed"]
+    for run_id, _ in rows:
+        event_types = [event.event_type for event in store.list_events(run_id)]
+        assert event_types[0] == "run.queued"
+        assert event_types[-2:] == ["checkpoint.saved", "run.completed"]
+
+
+def test_agent_message_and_runs_share_one_thread_execution_slot(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "runtime.db"
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    call_count = 0
+    call_lock = threading.Lock()
+    original = TravelAgentRuntime.handle_user_message
+
+    def blocking_handle(self, state, user_message):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            current_call = call_count
+        if current_call == 1:
+            first_started.set()
+            if not release_first.wait(timeout=5):
+                raise TimeoutError("first API Run was not released")
+        else:
+            second_started.set()
+        return original(self, state, user_message)
+
+    monkeypatch.setattr(
+        TravelAgentRuntime,
+        "handle_user_message",
+        blocking_handle,
+    )
+    app = create_app(database_path=database_path, worker_count=2)
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        first_response = executor.submit(
+            client.post,
+            "/agent/message",
+            json={
+                "thread_id": "shared-api-thread",
+                "user_message": "Plan Tokyo under 7000 SGD.",
+            },
+        )
+        assert first_started.wait(timeout=5)
+
+        second = client.post(
+            "/runs",
+            json={
+                "thread_id": "shared-api-thread",
+                "user_message": "Change the budget to 9000 SGD.",
+            },
+        )
+        try:
+            assert second.status_code == 202
+            second_run_id = second.json()["run_id"]
+            queued = client.get(f"/runs/{second_run_id}")
+            assert queued.status_code == 200
+            assert queued.json()["status"] == "queued"
+            assert not second_started.is_set()
+        finally:
+            release_first.set()
+
+        first = first_response.result(timeout=5)
+        assert first.status_code == 200
+        completed_second = wait_for_run(client, second_run_id)
+
+    assert second_started.is_set()
+    assert completed_second["status"] == "completed"
+    assert completed_second["state"]["destination"] == "Tokyo"
+    assert completed_second["state"]["budget"] == 9000
+    snapshot = SQLiteRunStore(
+        database_path,
+        state_registry=build_default_registry(),
+    ).load_thread_state_snapshot(
+        "shared-api-thread",
+        tenant_id=TENANT_A_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert snapshot.revision == 2
 
 
 def test_legacy_agent_message_rejects_mismatched_explicit_state_thread(tmp_path):

@@ -18,11 +18,15 @@ from runtime_service.store import SQLiteRunStore
 
 LEASE_TOKEN = "lease_public_boundary_secret"
 LEASE_OWNER = "manager_public_boundary_secret"
-INTERNAL_LEASE_FIELDS = {
+LEASE_AUTHORITY_FIELDS = {
     "lease_owner_id",
     "lease_token",
     "lease_heartbeat_at",
     "lease_expires_at",
+}
+INTERNAL_RUN_FIELDS = {
+    *LEASE_AUTHORITY_FIELDS,
+    "checkpoint_base_revision",
 }
 
 
@@ -39,6 +43,7 @@ def _leased_run() -> RunRecord:
         lease_token=LEASE_TOKEN,
         lease_heartbeat_at=1_000,
         lease_expires_at=31_000,
+        checkpoint_base_revision=7,
     )
 
 
@@ -66,7 +71,7 @@ def test_lease_authority_is_absent_from_serialization_repr_and_public_exports() 
         assert LEASE_TOKEN not in repr(value)
         assert LEASE_OWNER not in repr(value)
 
-    assert INTERNAL_LEASE_FIELDS.isdisjoint(run.model_dump(mode="json"))
+    assert INTERNAL_RUN_FIELDS.isdisjoint(run.model_dump(mode="json"))
     assert "lease_token" not in context.model_dump(mode="json")
     assert {"owner_id", "lease_token"}.isdisjoint(claim.model_dump(mode="json"))
     assert "RunLeaseClaim" not in runtime_service.__all__
@@ -77,7 +82,7 @@ def test_run_openapi_schema_excludes_internal_lease_fields(tmp_path) -> None:
 
     run_schema = app.openapi()["components"]["schemas"]["RunRecord"]
 
-    assert INTERNAL_LEASE_FIELDS.isdisjoint(run_schema["properties"])
+    assert INTERNAL_RUN_FIELDS.isdisjoint(run_schema["properties"])
 
 
 def test_claim_and_recovery_events_do_not_expose_lease_authority(tmp_path) -> None:
@@ -93,6 +98,7 @@ def test_claim_and_recovery_events_do_not_expose_lease_authority(tmp_path) -> No
             "lease_token": None,
             "lease_heartbeat_at": None,
             "lease_expires_at": None,
+            "checkpoint_base_revision": None,
         }
     )
     store.create_run_with_event(run, event_type="run.queued")
@@ -120,7 +126,7 @@ def test_claim_and_recovery_events_do_not_expose_lease_authority(tmp_path) -> No
         "manager_replacement_secret",
     ):
         assert private_value not in encoded_events
-    assert INTERNAL_LEASE_FIELDS.isdisjoint(
+    assert LEASE_AUTHORITY_FIELDS.isdisjoint(
         {
             key
             for event in store.list_events(run.run_id)
@@ -165,7 +171,7 @@ def test_provider_request_contract_cannot_carry_internal_lease_metadata() -> Non
     )
 
     assert captured == [request]
-    assert INTERNAL_LEASE_FIELDS.isdisjoint(ExternalActionRequest.model_fields)
+    assert INTERNAL_RUN_FIELDS.isdisjoint(ExternalActionRequest.model_fields)
     encoded = captured[0].model_dump_json()
     assert LEASE_TOKEN not in encoded
     assert LEASE_OWNER not in encoded

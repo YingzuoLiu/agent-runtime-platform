@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from domains.travel.state import AgentState
 from runtime_service import RunRecord, RunStatus
 from runtime_service.memory import SQLiteMemoryStore
 from runtime_service.registry import build_default_registry
-from runtime_service.models import LEGACY_TENANT_ID, RunLeaseRecoveryReason
+from runtime_service.models import LEGACY_TENANT_ID
 from runtime_service.store import SQLiteRunStore
 
 EXPECTED_COLUMNS = {
@@ -45,6 +47,7 @@ EXPECTED_COLUMNS = {
         ("lease_token", "TEXT", 0, 0),
         ("lease_heartbeat_at", "INTEGER", 0, 0),
         ("lease_expires_at", "INTEGER", 0, 0),
+        ("checkpoint_base_revision", "INTEGER", 0, 0),
     ],
     "run_events": [
         ("event_id", "INTEGER", 0, 1),
@@ -61,6 +64,7 @@ EXPECTED_COLUMNS = {
         ("schema_version", "TEXT", 1, 0),
         ("state_json", "TEXT", 1, 0),
         ("updated_at", "TEXT", 1, 0),
+        ("revision", "INTEGER", 1, 0),
     ],
     "memory_records": [
         ("memory_id", "TEXT", 0, 1),
@@ -160,6 +164,72 @@ def test_run_claim_index_matches_lease_candidate_ordering(tmp_path):
     assert columns == ["status", "lease_expires_at", "created_at"]
 
 
+def test_running_run_index_is_unique_per_tenant_qualified_thread(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    SQLiteRunStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_runs_one_running_per_thread'"
+        ).fetchone()
+        columns = [
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(idx_runs_one_running_per_thread)"
+            ).fetchall()
+        ]
+
+    assert index is not None
+    assert "UNIQUE INDEX" in index[0]
+    assert "WHERE status = 'running'" in index[0]
+    assert columns == ["tenant_id", "thread_id"]
+
+
+def test_store_rejects_same_named_index_that_does_not_enforce_thread_ownership(
+    tmp_path,
+):
+    database_path = tmp_path / "runtime.db"
+    SQLiteRunStore(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX idx_runs_one_running_per_thread")
+        connection.execute(
+            "CREATE INDEX idx_runs_one_running_per_thread ON runs(status)"
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires the unique partial index",
+    ):
+        SQLiteRunStore(database_path)
+
+
+def test_thread_serialization_migration_requires_legacy_runs_to_be_drained(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-nonterminal.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO runs (run_id, status) VALUES (?, ?)",
+            ("legacy-queued", RunStatus.QUEUED.value),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires all legacy queued and running Runs to be drained",
+    ):
+        SQLiteRunStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+    assert "checkpoint_base_revision" not in columns
+
+
 def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     database_path = tmp_path / "legacy.db"
     state = AgentState(thread_id="legacy-thread", destination="Tokyo")
@@ -236,11 +306,11 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
             )
             """,
             (
-                "run_legacy_running",
+                "run_legacy_terminal",
                 "legacy-running-thread",
                 "travel-agent",
                 "0.3.0",
-                "running",
+                "failed",
                 "Plan Osaka",
                 None,
                 None,
@@ -278,10 +348,10 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
             "INSERT INTO run_events (run_id, sequence, event_type, payload_json, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (
-                "run_legacy_running",
+                "run_legacy_terminal",
                 1,
-                "run.started",
-                '{"attempt": 1}',
+                "run.failed",
+                '{"error": "legacy terminal evidence"}',
                 "2026-01-02T00:00:00+00:00",
             ),
         )
@@ -310,38 +380,13 @@ def test_pre_phase_3a_rows_migrate_to_travel_schema_without_data_loss(tmp_path):
     assert migrated_run.state.destination == "Tokyo"
     assert migrated_state is not None
     assert migrated_state.destination == "Tokyo"
+    assert store.load_thread_state_snapshot(
+        "legacy-thread",
+        tenant_id=LEGACY_TENANT_ID,
+    ).revision == 1
     assert [event.event_type for event in store.list_events("run_legacy")] == [
         "run.completed"
     ]
-    legacy_claim = store.claim_next_run(
-        owner_id="lease-aware-manager",
-        lease_duration_seconds=30,
-    )
-    assert legacy_claim is not None
-    assert legacy_claim.run.run_id == "run_legacy_running"
-    assert legacy_claim.run.attempt == 2
-    assert legacy_claim.recovery_reason == RunLeaseRecoveryReason.LEGACY_UNLEASED
-    assert legacy_claim.run.lease_token == legacy_claim.lease_token
-    first_lease_token = legacy_claim.lease_token
-    assert store.expire_run_lease(
-        legacy_claim.run.run_id,
-        lease_token=first_lease_token,
-    )
-    replacement_claim = store.claim_next_run(
-        owner_id="replacement-manager",
-        lease_duration_seconds=30,
-    )
-    assert replacement_claim is not None
-    assert replacement_claim.run.run_id == "run_legacy_running"
-    assert replacement_claim.run.attempt == 3
-    assert replacement_claim.recovery_reason == RunLeaseRecoveryReason.LEASE_EXPIRED
-    assert replacement_claim.lease_token != first_lease_token
-    recovery_reasons = [
-        event.payload["reason"]
-        for event in store.list_events("run_legacy_running")
-        if event.event_type == "run.recovered"
-    ]
-    assert recovery_reasons == ["legacy_unleased", "lease_expired"]
     assert memory_store.list_memories(
         tenant_id=LEGACY_TENANT_ID,
         subject_id="legacy-unknown",

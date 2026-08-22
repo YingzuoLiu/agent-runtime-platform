@@ -397,6 +397,7 @@ def test_recovered_phase5a_run_uses_version_pinned_legacy_parser(tmp_path):
             agent_id="travel-agent",
             agent_version="1.0.0",
             status=RunStatus.RUNNING,
+            checkpoint_base_revision=0,
             input={
                 "user_message": (
                     "I want a 5-day Tokyo trip under 9000 SGD. "

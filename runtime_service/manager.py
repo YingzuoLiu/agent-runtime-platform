@@ -17,7 +17,7 @@ from .auth import TenantContext
 from .external_actions import ExternalActionReconciliationPendingError
 from .models import RunCommitOutcome, RunCreateRequest, RunLeaseClaim, RunRecord, RunStatus
 from .registry import AgentRegistry, RuntimeRegistration
-from .store import SQLiteRunStore
+from .store import SQLiteRunStore, ThreadCheckpointRevisionConflictError
 
 
 class ReferencedRunNotFoundError(KeyError):
@@ -398,7 +398,6 @@ class RuntimeManager:
             )
             return
         try:
-            runtime = self.registry.resolve(run.agent_id, run.agent_version)
             registration = self.registry.registration(run.agent_id, run.agent_version)
             if (
                 run.domain_id != registration.domain_id
@@ -408,12 +407,43 @@ class RuntimeManager:
                     "Persisted run schema does not match its registered runtime: "
                     f"{run.domain_id}:{run.schema_version}"
                 )
-            persisted_state = self.store.load_thread_state(
-                run.thread_id,
-                tenant_id=run.tenant_id,
-                domain_id=run.domain_id,
-                schema_version=run.schema_version,
-            )
+            try:
+                checkpoint = self.store.load_thread_state_snapshot(
+                    run.thread_id,
+                    tenant_id=run.tenant_id,
+                    domain_id=run.domain_id,
+                    schema_version=run.schema_version,
+                    expected_revision=run.checkpoint_base_revision,
+                    require_revision_match=True,
+                )
+            except ThreadCheckpointRevisionConflictError:
+                if reconcile_before_cancelling:
+                    # CAS can prevent a stale checkpoint write, but it cannot
+                    # undo effects produced by executing an arbitrary Runtime
+                    # against known-stale state. Quarantine this unsupported
+                    # mixed-writer/corruption state without releasing the
+                    # thread or hiding the unresolved external action.
+                    self.store.quarantine_checkpoint_conflict_for_reconciliation(
+                        run,
+                        lease_token=claim.lease_token,
+                        phase="load",
+                    )
+                    return
+                outcome = self.store.commit_checkpoint_conflict(
+                    run,
+                    lease_token=claim.lease_token,
+                    phase="load",
+                )
+                if outcome == RunCommitOutcome.CANCEL_REQUESTED:
+                    latest = self._require_run(run.run_id)
+                    self._mark_cancelled(
+                        latest,
+                        reason="cancelled_before_execution_boundary",
+                        lease_token=claim.lease_token,
+                    )
+                return
+            runtime = self.registry.resolve(run.agent_id, run.agent_version)
+            persisted_state = checkpoint.state
             state_source = (
                 "request"
                 if run.state is not None
@@ -436,7 +466,10 @@ class RuntimeManager:
                 run.run_id,
                 lease_token=claim.lease_token,
                 event_type="checkpoint.loaded",
-                payload={"source": state_source},
+                payload={
+                    "source": state_source,
+                    "revision": checkpoint.revision,
+                },
             )
             assert run.input is not None
             runtime_input = registration.parse_input(run.input)
@@ -599,6 +632,15 @@ class RuntimeManager:
         """Keep durable work recoverable when a deployment omits its extension."""
 
         for run in recoverable_runs:
+            if (
+                run.status == RunStatus.RUNNING
+                and run.checkpoint_base_revision is None
+            ):
+                raise RuntimeError(
+                    "RuntimeManager cannot start: running Run "
+                    f"{run.run_id} has no checkpoint base revision; drain legacy "
+                    "nonterminal Runs before enabling thread serialization"
+                )
             try:
                 registration = self.registry.registration(
                     run.agent_id,

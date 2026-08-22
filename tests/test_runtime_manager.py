@@ -2,6 +2,8 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
 from agent.contracts import (
     RuntimeExecutionContext,
     RuntimeExecutionError,
@@ -197,6 +199,31 @@ def blocking_registry(started: threading.Event, release: threading.Event) -> Age
         "0.3.0",
         lambda: BlockingRuntime(started, release),
         description="Blocking test runtime",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    return registry
+
+
+def counting_blocking_registry(
+    first_started: threading.Event,
+    second_started: threading.Event,
+    release: threading.Event,
+    call_count: list[int],
+    count_lock: threading.Lock,
+) -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(
+        "travel-agent",
+        "0.3.0",
+        lambda: CountingBlockingRuntime(
+            first_started,
+            second_started,
+            release,
+            call_count,
+            count_lock,
+        ),
+        description="Counting blocking test runtime",
         input_model=TravelMessageInput,
         state_model=AgentState,
     )
@@ -495,6 +522,7 @@ def test_cancel_cas_after_recovery_scan_is_not_overwritten(
         status=RunStatus.RUNNING,
         input_message="I want a 5-day Tokyo trip under 9000 SGD.",
         attempt=1,
+        checkpoint_base_revision=0,
     )
     store._seed_historical_run_for_migration(
         run,
@@ -609,6 +637,7 @@ def test_recovered_inflight_action_is_reconciled_before_persisted_cancel(tmp_pat
             ).model_dump(mode="json"),
             cancel_requested=True,
             attempt=1,
+            checkpoint_base_revision=0,
         )
     )
     started = threading.Event()
@@ -719,8 +748,167 @@ def test_reconciliation_pending_run_remains_recoverable_across_restart(tmp_path)
         "reason": "external_action_reconciliation_pending"
     }
     assert "run.failed" not in event_types
+
     assert "run.cancelled" not in event_types
     assert "run.completed" not in event_types
+
+
+def test_reconciliation_pending_checkpoint_drift_is_quarantined(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    predecessor = RunRecord(
+        run_id="run_pending_checkpoint_drift",
+        thread_id="pending-checkpoint-drift",
+        agent_id="travel-agent",
+        agent_version="1.2.0",
+        domain_id="travel",
+        schema_version="1",
+        status=RunStatus.RUNNING,
+        input=TravelMessageInput(
+            user_message="Reconcile the interrupted action."
+        ).model_dump(mode="json"),
+        error_code=ExternalActionReconciliationPendingError.CODE,
+        error="pending reconciliation",
+        attempt=1,
+        checkpoint_base_revision=0,
+    )
+    store._seed_historical_run_for_migration(predecessor)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO thread_states (
+                tenant_id, thread_id, domain_id, schema_version,
+                state_json, updated_at, revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                TENANT_CONTEXT.tenant_id,
+                predecessor.thread_id,
+                "corrupt-domain",
+                "corrupt-schema",
+                "not-json",
+                "2026-08-22T00:00:00+00:00",
+                1,
+            ),
+        )
+    successor = RunRecord(
+        run_id="run_after_pending_checkpoint_drift",
+        thread_id=predecessor.thread_id,
+        agent_id="travel-agent",
+        agent_version="1.2.0",
+        domain_id="travel",
+        schema_version="1",
+        status=RunStatus.QUEUED,
+        input=TravelMessageInput(
+            user_message="Continue after reconciliation."
+        ).model_dump(mode="json"),
+    )
+    store.create_run(successor)
+    claim = store.claim_next_run(
+        owner_id="reconciliation-owner",
+        lease_duration_seconds=30,
+        reconciliation_pending_code=(
+            ExternalActionReconciliationPendingError.CODE
+        ),
+    )
+    assert claim is not None
+    assert claim.run.run_id == predecessor.run_id
+
+    constructed = threading.Event()
+    attempted = threading.Event()
+    registry = AgentRegistry()
+
+    def forbidden_runtime_factory():
+        constructed.set()
+        return ReconciliationPendingRuntime(attempted)
+
+    registry.register(
+        "travel-agent",
+        "1.2.0",
+        forbidden_runtime_factory,
+        description="Quarantine must precede Runtime construction",
+        input_model=TravelMessageInput,
+        state_model=AgentState,
+    )
+    manager = RuntimeManager(store, registry)
+    manager._execute_owned_run(claim, lease_lost=threading.Event())
+
+    assert not constructed.is_set()
+    assert not attempted.is_set()
+    persisted = store.get_run_internal(predecessor.run_id)
+    assert persisted is not None
+    assert persisted.status == RunStatus.RUNNING
+    assert (
+        persisted.error_code
+        == "thread_checkpoint_conflict_reconciliation_pending"
+    )
+    assert persisted.lease_token is None
+    successor_persisted = store.get_run_internal(successor.run_id)
+    assert successor_persisted is not None
+    assert successor_persisted.status == RunStatus.QUEUED
+    assert (
+        store.claim_next_run(
+            owner_id="must-not-bypass-reconciliation",
+            lease_duration_seconds=30,
+            reconciliation_pending_code=(
+                ExternalActionReconciliationPendingError.CODE
+            ),
+        )
+        is None
+    )
+    event_types = [
+        event.event_type for event in store.list_events(predecessor.run_id)
+    ]
+    assert event_types == ["run.recovered", "run.started", "checkpoint.conflict"]
+    assert store.list_events(predecessor.run_id)[-1].payload == {
+        "phase": "load",
+        "expected_revision": 0,
+        "observed_revision": 1,
+        "disposition": "external_action_reconciliation_quarantined",
+    }
+    assert "run.failed" not in event_types
+
+    reopened = SQLiteRunStore(database_path)
+    cancelled = reopened.request_cancel_atomically(
+        predecessor.run_id,
+        tenant_id=predecessor.tenant_id,
+    )
+    assert cancelled.cancel_requested
+    assert (
+        reopened.claim_next_run(
+            owner_id="must-not-reclaim-quarantine-after-restart",
+            lease_duration_seconds=30,
+            reconciliation_pending_code=(
+                ExternalActionReconciliationPendingError.CODE
+            ),
+        )
+        is None
+    )
+    reopened_successor = reopened.get_run_internal(successor.run_id)
+    assert reopened_successor is not None
+    assert reopened_successor.status == RunStatus.QUEUED
+    independent = RunRecord(
+        run_id="run_outside_quarantined_thread",
+        thread_id="independent-after-quarantine",
+        agent_id="travel-agent",
+        agent_version="0.3.0",
+        domain_id="travel",
+        schema_version="1",
+        status=RunStatus.QUEUED,
+        input=TravelMessageInput(user_message="Plan Tokyo.").model_dump(
+            mode="json"
+        ),
+    )
+    reopened.create_run(independent)
+    independent_claim = reopened.claim_next_run(
+        owner_id="independent-manager",
+        lease_duration_seconds=30,
+        reconciliation_pending_code=(
+            ExternalActionReconciliationPendingError.CODE
+        ),
+    )
+    assert independent_claim is not None
+    assert independent_claim.run.run_id == independent.run_id
 
 
 def test_reconciliation_pending_cancel_resolution_clears_marker(tmp_path):
@@ -742,6 +930,7 @@ def test_reconciliation_pending_cancel_resolution_clears_marker(tmp_path):
             error="pending reconciliation",
             cancel_requested=True,
             attempt=1,
+            checkpoint_base_revision=0,
         )
     )
     manager = RuntimeManager(
@@ -786,6 +975,7 @@ def test_unmarked_crash_recovery_setup_failure_persists_pending_marker(
             ).model_dump(mode="json"),
             cancel_requested=True,
             attempt=1,
+            checkpoint_base_revision=0,
         )
     )
     attempted = threading.Event()
@@ -854,7 +1044,16 @@ def test_reconciliation_marker_update_preserves_cancel_cas(tmp_path):
 def test_running_run_is_recovered_after_restart(tmp_path):
     database_path = tmp_path / "runtime.db"
     store = SQLiteRunStore(database_path)
-    run = RunRecord(run_id="run_recovery_test", thread_id="recovery-thread", agent_id="travel-agent", agent_version="0.3.0", status=RunStatus.RUNNING, input_message="I want a 5-day Tokyo trip under 9000 SGD.", attempt=1)
+    run = RunRecord(
+        run_id="run_recovery_test",
+        thread_id="recovery-thread",
+        agent_id="travel-agent",
+        agent_version="0.3.0",
+        status=RunStatus.RUNNING,
+        input_message="I want a 5-day Tokyo trip under 9000 SGD.",
+        attempt=1,
+        checkpoint_base_revision=0,
+    )
     store._seed_historical_run_for_migration(
         run,
         event_type="run.started",
@@ -877,6 +1076,96 @@ def test_running_run_is_recovered_after_restart(tmp_path):
         assert manager.store.load_thread_state("recovery-thread", tenant_id="legacy") is not None
     finally:
         manager.stop()
+
+
+def test_manager_rejects_pre_thread_serialization_running_run(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    store = SQLiteRunStore(database_path)
+    run = RunRecord(
+        run_id="run_without_checkpoint_base",
+        thread_id="legacy-running-thread",
+        agent_id="travel-agent",
+        agent_version="0.3.0",
+        status=RunStatus.RUNNING,
+        input_message="Plan Tokyo.",
+        attempt=1,
+    )
+    store._seed_historical_run_for_migration(run)
+    manager = RuntimeManager(store, build_default_registry())
+
+    with pytest.raises(
+        RuntimeError,
+        match="has no checkpoint base revision",
+    ):
+        manager.start()
+
+    assert (
+        store.claim_next_run(
+            owner_id="must-not-guess-checkpoint-base",
+            lease_duration_seconds=30,
+        )
+        is None
+    )
+
+
+def test_checkpoint_conflict_before_execute_never_calls_runtime(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    started = threading.Event()
+    release = threading.Event()
+    release.set()
+    store = SQLiteRunStore(database_path)
+    manager = RuntimeManager(store, blocking_registry(started, release))
+    submitted = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="pre-execute-conflict",
+            user_message="Plan Tokyo.",
+        ),
+    )
+    claim = store.claim_next_run(
+        owner_id="conflict-owner",
+        lease_duration_seconds=30,
+    )
+    assert claim is not None
+    assert claim.run.checkpoint_base_revision == 0
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO thread_states (
+                tenant_id, thread_id, domain_id, schema_version,
+                state_json, updated_at, revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                TENANT_CONTEXT.tenant_id,
+                "pre-execute-conflict",
+                "corrupt-domain",
+                "corrupt-schema",
+                "not-json",
+                "2026-08-22T00:00:00+00:00",
+                1,
+            ),
+        )
+
+    manager._execute_owned_run(claim, lease_lost=threading.Event())
+
+    assert not started.is_set()
+    failed = store.get_run_internal(submitted.run_id)
+    assert failed is not None
+    assert failed.status == RunStatus.FAILED
+    assert failed.error_code == "thread_checkpoint_conflict"
+    events = store.list_events(submitted.run_id)
+    assert [event.event_type for event in events] == [
+        "run.queued",
+        "run.started",
+        "checkpoint.conflict",
+        "run.failed",
+    ]
+    assert events[-2].payload == {
+        "phase": "load",
+        "expected_revision": 0,
+        "observed_revision": 1,
+    }
 
 
 def test_release_validation_running_step_is_resumed_after_manager_restart(tmp_path):
@@ -1380,6 +1669,197 @@ def test_two_workers_complete_independent_runs(tmp_path):
         assert len({result.run_id for result in results}) == 8
     finally:
         manager.stop()
+
+
+def test_two_workers_serialize_runtime_execution_for_one_thread(tmp_path):
+    first_started = threading.Event()
+    second_started = threading.Event()
+    blocked_poll_observed = threading.Event()
+    release = threading.Event()
+    call_count = [0]
+    count_lock = threading.Lock()
+    store = SQLiteRunStore(tmp_path / "runtime.db")
+    original_claim = store.claim_next_run
+
+    def observe_blocked_poll(**kwargs):
+        claim = original_claim(**kwargs)
+        if claim is None and first_started.is_set() and not second_started.is_set():
+            blocked_poll_observed.set()
+        return claim
+
+    store.claim_next_run = observe_blocked_poll  # type: ignore[method-assign]
+    manager = RuntimeManager(
+        store,
+        counting_blocking_registry(
+            first_started,
+            second_started,
+            release,
+            call_count,
+            count_lock,
+        ),
+        worker_count=2,
+    )
+    first = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="serialized-thread",
+            user_message="I want a five-day Tokyo trip under 7000 SGD.",
+        ),
+    )
+    second = submit_run(
+        manager,
+        RunCreateRequest(
+            thread_id="serialized-thread",
+            user_message="Change the budget to 9000 SGD.",
+        ),
+    )
+
+    manager.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert blocked_poll_observed.wait(timeout=5)
+        assert not second_started.is_set()
+        queued = store.get_run_internal(second.run_id)
+        assert queued is not None
+        assert queued.status == RunStatus.QUEUED
+        assert queued.attempt == 0
+
+        release.set()
+        first_result = wait_for_terminal(manager, first.run_id)
+        second_result = wait_for_terminal(manager, second.run_id)
+    finally:
+        release.set()
+        manager.stop()
+
+    assert second_started.is_set()
+    assert call_count == [2]
+    assert first_result.status == RunStatus.COMPLETED
+    assert second_result.status == RunStatus.COMPLETED
+    assert isinstance(second_result.state, AgentState)
+    assert second_result.state.destination == "Tokyo"
+    assert second_result.state.budget == 9000
+    second_loaded = next(
+        event
+        for event in store.list_events(second.run_id)
+        if event.event_type == "checkpoint.loaded"
+    )
+    assert second_loaded.payload == {"source": "thread_store", "revision": 1}
+
+
+def test_two_workers_still_execute_different_threads_in_parallel(tmp_path):
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    call_count = [0]
+    count_lock = threading.Lock()
+    manager = RuntimeManager(
+        SQLiteRunStore(tmp_path / "runtime.db"),
+        counting_blocking_registry(
+            first_started,
+            second_started,
+            release,
+            call_count,
+            count_lock,
+        ),
+        worker_count=2,
+    )
+    first = submit_run(
+        manager,
+        RunCreateRequest(thread_id="parallel-a", user_message="Plan Tokyo."),
+    )
+    second = submit_run(
+        manager,
+        RunCreateRequest(thread_id="parallel-b", user_message="Plan Seoul."),
+    )
+
+    manager.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert second_started.wait(timeout=5)
+        assert call_count == [2]
+        release.set()
+        results = [
+            wait_for_terminal(manager, first.run_id),
+            wait_for_terminal(manager, second.run_id),
+        ]
+    finally:
+        release.set()
+        manager.stop()
+
+    assert all(result.status == RunStatus.COMPLETED for result in results)
+
+
+def test_two_managers_share_one_durable_thread_execution_slot(tmp_path):
+    database_path = tmp_path / "runtime.db"
+    first_started = threading.Event()
+    second_started = threading.Event()
+    blocked_poll_observed = threading.Event()
+    release = threading.Event()
+    call_count = [0]
+    count_lock = threading.Lock()
+    registry = counting_blocking_registry(
+        first_started,
+        second_started,
+        release,
+        call_count,
+        count_lock,
+    )
+    store_a = SQLiteRunStore(database_path)
+    store_b = SQLiteRunStore(database_path)
+
+    for store in (store_a, store_b):
+        original_claim = store.claim_next_run
+
+        def observe_blocked_poll(_claim=original_claim, **kwargs):
+            claim = _claim(**kwargs)
+            if claim is None and first_started.is_set() and not second_started.is_set():
+                blocked_poll_observed.set()
+            return claim
+
+        store.claim_next_run = observe_blocked_poll  # type: ignore[method-assign]
+
+    manager_a = RuntimeManager(store_a, registry, owner_id="manager-a")
+    manager_b = RuntimeManager(store_b, registry, owner_id="manager-b")
+    first = submit_run(
+        manager_a,
+        RunCreateRequest(
+            thread_id="two-manager-thread",
+            user_message="Plan a five-day Tokyo trip under 7000 SGD.",
+        ),
+    )
+    second = submit_run(
+        manager_a,
+        RunCreateRequest(
+            thread_id="two-manager-thread",
+            user_message="Change the budget to 9000 SGD.",
+        ),
+    )
+
+    manager_a.start()
+    manager_b.start()
+    try:
+        assert first_started.wait(timeout=5)
+        assert blocked_poll_observed.wait(timeout=5)
+        assert not second_started.is_set()
+        release.set()
+        results = [
+            wait_for_terminal(manager_a, first.run_id),
+            wait_for_terminal(manager_a, second.run_id),
+        ]
+    finally:
+        release.set()
+        manager_a.stop()
+        manager_b.stop()
+
+    assert second_started.is_set()
+    assert call_count == [2]
+    assert all(result.status == RunStatus.COMPLETED for result in results)
+    second_loaded = next(
+        event
+        for event in store_a.list_events(second.run_id)
+        if event.event_type == "checkpoint.loaded"
+    )
+    assert second_loaded.payload["revision"] == 1
 
 
 def test_submit_before_start_is_enqueued_once_with_two_workers(tmp_path):
