@@ -165,6 +165,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Policy | Fixed step-limit, allowlist, permission, and argument-schema checks before execution | [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) |
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
+| Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Action gateway | `webhook.send` façade over a private single-step domain and the existing Run lifecycle | [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md), [`examples/external_agent.py`](examples/external_agent.py) |
@@ -531,7 +532,9 @@ contract, PowerShell walkthrough, API payload, versioning rules, and Guardian re
 - exact Agent-version pinning;
 - atomic cancellation/completion guard;
 - store-authoritative Run claims with renewable leases and attempt-specific fencing tokens;
-- automatic takeover of expired or legacy-unleased running work without stealing a live attempt;
+- automatic takeover of expired running work without stealing a live attempt;
+- tenant-qualified thread serialization with recovery-before-successor ordering;
+- revision-qualified checkpoint loads and atomic checkpoint compare-and-swap completion;
 - fenced Run, checkpoint, workflow, memory, and new external-dispatch mutations;
 - startup preflight that preserves recoverable work when a pinned Agent version or state schema is
   not registered;
@@ -598,13 +601,21 @@ and it does not create a private mount namespace, so it is not a general untrust
 | `POST /actions` | Submit one allowlisted durable side effect with optional bounded wait | no | yes |
 | `POST /runs/{id}/cancel` | Request cooperative cancellation | no | yes |
 | `POST /tools/{tool}/execute` | Execute a registered read-only tool directly; external writes return `409` | no | yes |
-| `POST /agent/message` | Call the synchronous Travel compatibility path | no | yes |
+| `POST /agent/message` | Call the bounded-wait Travel adapter through the managed Run lifecycle | no | yes |
 | `DELETE /memories/{id}` | Forget one logical memory key for future runs | no | yes |
 
 `create_trip_hold` is intentionally absent from `GET /tools`; it belongs only
 to the private `travel-agent:1.2.0` durable registry. The direct POST route still
 recognizes that name so an authorized attempt receives `409` instead of falling
 through to sandbox execution.
+
+`POST /agent/message` preserves the legacy `200` completed-response shape. After durable submission,
+it waits for at most `wait=0..5` seconds (five by default). If the managed Run is still queued or
+running, it returns `202` with the durable `run_id`, `Location`, and `Retry-After`; the Run continues
+after timeout or client disconnect. Its optional `state` now initializes only a tenant-qualified
+thread with no checkpoint and no queued/running Run. Existing-thread callers must omit `state` so
+the Run loads the durable checkpoint; callers that previously echoed `updated_state` into every
+request will receive `409` and must update.
 
 Outside explicit demo mode, `RUNTIME_API_KEYS_JSON` is the local credential provider. Every credential must declare
 `viewer` or `operator`; missing or unknown roles fail configuration loading without retaining the
@@ -749,6 +760,8 @@ input signatures still match; the source run is never mutated.
   destination configuration, HTTP envelope, bounded wait, and public evidence contract;
 - [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md): Run ownership, heartbeat,
   exact-expiry takeover, fencing tokens, and deployment migration boundary;
+- [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md):
+  tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
   retrieval, forgetting, RBAC, and audit evidence;
 - [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
@@ -808,6 +821,10 @@ races, threadpool-pressure behavior, and the ten-line external-Agent example.
 The local recovery proof additionally covers provider-side commit-before-response injection,
 independent Runtime restart, live-lease non-stealing, exact-expiry takeover, one-effect receipt
 replay, unsafe no-retry, and sanitized cross-ledger evidence.
+The durable execution plane additionally covers two-Manager Run leasing and stale-attempt fencing,
+one active Run per tenant-qualified thread, recovery-before-successor ordering, cross-thread
+parallel execution, monotonic checkpoint revisions, conflict terminalization, and managed
+compatibility-path execution.
 
 GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12. After
 both matrix legs pass, one Python 3.12 job runs the Docker Action-recovery proof and uploads only its
@@ -829,6 +846,12 @@ The first lease-aware deployment requires a stop-the-old-runtime boundary: stop 
 pre-leasing process, run the additive migration, and then start only lease-aware binaries. Mixed
 old/new execution and mixed-version rollback are unsupported because the old Manager ignores lease
 columns. See [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md#persisted-model).
+
+The thread-serialization migration adds a stricter drain boundary. Before the first deployment,
+the old binary must finish or cancel every queued/running Run. A running legacy Run has no durable
+record of the checkpoint revision it originally read, so the new Runtime refuses to guess and
+fails startup closed. Mixed old/new binaries and direct rollback remain unsupported: old
+state-only writes do not increment the revision and cannot be detected by the new CAS.
 
 Before increasing replicas, the architecture would need:
 
@@ -855,8 +878,6 @@ platform.
   distributed worker queue;
 - Run leases and fencing are a single-host SQLite reference, not a distributed multi-host lease;
 - no quota, token accounting, key rotation, or external secret manager;
-- no per-thread lease or checkpoint revision CAS; callers must serialize Runs for one
-  tenant-qualified thread;
 - only two static roles, with no custom or per-Agent/per-tool grants;
 - process isolation rather than a container, gVisor, or microVM sandbox;
 - no arbitrary user-code or untrusted third-party MCP execution;
@@ -879,13 +900,13 @@ platform.
 - no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
   reconciliation for unknown external-action outcomes.
 
-Phase 7D is the current Agent-integration milestone. It exposes the existing durable external-action
-state machine through a deliberately narrow Action façade while leaving Planner, memory, session,
-and framework orchestration with the caller. It does not add MCP, OpenClaw, Letta, or other
-framework-specific adapters, arbitrary webhooks, human approval, or active provider queries for a
-terminal unknown outcome. Those boundaries, semantic memory retrieval, bounded parallel read-only
-calls, a live read-only Travel adapter, multi-model fallback, and durable multi-Agent delegation
-remain possible follow-up slices rather than prerequisites for the runtime demonstrated here.
+Phase 7D remains the Agent-integration milestone. The subsequent durable execution-plane work
+hardens ownership and thread consistency without expanding the public Action surface. The project
+still does not add MCP, OpenClaw, Letta, or other framework-specific adapters, arbitrary webhooks,
+human approval, or active provider queries for a terminal unknown outcome. Those boundaries,
+semantic memory retrieval, bounded parallel read-only calls, a live read-only Travel adapter,
+multi-model fallback, and durable multi-Agent delegation remain possible follow-up slices rather
+than prerequisites for the runtime demonstrated here.
 
 ## License
 

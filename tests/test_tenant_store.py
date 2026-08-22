@@ -1,7 +1,13 @@
 import pytest
 
 from domains.travel.state import AgentState
-from runtime_service import RunLeaseLostError, RunRecord, RunStatus, SQLiteRunStore
+from runtime_service import (
+    RunCommitOutcome,
+    RunLeaseLostError,
+    RunRecord,
+    RunStatus,
+    SQLiteRunStore,
+)
 
 
 def queued_run(run_id: str, tenant_id: str, *, client_request_id: str) -> RunRecord:
@@ -142,14 +148,30 @@ def test_public_create_with_event_only_accepts_run_queued(tmp_path):
 
 def test_thread_checkpoints_are_independent_per_tenant(tmp_path):
     store = SQLiteRunStore(tmp_path / "runtime.db")
-    store.save_unmanaged_thread_state(
-        AgentState(thread_id="shared-thread", destination="Tokyo", budget=7000),
-        tenant_id="tenant-a",
-    )
-    store.save_unmanaged_thread_state(
-        AgentState(thread_id="shared-thread", destination="Seoul", budget=9000),
-        tenant_id="tenant-b",
-    )
+    for run_id, tenant_id, destination, budget in (
+        ("run-a", "tenant-a", "Tokyo", 7000),
+        ("run-b", "tenant-b", "Seoul", 9000),
+    ):
+        run = queued_run(run_id, tenant_id, client_request_id=f"request-{run_id}")
+        store.create_run(run)
+        claim = store.claim_next_run(
+            owner_id=f"owner-{run_id}",
+            lease_duration_seconds=30,
+        )
+        assert claim is not None
+        assert claim.run.run_id == run_id
+        claim.run.state = AgentState(
+            thread_id="shared-thread",
+            destination=destination,
+            budget=budget,
+        )
+        assert (
+            store.commit_completed_run(
+                claim.run,
+                lease_token=claim.lease_token,
+            )
+            == RunCommitOutcome.COMMITTED
+        )
 
     tenant_a = store.load_thread_state("shared-thread", tenant_id="tenant-a")
     tenant_b = store.load_thread_state("shared-thread", tenant_id="tenant-b")

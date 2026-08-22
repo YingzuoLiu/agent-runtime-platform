@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -21,6 +22,41 @@ from .models import (
 
 class RunLeaseLostError(RuntimeError):
     """Raised when an attempt-owned mutation no longer holds its Run lease."""
+
+
+class ThreadStateConflictError(ValueError):
+    """Raised when client state would replace an existing thread history."""
+
+
+class ThreadCheckpointRevisionConflictError(RuntimeError):
+    """Raised before checkpoint decoding when a claimed base is no longer current."""
+
+    def __init__(
+        self,
+        *,
+        expected_revision: int | None,
+        observed_revision: int,
+    ) -> None:
+        self.expected_revision = expected_revision
+        self.observed_revision = observed_revision
+        super().__init__(
+            "Thread checkpoint revision mismatch: "
+            f"expected {expected_revision}, observed {observed_revision}"
+        )
+
+
+THREAD_CHECKPOINT_CONFLICT_CODE = "thread_checkpoint_conflict"
+THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE = (
+    "thread_checkpoint_conflict_reconciliation_pending"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadStateSnapshot:
+    """One non-authoritative read of a thread checkpoint and its revision."""
+
+    state: BaseRuntimeState | None
+    revision: int
 
 
 class StateRegistry(Protocol):
@@ -126,7 +162,8 @@ class SQLiteRunStore:
                     lease_owner_id TEXT,
                     lease_token TEXT,
                     lease_heartbeat_at INTEGER,
-                    lease_expires_at INTEGER
+                    lease_expires_at INTEGER,
+                    checkpoint_base_revision INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS run_events (
@@ -147,6 +184,7 @@ class SQLiteRunStore:
                     schema_version TEXT NOT NULL DEFAULT '1',
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY(tenant_id, thread_id)
                 );
                 """
@@ -155,6 +193,16 @@ class SQLiteRunStore:
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(runs)").fetchall()
             }
+            if "checkpoint_base_revision" not in columns:
+                nonterminal = connection.execute(
+                    "SELECT run_id FROM runs WHERE status IN (?, ?) LIMIT 1",
+                    (RunStatus.QUEUED.value, RunStatus.RUNNING.value),
+                ).fetchone()
+                if nonterminal is not None:
+                    raise RuntimeError(
+                        "Thread-serialization migration requires all legacy "
+                        "queued and running Runs to be drained before upgrade"
+                    )
             if "client_request_id" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN client_request_id TEXT")
                 connection.execute(
@@ -179,6 +227,9 @@ class SQLiteRunStore:
                     "ALTER TABLE runs ADD COLUMN lease_heartbeat_at INTEGER"
                 ),
                 "lease_expires_at": "ALTER TABLE runs ADD COLUMN lease_expires_at INTEGER",
+                "checkpoint_base_revision": (
+                    "ALTER TABLE runs ADD COLUMN checkpoint_base_revision INTEGER"
+                ),
             }
             for column, statement in run_migrations.items():
                 if column not in columns:
@@ -188,6 +239,16 @@ class SQLiteRunStore:
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(thread_states)").fetchall()
             }
+            if "revision" not in thread_columns:
+                nonterminal = connection.execute(
+                    "SELECT run_id FROM runs WHERE status IN (?, ?) LIMIT 1",
+                    (RunStatus.QUEUED.value, RunStatus.RUNNING.value),
+                ).fetchone()
+                if nonterminal is not None:
+                    raise RuntimeError(
+                        "Thread-serialization migration requires all legacy "
+                        "queued and running Runs to be drained before upgrade"
+                    )
             if "domain_id" not in thread_columns:
                 connection.execute(
                     "ALTER TABLE thread_states ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'travel'"
@@ -201,11 +262,35 @@ class SQLiteRunStore:
                     "ALTER TABLE thread_states ADD COLUMN tenant_id "
                     f"TEXT NOT NULL DEFAULT '{LEGACY_TENANT_ID}'"
                 )
+            if "revision" not in thread_columns:
+                # A persisted legacy row is already one committed checkpoint.
+                # Revision zero is reserved for the absence of a row.
+                connection.execute(
+                    "ALTER TABLE thread_states ADD COLUMN revision "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
 
             if self._has_global_client_request_uniqueness(connection):
                 self._rebuild_runs_table(connection)
             if not self._thread_states_has_tenant_primary_key(connection):
                 self._rebuild_thread_states_table(connection)
+
+            duplicate_running_thread = connection.execute(
+                """
+                SELECT tenant_id, thread_id FROM runs
+                WHERE status = ?
+                GROUP BY tenant_id, thread_id
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """,
+                (RunStatus.RUNNING.value,),
+            ).fetchone()
+            if duplicate_running_thread is not None:
+                raise RuntimeError(
+                    "Multiple running Runs already occupy tenant-qualified thread "
+                    f"{duplicate_running_thread['tenant_id']!r}:"
+                    f"{duplicate_running_thread['thread_id']!r}"
+                )
 
             connection.executescript(
                 """
@@ -214,11 +299,14 @@ class SQLiteRunStore:
                 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
                 CREATE INDEX IF NOT EXISTS idx_runs_claimable
                     ON runs(status, lease_expires_at, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_running_per_thread
+                    ON runs(tenant_id, thread_id) WHERE status = 'running';
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_tenant_client_request_id
                     ON runs(tenant_id, client_request_id)
                     WHERE client_request_id IS NOT NULL;
                 """
             )
+            self._assert_running_thread_index(connection)
             connection.commit()
             connection.execute("PRAGMA foreign_keys=ON")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -252,6 +340,45 @@ class SQLiteRunStore:
         return primary_key == {"tenant_id": 1, "thread_id": 2}
 
     @staticmethod
+    def _assert_running_thread_index(connection: sqlite3.Connection) -> None:
+        """Fail closed if a same-named index does not enforce thread ownership."""
+
+        indexes = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA index_list(runs)").fetchall()
+        }
+        name = "idx_runs_one_running_per_thread"
+        index = indexes.get(name)
+        columns = [
+            row["name"]
+            for row in connection.execute(
+                f'PRAGMA index_info("{name}")'
+            ).fetchall()
+        ]
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        normalized_sql = (
+            "" if definition is None or definition["sql"] is None
+            else "".join(str(definition["sql"]).lower().split())
+        )
+        expected_suffix = (
+            "onruns(tenant_id,thread_id)wherestatus='running'"
+        )
+        if (
+            index is None
+            or not bool(index["unique"])
+            or not bool(index["partial"])
+            or columns != ["tenant_id", "thread_id"]
+            or not normalized_sql.endswith(expected_suffix)
+        ):
+            raise RuntimeError(
+                "Thread serialization requires the unique partial index "
+                f"{name!r} on (tenant_id, thread_id) for running Runs"
+            )
+
+    @staticmethod
     def _rebuild_runs_table(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
@@ -283,7 +410,8 @@ class SQLiteRunStore:
                 lease_owner_id TEXT,
                 lease_token TEXT,
                 lease_heartbeat_at INTEGER,
-                lease_expires_at INTEGER
+                lease_expires_at INTEGER,
+                checkpoint_base_revision INTEGER
             );
 
             INSERT INTO runs_tenant_migration (
@@ -292,7 +420,8 @@ class SQLiteRunStore:
                 state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
                 updated_at, started_at, completed_at, lease_owner_id,
-                lease_token, lease_heartbeat_at, lease_expires_at
+                lease_token, lease_heartbeat_at, lease_expires_at,
+                checkpoint_base_revision
             )
             SELECT
                 run_id, tenant_id, execution_authority_json, thread_id, agent_id, agent_version,
@@ -300,7 +429,8 @@ class SQLiteRunStore:
                 state_json, output_message, validation_errors_json, error_code, error,
                 attempt, cancel_requested, client_request_id, created_at,
                 updated_at, started_at, completed_at, lease_owner_id,
-                lease_token, lease_heartbeat_at, lease_expires_at
+                lease_token, lease_heartbeat_at, lease_expires_at,
+                checkpoint_base_revision
             FROM runs;
 
             DROP TABLE runs;
@@ -321,13 +451,16 @@ class SQLiteRunStore:
                 schema_version TEXT NOT NULL DEFAULT '1',
                 state_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY(tenant_id, thread_id)
             );
 
             INSERT INTO thread_states_tenant_migration (
-                tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+                tenant_id, thread_id, domain_id, schema_version, state_json,
+                updated_at, revision
             )
-            SELECT tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
+            SELECT tenant_id, thread_id, domain_id, schema_version, state_json,
+                updated_at, revision
             FROM thread_states;
 
             DROP TABLE thread_states;
@@ -343,7 +476,9 @@ class SQLiteRunStore:
     def create_run(self, run: RunRecord) -> RunRecord:
         self._assert_new_queued_run(run)
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._insert_run_with_connection(connection, run)
+            self._prepare_client_state_seed(connection, run)
         return run
 
     def create_run_with_event(
@@ -359,7 +494,9 @@ class SQLiteRunStore:
         if event_type != "run.queued":
             raise ValueError("A new Run's initial event must be run.queued")
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._insert_run_with_connection(connection, run)
+            self._prepare_client_state_seed(connection, run)
             self._append_event_with_connection(
                 connection,
                 run.run_id,
@@ -386,6 +523,7 @@ class SQLiteRunStore:
             or bool(run.validation_errors)
             or run.error_code is not None
             or run.error is not None
+            or run.checkpoint_base_revision is not None
             or any(value is not None for value in lease_fields)
         ):
             raise ValueError(
@@ -426,11 +564,53 @@ class SQLiteRunStore:
                 state_json, output_message,
                 validation_errors_json, error_code, error, attempt, cancel_requested,
                 client_request_id, created_at, updated_at, started_at, completed_at,
-                lease_owner_id, lease_token, lease_heartbeat_at, lease_expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                lease_owner_id, lease_token, lease_heartbeat_at, lease_expires_at,
+                checkpoint_base_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._run_values(run),
         )
+
+    @staticmethod
+    def _prepare_client_state_seed(
+        connection: sqlite3.Connection,
+        run: RunRecord,
+    ) -> None:
+        """Allow client state only as the first history entry for a thread."""
+
+        if run.state is None:
+            return
+        checkpoint = connection.execute(
+            "SELECT 1 FROM thread_states WHERE tenant_id = ? AND thread_id = ?",
+            (run.tenant_id, run.thread_id),
+        ).fetchone()
+        nonterminal = connection.execute(
+            """
+            SELECT 1 FROM runs
+            WHERE tenant_id = ? AND thread_id = ? AND run_id != ?
+                AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                run.tenant_id,
+                run.thread_id,
+                run.run_id,
+                RunStatus.QUEUED.value,
+                RunStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        if checkpoint is not None or nonterminal is not None:
+            raise ThreadStateConflictError(
+                "Client-provided state can only initialize an empty thread; "
+                f"omit state to continue thread {run.thread_id!r}"
+            )
+        cursor = connection.execute(
+            "UPDATE runs SET checkpoint_base_revision = 0 WHERE run_id = ?",
+            (run.run_id,),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Client-state seed Run disappeared during creation")
+        run.checkpoint_base_revision = 0
 
     def get_run_internal(self, run_id: str) -> RunRecord | None:
         with self._connect() as connection:
@@ -439,8 +619,14 @@ class SQLiteRunStore:
             ).fetchone()
         return self._row_to_run(row) if row else None
 
-    def get_run_for_tenant(self, run_id: str, tenant_id: str) -> RunRecord | None:
-        with self._connect() as connection:
+    def get_run_for_tenant(
+        self,
+        run_id: str,
+        tenant_id: str,
+        *,
+        timeout_seconds: float = 30,
+    ) -> RunRecord | None:
+        with self._connect(timeout_seconds=timeout_seconds) as connection:
             row = connection.execute(
                 "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
                 (run_id, tenant_id),
@@ -529,21 +715,50 @@ class SQLiteRunStore:
             expires_at = now_ms + lease_duration_seconds * 1000
             candidate = connection.execute(
                 """
-                SELECT * FROM runs
+                SELECT candidate.* FROM runs AS candidate
                 WHERE
-                    (status = ? AND cancel_requested = 0)
-                    OR (
-                        status = ?
-                        AND (
-                            lease_token IS NULL
-                            OR lease_expires_at IS NULL
-                            OR lease_expires_at <= ?
+                    (
+                        candidate.status = ?
+                        AND candidate.cancel_requested = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM runs AS thread_run
+                            WHERE thread_run.tenant_id = candidate.tenant_id
+                                AND thread_run.thread_id = candidate.thread_id
+                                AND thread_run.status = ?
                         )
                     )
-                ORDER BY created_at, run_id
+                    OR (
+                        candidate.status = ?
+                        AND candidate.checkpoint_base_revision IS NOT NULL
+                        AND candidate.error_code IS NOT ?
+                        AND (
+                            candidate.lease_token IS NULL
+                            OR candidate.lease_expires_at IS NULL
+                            OR candidate.lease_expires_at <= ?
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM runs AS live_thread_run
+                            WHERE live_thread_run.tenant_id = candidate.tenant_id
+                                AND live_thread_run.thread_id = candidate.thread_id
+                                AND live_thread_run.run_id != candidate.run_id
+                                AND live_thread_run.status = ?
+                                AND live_thread_run.lease_token IS NOT NULL
+                                AND live_thread_run.lease_expires_at IS NOT NULL
+                                AND live_thread_run.lease_expires_at > ?
+                        )
+                    )
+                ORDER BY candidate.created_at, candidate.run_id
                 LIMIT 1
                 """,
-                (RunStatus.QUEUED.value, RunStatus.RUNNING.value, now_ms),
+                (
+                    RunStatus.QUEUED.value,
+                    RunStatus.RUNNING.value,
+                    RunStatus.RUNNING.value,
+                    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                    now_ms,
+                    RunStatus.RUNNING.value,
+                    now_ms,
+                ),
             ).fetchone()
             if candidate is None:
                 return None
@@ -565,16 +780,46 @@ class SQLiteRunStore:
                     error = CASE WHEN error_code = ? THEN error ELSE NULL END,
                     error_code = CASE WHEN error_code = ? THEN error_code ELSE NULL END,
                     updated_at = ?, lease_owner_id = ?, lease_token = ?,
-                    lease_heartbeat_at = ?, lease_expires_at = ?
+                    lease_heartbeat_at = ?, lease_expires_at = ?,
+                    checkpoint_base_revision = COALESCE(
+                        checkpoint_base_revision,
+                        (
+                            SELECT revision FROM thread_states
+                            WHERE tenant_id = runs.tenant_id
+                                AND thread_id = runs.thread_id
+                        ),
+                        0
+                    )
                 WHERE run_id = ?
                     AND (
-                        (status = ? AND cancel_requested = 0)
+                        (
+                            status = ? AND cancel_requested = 0
+                            AND NOT EXISTS (
+                                SELECT 1 FROM runs AS thread_run
+                                WHERE thread_run.tenant_id = runs.tenant_id
+                                    AND thread_run.thread_id = runs.thread_id
+                                    AND thread_run.run_id != runs.run_id
+                                    AND thread_run.status = ?
+                            )
+                        )
                         OR (
                             status = ?
+                            AND checkpoint_base_revision IS NOT NULL
+                            AND error_code IS NOT ?
                             AND (
                                 lease_token IS NULL
                                 OR lease_expires_at IS NULL
                                 OR lease_expires_at <= ?
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM runs AS live_thread_run
+                                WHERE live_thread_run.tenant_id = runs.tenant_id
+                                    AND live_thread_run.thread_id = runs.thread_id
+                                    AND live_thread_run.run_id != runs.run_id
+                                    AND live_thread_run.status = ?
+                                    AND live_thread_run.lease_token IS NOT NULL
+                                    AND live_thread_run.lease_expires_at IS NOT NULL
+                                    AND live_thread_run.lease_expires_at > ?
                             )
                         )
                     )
@@ -591,6 +836,10 @@ class SQLiteRunStore:
                     expires_at,
                     candidate["run_id"],
                     RunStatus.QUEUED.value,
+                    RunStatus.RUNNING.value,
+                    RunStatus.RUNNING.value,
+                    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                    now_ms,
                     RunStatus.RUNNING.value,
                     now_ms,
                 ),
@@ -625,6 +874,7 @@ class SQLiteRunStore:
                 {
                     "attempt": run.attempt,
                     "recovered": recovery_reason is not None,
+                    "checkpoint_base_revision": run.checkpoint_base_revision,
                 },
             )
 
@@ -864,20 +1114,101 @@ class SQLiteRunStore:
         lease_token: str,
     ) -> RunCommitOutcome:
         completed_at = utc_now()
-        if run.state is not None:
-            self._remember_state_model(run.state)
-        state_json = run.state.model_dump_json() if run.state is not None else None
         validation_errors_json = json.dumps(run.validation_errors)
 
         with self._lease_connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now_ms = self._lease_now_ms(connection)
+            persisted = connection.execute(
+                """
+                SELECT status, cancel_requested, lease_token, lease_expires_at,
+                    checkpoint_base_revision, thread_id, domain_id, schema_version
+                FROM runs WHERE run_id = ? AND tenant_id = ?
+                """,
+                (run.run_id, run.tenant_id),
+            ).fetchone()
+            if persisted is None:
+                raise KeyError(f"Run not found: {run.run_id}")
+            persisted_status = RunStatus(persisted["status"])
+            current_lease = (
+                persisted["lease_token"] == lease_token
+                and persisted["lease_expires_at"] is not None
+                and int(persisted["lease_expires_at"]) > now_ms
+            )
+            if (
+                persisted_status != RunStatus.RUNNING
+                or bool(persisted["cancel_requested"])
+                or not current_lease
+            ):
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
+            if run.state is None:
+                raise ValueError(
+                    "A completed managed Run must include checkpoint state"
+                )
+            persisted_identity = (
+                persisted["thread_id"],
+                persisted["domain_id"],
+                persisted["schema_version"],
+            )
+            expected_revision = persisted["checkpoint_base_revision"]
+            observed_revision = self._thread_revision(
+                connection,
+                run.tenant_id,
+                persisted["thread_id"],
+            )
+            if (
+                expected_revision is None
+                or int(expected_revision) != observed_revision
+            ):
+                error = self._fail_checkpoint_conflict_with_connection(
+                    connection,
+                    run_id=run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    expected_revision=(
+                        int(expected_revision)
+                        if expected_revision is not None
+                        else None
+                    ),
+                    observed_revision=observed_revision,
+                    phase="completion",
+                    completed_at=completed_at,
+                    now_ms=now_ms,
+                )
+                self._apply_checkpoint_conflict_to_run(
+                    run,
+                    error=error,
+                    completed_at=completed_at,
+                )
+                return RunCommitOutcome.CHECKPOINT_CONFLICT
+            if (
+                (run.thread_id, run.domain_id, run.schema_version)
+                != persisted_identity
+                or (
+                    run.state.thread_id,
+                    run.state.domain_id,
+                    run.state.schema_version,
+                )
+                != persisted_identity
+            ):
+                raise ValueError(
+                    "Completed Run and checkpoint state identity must match "
+                    "the persisted Run"
+                )
+            self._remember_state_model(run.state)
+            state_json = run.state.model_dump_json()
             self._assert_thread_schema_available(
                 connection,
                 run.tenant_id,
-                run.thread_id,
-                run.domain_id,
-                run.schema_version,
+                persisted["thread_id"],
+                persisted["domain_id"],
+                persisted["schema_version"],
             )
             cursor = connection.execute(
                 """
@@ -914,34 +1245,47 @@ class SQLiteRunStore:
                     now_ms=now_ms,
                 )
 
-            if run.state is not None:
-                connection.execute(
-                    """
-                    INSERT INTO thread_states (
-                        tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(tenant_id, thread_id) DO UPDATE SET
-                        domain_id = excluded.domain_id,
-                        schema_version = excluded.schema_version,
-                        state_json = excluded.state_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        run.tenant_id,
-                        run.thread_id,
-                        run.domain_id,
-                        run.schema_version,
-                        state_json,
-                        completed_at,
-                    ),
+            checkpoint_revision = observed_revision + 1
+            checkpoint_cursor = connection.execute(
+                """
+                INSERT INTO thread_states (
+                    tenant_id, thread_id, domain_id, schema_version,
+                    state_json, updated_at, revision
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(tenant_id, thread_id) DO UPDATE SET
+                    domain_id = excluded.domain_id,
+                    schema_version = excluded.schema_version,
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at,
+                    revision = thread_states.revision + 1
+                WHERE thread_states.revision = ?
+                """,
+                (
+                    run.tenant_id,
+                    persisted["thread_id"],
+                    persisted["domain_id"],
+                    persisted["schema_version"],
+                    state_json,
+                    completed_at,
+                    observed_revision,
+                ),
+            )
+            if checkpoint_cursor.rowcount != 1:
+                raise RuntimeError(
+                    "Thread checkpoint CAS changed inside its write transaction"
                 )
 
-            trace_events = len(run.state.execution_trace) if run.state is not None else 0
+            trace_events = len(run.state.execution_trace)
             self._append_event_with_connection(
                 connection,
                 run.run_id,
                 "checkpoint.saved",
-                {"thread_id": run.thread_id, "trace_events": trace_events},
+                {
+                    "thread_id": persisted["thread_id"],
+                    "trace_events": trace_events,
+                    "base_revision": observed_revision,
+                    "revision": checkpoint_revision,
+                },
             )
             self._append_event_with_connection(
                 connection,
@@ -960,6 +1304,257 @@ class SQLiteRunStore:
         run.lease_heartbeat_at = None
         run.lease_expires_at = None
         return RunCommitOutcome.COMMITTED
+
+    def commit_checkpoint_conflict(
+        self,
+        run: RunRecord,
+        *,
+        lease_token: str,
+        phase: str,
+    ) -> RunCommitOutcome:
+        """Fail a current attempt when its captured checkpoint is no longer current."""
+
+        completed_at = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            persisted = connection.execute(
+                """
+                SELECT status, cancel_requested, lease_token, lease_expires_at,
+                    checkpoint_base_revision, thread_id
+                FROM runs WHERE run_id = ? AND tenant_id = ?
+                """,
+                (run.run_id, run.tenant_id),
+            ).fetchone()
+            if persisted is None:
+                raise KeyError(f"Run not found: {run.run_id}")
+            status = RunStatus(persisted["status"])
+            current_lease = (
+                persisted["lease_token"] == lease_token
+                and persisted["lease_expires_at"] is not None
+                and int(persisted["lease_expires_at"]) > now_ms
+            )
+            if (
+                status != RunStatus.RUNNING
+                or bool(persisted["cancel_requested"])
+                or not current_lease
+            ):
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
+            expected_revision = persisted["checkpoint_base_revision"]
+            observed_revision = self._thread_revision(
+                connection,
+                run.tenant_id,
+                persisted["thread_id"],
+            )
+            error = self._fail_checkpoint_conflict_with_connection(
+                connection,
+                run_id=run.run_id,
+                tenant_id=run.tenant_id,
+                lease_token=lease_token,
+                expected_revision=(
+                    int(expected_revision) if expected_revision is not None else None
+                ),
+                observed_revision=observed_revision,
+                phase=phase,
+                completed_at=completed_at,
+                now_ms=now_ms,
+            )
+
+        self._apply_checkpoint_conflict_to_run(
+            run,
+            error=error,
+            completed_at=completed_at,
+        )
+        return RunCommitOutcome.CHECKPOINT_CONFLICT
+
+    def quarantine_checkpoint_conflict_for_reconciliation(
+        self,
+        run: RunRecord,
+        *,
+        lease_token: str,
+        phase: str,
+    ) -> RunCommitOutcome:
+        """Park an invariant breach without hiding unresolved external effects."""
+
+        updated_at = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now_ms = self._lease_now_ms(connection)
+            persisted = connection.execute(
+                """
+                SELECT status, lease_token, lease_expires_at,
+                    checkpoint_base_revision, thread_id
+                FROM runs WHERE run_id = ? AND tenant_id = ?
+                """,
+                (run.run_id, run.tenant_id),
+            ).fetchone()
+            if persisted is None:
+                raise KeyError(f"Run not found: {run.run_id}")
+            status = RunStatus(persisted["status"])
+            current_lease = (
+                persisted["lease_token"] == lease_token
+                and persisted["lease_expires_at"] is not None
+                and int(persisted["lease_expires_at"]) > now_ms
+            )
+            if status != RunStatus.RUNNING or not current_lease:
+                return self._classify_commit_outcome(
+                    connection,
+                    run.run_id,
+                    tenant_id=run.tenant_id,
+                    lease_token=lease_token,
+                    now_ms=now_ms,
+                )
+            expected_revision = persisted["checkpoint_base_revision"]
+            observed_revision = self._thread_revision(
+                connection,
+                run.tenant_id,
+                persisted["thread_id"],
+            )
+            normalized_expected_revision = (
+                int(expected_revision) if expected_revision is not None else None
+            )
+            if normalized_expected_revision == observed_revision:
+                raise RuntimeError(
+                    "Checkpoint reconciliation quarantine requires a current "
+                    "revision mismatch"
+                )
+            error = (
+                "Thread checkpoint revision changed while external-action "
+                "reconciliation remains unresolved; the Run is quarantined: "
+                f"expected {expected_revision}, observed {observed_revision}"
+            )
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    error_code = ?, error = ?, completed_at = NULL,
+                    updated_at = ?, lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    AND lease_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                    error,
+                    updated_at,
+                    run.run_id,
+                    run.tenant_id,
+                    RunStatus.RUNNING.value,
+                    lease_token,
+                    now_ms,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "Checkpoint reconciliation quarantine lost its Run lease"
+                )
+            self._append_event_with_connection(
+                connection,
+                run.run_id,
+                "checkpoint.conflict",
+                {
+                    "phase": phase,
+                    "expected_revision": normalized_expected_revision,
+                    "observed_revision": observed_revision,
+                    "disposition": "external_action_reconciliation_quarantined",
+                },
+            )
+
+        run.status = RunStatus.RUNNING
+        run.error_code = THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
+        run.error = error
+        run.completed_at = None
+        run.updated_at = updated_at
+        run.lease_owner_id = None
+        run.lease_token = None
+        run.lease_heartbeat_at = None
+        run.lease_expires_at = None
+        return RunCommitOutcome.COMMITTED
+
+    def _fail_checkpoint_conflict_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        tenant_id: str,
+        lease_token: str,
+        expected_revision: int | None,
+        observed_revision: int,
+        phase: str,
+        completed_at: str,
+        now_ms: int,
+    ) -> str:
+        error = (
+            "Thread checkpoint revision changed while the Run held execution "
+            f"ownership: expected {expected_revision}, observed {observed_revision}"
+        )
+        cursor = connection.execute(
+            """
+            UPDATE runs SET
+                status = ?, error_code = ?, error = ?, completed_at = ?,
+                updated_at = ?, lease_owner_id = NULL, lease_token = NULL,
+                lease_heartbeat_at = NULL, lease_expires_at = NULL
+            WHERE run_id = ? AND tenant_id = ? AND status = ?
+                AND cancel_requested = 0 AND lease_token = ?
+                AND lease_expires_at > ?
+            """,
+            (
+                RunStatus.FAILED.value,
+                THREAD_CHECKPOINT_CONFLICT_CODE,
+                error,
+                completed_at,
+                completed_at,
+                run_id,
+                tenant_id,
+                RunStatus.RUNNING.value,
+                lease_token,
+                now_ms,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Checkpoint conflict terminalization lost its Run lease")
+        self._append_event_with_connection(
+            connection,
+            run_id,
+            "checkpoint.conflict",
+            {
+                "phase": phase,
+                "expected_revision": expected_revision,
+                "observed_revision": observed_revision,
+            },
+        )
+        self._append_event_with_connection(
+            connection,
+            run_id,
+            "run.failed",
+            {
+                "error_code": THREAD_CHECKPOINT_CONFLICT_CODE,
+                "error": error,
+            },
+        )
+        return error
+
+    @staticmethod
+    def _apply_checkpoint_conflict_to_run(
+        run: RunRecord,
+        *,
+        error: str,
+        completed_at: str,
+    ) -> None:
+        run.status = RunStatus.FAILED
+        run.error_code = THREAD_CHECKPOINT_CONFLICT_CODE
+        run.error = error
+        run.completed_at = completed_at
+        run.updated_at = completed_at
+        run.lease_owner_id = None
+        run.lease_token = None
+        run.lease_heartbeat_at = None
+        run.lease_expires_at = None
 
     def commit_cancelled_run(
         self,
@@ -1310,48 +1905,6 @@ class SQLiteRunStore:
             for row in rows
         ]
 
-    def save_unmanaged_thread_state(
-        self,
-        state: BaseRuntimeState,
-        *,
-        tenant_id: str,
-    ) -> None:
-        """Persist state for the legacy synchronous, non-Run API only.
-
-        Managed attempts must commit their checkpoint through a fenced Run
-        terminalization method instead of this explicitly unmanaged surface.
-        """
-
-        self._remember_state_model(state)
-        with self._lock, self._connect() as connection:
-            self._assert_thread_schema_available(
-                connection,
-                tenant_id,
-                state.thread_id,
-                state.domain_id,
-                state.schema_version,
-            )
-            connection.execute(
-                """
-                INSERT INTO thread_states (
-                    tenant_id, thread_id, domain_id, schema_version, state_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id, thread_id) DO UPDATE SET
-                    domain_id = excluded.domain_id,
-                    schema_version = excluded.schema_version,
-                    state_json = excluded.state_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    tenant_id,
-                    state.thread_id,
-                    state.domain_id,
-                    state.schema_version,
-                    state.model_dump_json(),
-                    utc_now(),
-                ),
-            )
-
     def load_thread_state(
         self,
         thread_id: str,
@@ -1360,14 +1913,37 @@ class SQLiteRunStore:
         domain_id: str | None = None,
         schema_version: str | None = None,
     ) -> BaseRuntimeState | None:
+        return self.load_thread_state_snapshot(
+            thread_id,
+            tenant_id=tenant_id,
+            domain_id=domain_id,
+            schema_version=schema_version,
+        ).state
+
+    def load_thread_state_snapshot(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+        domain_id: str | None = None,
+        schema_version: str | None = None,
+        expected_revision: int | None = None,
+        require_revision_match: bool = False,
+    ) -> ThreadStateSnapshot:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT domain_id, schema_version, state_json FROM thread_states "
+                "SELECT domain_id, schema_version, state_json, revision FROM thread_states "
                 "WHERE tenant_id = ? AND thread_id = ?",
                 (tenant_id, thread_id),
             ).fetchone()
+        observed_revision = int(row["revision"]) if row is not None else 0
+        if require_revision_match and expected_revision != observed_revision:
+            raise ThreadCheckpointRevisionConflictError(
+                expected_revision=expected_revision,
+                observed_revision=observed_revision,
+            )
         if row is None:
-            return None
+            return ThreadStateSnapshot(state=None, revision=0)
         if domain_id is not None and row["domain_id"] != domain_id:
             raise ValueError(
                 f"Thread {thread_id!r} belongs to domain {row['domain_id']!r}, not {domain_id!r}"
@@ -1377,10 +1953,13 @@ class SQLiteRunStore:
                 f"Thread {thread_id!r} uses schema {row['schema_version']!r}, "
                 f"not {schema_version!r}"
             )
-        return self._deserialize_state(
-            row["domain_id"],
-            row["schema_version"],
-            row["state_json"],
+        return ThreadStateSnapshot(
+            state=self._deserialize_state(
+                row["domain_id"],
+                row["schema_version"],
+                row["state_json"],
+            ),
+            revision=observed_revision,
         )
 
     def _run_values(self, run: RunRecord) -> tuple[Any, ...]:
@@ -1418,6 +1997,7 @@ class SQLiteRunStore:
             run.lease_token,
             run.lease_heartbeat_at,
             run.lease_expires_at,
+            run.checkpoint_base_revision,
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
@@ -1471,6 +2051,11 @@ class SQLiteRunStore:
             lease_expires_at=(
                 row["lease_expires_at"] if "lease_expires_at" in keys else None
             ),
+            checkpoint_base_revision=(
+                row["checkpoint_base_revision"]
+                if "checkpoint_base_revision" in keys
+                else None
+            ),
         )
 
     @staticmethod
@@ -1499,6 +2084,18 @@ class SQLiteRunStore:
                 f"for {domain_id}:{schema_version}"
             )
         return state_model.model_validate(payload)
+
+    @staticmethod
+    def _thread_revision(
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        thread_id: str,
+    ) -> int:
+        row = connection.execute(
+            "SELECT revision FROM thread_states WHERE tenant_id = ? AND thread_id = ?",
+            (tenant_id, thread_id),
+        ).fetchone()
+        return int(row["revision"]) if row is not None else 0
 
     @staticmethod
     def _assert_thread_schema_available(

@@ -181,6 +181,14 @@ opaque lease token, increment `attempt`, set a store-time expiry, and append `ru
 `run.recovered` when applicable. Completion, failure, running cancellation, checkpoint persistence,
 and their describing events commit under that same current unexpired token.
 
+Claim arbitration is also tenant/thread-qualified. A queued Run cannot become `running` while a
+different Run for the same `(tenant_id, thread_id)` remains `running`; an expired predecessor must
+be recovered and terminalized before its successor starts. The first claim captures the current
+checkpoint revision, and successful state-bearing completion advances that revision with a
+conditional write in the same transaction as `checkpoint.saved` and `run.completed`. Different thread keys remain
+eligible for parallel workers. See
+[`thread-execution-serialization.md`](thread-execution-serialization.md).
+
 Heartbeats renew from current SQLite time, not from a worker clock or the old deadline. At
 `store_now == lease_expires_at` the attempt is expired: it cannot renew or commit, and a different
 Manager may claim it with a new token. The token is also checked in the workflow, memory, evidence,
@@ -192,6 +200,9 @@ external effect.
 Lease owner, token, heartbeat, and deadline are internal fields and never enter public Run JSON,
 Planner context, tool arguments, events, memory values, or provider requests. The complete model and
 race matrix are in [`durable-run-leasing.md`](durable-run-leasing.md).
+The checkpoint base revision is also excluded from public Run JSON, but revision numbers are
+non-secret audit metadata and appear in `run.started`, `checkpoint.loaded`, and
+`checkpoint.saved` events.
 
 ## Tool sandbox
 
@@ -371,10 +382,12 @@ This guarantee applies to the supplied Docker image. Running `uvicorn` directly 
 ## Restart recovery
 
 Workers continuously poll durable claim candidates. Queued Runs are fresh claims; a `running` Run
-is recoverable only when its lease is expired or it is a legacy pre-leasing row with no token. A
-live unexpired lease is not rewritten when another Manager starts. Every takeover rotates the
-token, increments the attempt, and appends `run.recovered` and `run.started` in the claim
-transaction.
+is recoverable only when its lease is expired and it already carries the checkpoint base revision
+captured by its first thread-aware claim. A live unexpired lease is not rewritten when another
+Manager starts. Every takeover rotates the token, preserves the base revision, increments the
+attempt, and appends `run.recovered` and `run.started` in the claim transaction. Pre-thread-
+serialization nonterminal rows must be drained with the old binary before migration; the Runtime
+does not guess which checkpoint an already-running legacy attempt originally read.
 
 Recovered executions carry a domain-neutral execution-context marker; the release-validation
 adapter maps it to explicit interrupted-step recovery, while normal submissions do not receive it.
@@ -389,7 +402,8 @@ succeeded and uses `external_action_evidence_incomplete` when its public evidenc
 cannot be reconciled. Terminal `failed` runs remain excluded from recovery.
 
 The full suite verifies recovery, cancellation before start, cancellation at execution and
-dispatch boundaries, two-worker execution, tenant-scoped thread state and submission idempotency,
+dispatch boundaries, same-thread execution serialization, cross-thread parallel execution,
+checkpoint revision conflicts, tenant-scoped thread state and submission idempotency,
 fail-closed authentication, Viewer/Operator authorization and spoof resistance, cross-tenant
 resource invisibility, DAG validation, tenant-safe selective replay, source-run immutability, tool
 allowlisting, schema rejection, timeout termination, environment scrubbing, external-action
@@ -429,3 +443,10 @@ sandbox implementation.
 The first lease-aware rollout must stop and verify all pre-leasing Runtime processes before the
 additive migration, then start only lease-aware binaries. Mixed old/new execution and mixed-version
 rollback are unsupported because old Managers ignore lease columns.
+
+The first thread-serialization rollout must additionally drain all queued and running Runs before
+the new columns and partial unique index are installed. Existing checkpoint rows migrate to
+revision `1`; absence remains logical revision `0`. Old binaries do not maintain revisions, so
+mixed-version execution and rollback across this migration are unsupported. In particular, an old
+state-only writer does not increment `revision` and is therefore invisible to CAS; stop-and-drain
+remains mandatory even if a partial rollout already added the new columns.

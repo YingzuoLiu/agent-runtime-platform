@@ -226,6 +226,10 @@ def test_store_lease_expiry_is_an_exact_fencing_boundary(tmp_path) -> None:
     assert second_claim.run.attempt == 2
     assert second_claim.lease_token != first_claim.lease_token
 
+    second_claim.run.state = AgentState(
+        thread_id=second_claim.run.thread_id,
+        destination="Tokyo",
+    )
     second_claim.run.output_message = "winner"
     assert (
         store.commit_completed_run(

@@ -31,6 +31,7 @@ class RunLeaseRecoveryReason(str, Enum):
 class RunCommitOutcome(str, Enum):
     COMMITTED = "committed"
     CANCEL_REQUESTED = "cancel_requested"
+    CHECKPOINT_CONFLICT = "checkpoint_conflict"
     LEASE_LOST = "lease_lost"
     ALREADY_TERMINAL = "already_terminal"
     NOT_ELIGIBLE = "not_eligible"
@@ -89,6 +90,12 @@ class RunRecord(BaseModel):
     lease_token: str | None = Field(default=None, exclude=True, repr=False)
     lease_heartbeat_at: int | None = Field(default=None, exclude=True, repr=False)
     lease_expires_at: int | None = Field(default=None, exclude=True, repr=False)
+    checkpoint_base_revision: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        ge=0,
+    )
 
     @model_validator(mode="after")
     def normalize_legacy_message(self) -> "RunRecord":

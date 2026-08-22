@@ -76,7 +76,7 @@ from .sandbox import (
     ToolSandbox,
     ToolSpec,
 )
-from .store import RunLeaseLostError, SQLiteRunStore
+from .store import RunLeaseLostError, SQLiteRunStore, ThreadStateConflictError
 
 
 def build_default_tool_registry() -> ToolRegistry:
@@ -148,6 +148,7 @@ __all__ = [
     "SQLiteMemoryStore",
     "StaticApiKeyAuthenticator",
     "TenantContext",
+    "ThreadStateConflictError",
     "ToolDescriptor",
     "ToolEffect",
     "ToolExecutionRequest",

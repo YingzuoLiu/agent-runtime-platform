@@ -5,10 +5,11 @@ import json
 import logging
 import math
 import os
+import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -40,7 +41,6 @@ from domains.travel.preferences import (
     parse_legacy_travel_preferences,
 )
 from domains.travel.state import AgentState
-from domains.travel.runtime import TravelAgentRuntime
 from domains.travel.tools import (
     SQLiteTripHoldProvider,
     build_travel_external_action_tool_registry,
@@ -64,6 +64,7 @@ from runtime_service import (
     RunCreateRequest,
     RunEvent,
     RunRecord,
+    RunStatus,
     RuntimeManager,
     RuntimeExtension,
     RuntimeExtensionContext,
@@ -72,6 +73,7 @@ from runtime_service import (
     SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
+    ThreadStateConflictError,
     ToolDescriptor,
     ToolEffect,
     ToolExecutionRequest,
@@ -143,7 +145,10 @@ class AgentMessageRequest(BaseModel):
     user_message: str = Field(..., description="User message to process.")
     state: Optional[AgentState] = Field(
         default=None,
-        description="Optional client-provided state. If omitted, server loads the durable thread checkpoint.",
+        description=(
+            "Optional state used only to initialize an empty thread. "
+            "Omit it to continue an existing durable checkpoint."
+        ),
     )
 
 
@@ -151,6 +156,13 @@ class AgentMessageResponse(BaseModel):
     assistant_message: str
     updated_state: AgentState
     validation_errors: list[str]
+
+
+class AgentMessagePendingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: Literal["queued", "running"]
 
 
 def create_app(
@@ -163,6 +175,7 @@ def create_app(
     travel_action_provider: ExternalActionProvider | None = None,
     action_providers: Mapping[str, ExternalActionProvider] | None = None,
     action_waiter_limit: int | None = None,
+    agent_message_waiter_limit: int | None = None,
     demo_mode: bool | None = None,
     demo_api_key: str | None = None,
     runtime_extensions: Sequence[RuntimeExtension] = (),
@@ -179,6 +192,13 @@ def create_app(
     )
     if not 1 <= resolved_action_waiter_limit <= 1_000:
         raise ValueError("action waiter limit must be between 1 and 1000")
+    resolved_agent_message_waiter_limit = (
+        int(os.getenv("RUNTIME_AGENT_MESSAGE_WAITER_LIMIT", "16"))
+        if agent_message_waiter_limit is None
+        else agent_message_waiter_limit
+    )
+    if not 1 <= resolved_agent_message_waiter_limit <= 1_000:
+        raise ValueError("agent message waiter limit must be between 1 and 1000")
     configured_action_providers = dict(load_action_providers_from_environment())
     for alias, provider in (action_providers or {}).items():
         if alias in configured_action_providers:
@@ -593,43 +613,195 @@ def create_app(
             )
         return result
 
-    @app.post("/agent/message", response_model=AgentMessageResponse)
-    def handle_agent_message(
+    def validate_agent_message_wait(request: Request, wait: float) -> float:
+        values = request.query_params.getlist("wait")
+        if len(values) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="wait must be a number between 0 and 5 seconds",
+            )
+        return wait
+
+    async def get_agent_message_run(
+        request: Request,
+        run_id: str,
+        principal: Principal,
+        *,
+        operation_timeout_seconds: float,
+    ) -> RunRecord | None:
+        try:
+            with anyio.fail_after(operation_timeout_seconds):
+                current = await anyio.to_thread.run_sync(
+                    lambda: get_manager(request).get_run(
+                        run_id,
+                        tenant_context=principal.tenant_context,
+                        operation_timeout_seconds=operation_timeout_seconds,
+                    ),
+                    abandon_on_cancel=True,
+                )
+        except TimeoutError:
+            # Submission already committed. Database contention or an over-budget
+            # observation must end compatibility waiting, not fail or cancel the Run.
+            return None
+        except sqlite3.OperationalError as exc:
+            sqlite_error_code = getattr(exc, "sqlite_errorcode", None)
+            if (
+                sqlite_error_code is not None
+                and sqlite_error_code & 0xFF
+                in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            ):
+                return None
+            raise HTTPException(
+                status_code=500,
+                detail="Managed Run evidence is incomplete",
+                headers={"Location": f"/runs/{run_id}"},
+            ) from None
+        if current is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Managed Run evidence is incomplete",
+                headers={"Location": f"/runs/{run_id}"},
+            )
+        return current
+
+    async def wait_for_agent_message_run(
+        request: Request,
+        run: RunRecord,
+        principal: Principal,
+        wait_seconds: float,
+    ) -> RunRecord:
+        if wait_seconds <= 0 or run.status.is_terminal:
+            return run
+        semaphore: anyio.Semaphore = request.app.state.agent_message_waiter_semaphore
+        try:
+            semaphore.acquire_nowait()
+        except anyio.WouldBlock:
+            return run
+        try:
+            deadline = anyio.current_time() + wait_seconds
+            current = run
+            poll_delay = 0.05
+            while not current.status.is_terminal:
+                remaining = deadline - anyio.current_time()
+                if remaining <= 0:
+                    break
+                await anyio.sleep(min(poll_delay, remaining))
+                remaining = deadline - anyio.current_time()
+                if remaining <= 0:
+                    break
+                refreshed = await get_agent_message_run(
+                    request,
+                    current.run_id,
+                    principal,
+                    operation_timeout_seconds=max(0.001, min(0.25, remaining)),
+                )
+                if refreshed is None:
+                    break
+                current = refreshed
+                poll_delay = min(0.4, poll_delay * 1.5)
+            return current
+        finally:
+            semaphore.release()
+
+    def agent_message_pending_response(run: RunRecord) -> JSONResponse:
+        pending = AgentMessagePendingResponse(
+            run_id=run.run_id,
+            status=run.status.value,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=pending.model_dump(mode="json"),
+            headers={
+                "Location": f"/runs/{run.run_id}",
+                "Retry-After": "1",
+            },
+        )
+
+    @app.post(
+        "/agent/message",
+        response_model=AgentMessageResponse,
+        responses={202: {"model": AgentMessagePendingResponse}},
+    )
+    async def handle_agent_message(
         payload: AgentMessageRequest,
         request: Request,
+        wait: Annotated[
+            float,
+            Query(ge=0, le=5, allow_inf_nan=False),
+        ] = 5.0,
         principal: Principal = Depends(require_principal),
-    ) -> AgentMessageResponse:
-        """Backward-compatible synchronous endpoint backed by the durable thread store."""
+    ) -> AgentMessageResponse | JSONResponse:
+        """Bounded-wait Travel adapter backed by the managed Run lifecycle."""
         require_permission(principal, RuntimePermission.AGENT_MESSAGE_EXECUTE)
+        wait_seconds = validate_agent_message_wait(request, wait)
         store: SQLiteRunStore = request.app.state.run_store
-        runtime = TravelAgentRuntime(retry_limit=2)
         if payload.state is not None and payload.state.thread_id != payload.thread_id:
             raise HTTPException(
                 status_code=422,
                 detail="state.thread_id must match request.thread_id",
             )
         try:
-            persisted_state = store.load_thread_state(
-                payload.thread_id,
-                tenant_id=principal.tenant_id,
-                domain_id=AgentState.domain_id,
-                schema_version=AgentState.schema_version,
+            # Preserve the compatibility endpoint's immediate cross-domain
+            # conflict while execution itself now goes through a managed Run.
+            await anyio.to_thread.run_sync(
+                lambda: store.load_thread_state(
+                    payload.thread_id,
+                    tenant_id=principal.tenant_id,
+                    domain_id=AgentState.domain_id,
+                    schema_version=AgentState.schema_version,
+                )
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        state_value = payload.state or persisted_state or AgentState(thread_id=payload.thread_id)
-        result = runtime.handle_user_message(state_value, payload.user_message)
+
+        authority = effective_execution_authority(principal, resolved_authorizer)
         try:
-            store.save_unmanaged_thread_state(
-                result.state,
-                tenant_id=principal.tenant_id,
+            submitted = await anyio.to_thread.run_sync(
+                lambda: get_manager(request).submit(
+                    RunCreateRequest(
+                        thread_id=payload.thread_id,
+                        agent_id="travel-agent",
+                        agent_version="0.3.0",
+                        input={"user_message": payload.user_message},
+                        state=payload.state,
+                    ),
+                    tenant_context=TenantContext(
+                        tenant_id=authority.tenant_id,
+                        subject_id=authority.subject_id,
+                        permissions=authority.permissions,
+                    ),
+                )
             )
-        except ValueError as exc:
+        except ThreadStateConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        completed = await wait_for_agent_message_run(
+            request,
+            submitted,
+            principal,
+            wait_seconds,
+        )
+        if not completed.status.is_terminal:
+            return agent_message_pending_response(completed)
+
+        if completed.status != RunStatus.COMPLETED or completed.state is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Managed Run did not complete successfully",
+                headers={"Location": f"/runs/{completed.run_id}"},
+            )
+        try:
+            result_state = AgentState.model_validate(completed.state)
+        except ValidationError:
+            raise HTTPException(
+                status_code=500,
+                detail="Managed Run evidence is incomplete",
+                headers={"Location": f"/runs/{completed.run_id}"},
+            ) from None
         return AgentMessageResponse(
-            assistant_message=result.message,
-            updated_state=result.state,
-            validation_errors=result.validation_errors,
+            assistant_message=completed.output_message or "",
+            updated_state=result_state,
+            validation_errors=completed.validation_errors,
         )
 
     @app.post("/runs", response_model=RunRecord, status_code=status.HTTP_202_ACCEPTED)
@@ -678,6 +850,8 @@ def create_app(
             )
         except ReferencedRunNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Referenced run not found") from exc
+        except ThreadStateConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -951,6 +1125,9 @@ def create_app(
 
     app.state.action_waiter_semaphore = anyio.Semaphore(
         resolved_action_waiter_limit
+    )
+    app.state.agent_message_waiter_semaphore = anyio.Semaphore(
+        resolved_agent_message_waiter_limit
     )
 
     @app.post("/actions", response_model=ActionResource)

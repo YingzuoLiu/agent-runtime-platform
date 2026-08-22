@@ -1,6 +1,11 @@
 # Durable execution plane: run leasing and fencing
 
-Status: implementation candidate on `feat/durable-run-leasing-fencing`; not yet merged to `main`.
+Status: historical design record for the merged Run Leasing & Fencing milestone (PR #27).
+
+The later thread-serialization milestone supersedes this document wherever it strengthens claim,
+legacy migration, or checkpoint rules. In particular, current code fails closed for a legacy
+`running` row without `checkpoint_base_revision`; it no longer automatically recovers every
+unleased `running` row described below. See `docs/thread-execution-serialization.md`.
 
 Baseline: `b93914b7dc126f51bf4af7c4de11a2dc45e1918a`.
 
@@ -112,7 +117,8 @@ This milestone includes:
 - durable polling, with an in-process signal used only to reduce latency;
 - fenced completion, failure, cancellation, reconciliation markers, and attempt-owned Run events;
 - propagation of Run execution authority into workflow, memory, and external-action mutation gates;
-- recovery of legacy unleased `running` rows;
+- recovery of legacy unleased `running` rows (the behavior introduced by this historical
+  milestone and later superseded by the thread-serialization migration boundary);
 - two-Manager concurrency and stale-worker tests against one SQLite database;
 - preservation of the existing external-action recovery rules.
 
@@ -216,6 +222,10 @@ claim index shaped for the current concrete store:
 
 Migration rules:
 
+These rules describe the original leasing migration. The current thread-serialization migration
+adds a stricter drain requirement and rejects a nonterminal legacy Run whose checkpoint base is
+unknown.
+
 - existing `queued` rows with null lease fields are normally claimable;
 - existing `running` rows with null lease fields are legacy interrupted work and immediately
   eligible for one fenced recovery claim;
@@ -302,6 +312,10 @@ provider outcome, which remains guarded by its dispatch and tool-attempt tokens.
 tests may use explicit fixtures, but a managed Run row with a missing token fails closed.
 
 ## Claim and takeover
+
+This section describes claim behavior at the end of the leasing milestone. Current claim behavior
+also enforces per-thread serialization and checkpoint-base requirements; the later design document
+is authoritative for those additional constraints.
 
 An eligible claim candidate is:
 
@@ -551,6 +565,7 @@ Once these semantics are proven, a PostgreSQL store can implement claim selectio
 must preserve the same token predicates and store-authoritative expiry rules. A queue delivery or a
 leader lease alone is never proof of current execution authority.
 
-Per-thread serialization is a separate milestone. Two independently valid Runs for the same
-tenant-qualified thread can still race to write a later checkpoint unless a thread lease or
-checkpoint revision compare-and-set is added explicitly.
+Per-thread serialization remains a separate layer from Run leasing and is now specified and
+implemented by [`thread-execution-serialization.md`](thread-execution-serialization.md). It reuses
+the current Run lease as tenant-qualified thread ownership and adds checkpoint revision
+compare-and-set; Run leasing itself does not imply either guarantee.
