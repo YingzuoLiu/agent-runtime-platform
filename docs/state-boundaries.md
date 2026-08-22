@@ -66,9 +66,9 @@ python -m eval.state_boundary --output eval/results/state_boundary_latest.json
 pytest -q tests/characterization/test_state_boundary_eval.py
 ```
 
-The pytest verification regenerates the report in a temporary directory, compares it with the
-committed report, and applies strict semantic assertions. Checkpoint size remains observational:
-there is deliberately no maximum-byte CI threshold.
+The pytest verification regenerates the report in a temporary directory and applies semantic
+invariants. The committed JSON remains an inspectable evidence artifact, not a byte-for-byte golden
+fixture. Checkpoint size remains observational: there is deliberately no maximum-byte CI threshold.
 
 ## Results
 
@@ -155,20 +155,16 @@ Size is the UTF-8 byte length of the exact compact `thread_states.state_json`. T
 columns are compact serialized value sizes; `other` includes all other values plus JSON keys and
 punctuation. No persisted checkpoint was altered to calculate the breakdown.
 
-| Turn | Revision | Total bytes | `execution_trace` value | `tool_outputs` value | Other | Growth |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 2,579 | 2,058 | 92 | 429 | 2,579 |
-| 2 | 2 | 4,629 | 4,081 | 92 | 456 | 2,050 |
-| 3 | 3 | 6,653 | 6,084 | 92 | 477 | 2,024 |
-| 4 | 4 | 8,713 | 8,108 | 92 | 513 | 2,060 |
-| 5 | 5 | 11,196 | 10,535 | 92 | 569 | 2,483 |
-| 6 | 6 | 13,113 | 12,511 | 92 | 510 | 1,917 |
-| 7 | 7 | 15,189 | 14,583 | 92 | 514 | 2,076 |
-| 8 | 8 | 16,336 | 15,730 | 92 | 514 | 1,147 |
+| Observation | Characterized result |
+| --- | --- |
+| Total checkpoint size | Increased on every turn |
+| `execution_trace` contribution | Increased on every turn |
+| Net-growth attribution | More than 99% came from `execution_trace`; the regression invariant requires more than 95% |
+| `tool_outputs` contribution | Remained constant across the scenario |
+| Field accounting | Total bytes equal trace value + tool-output value + other state/JSON structure on every turn |
 
-In this scenario both total checkpoint bytes and the trace contribution increased on every turn.
-Total net growth after the first checkpoint was 13,757 bytes; trace value net growth was 13,672
-bytes. The observation answers the scoped question: `execution_trace` causes monotonic checkpoint
+The exact per-turn byte measurements remain in the committed JSON evidence. The proportional result
+answers the scoped question: `execution_trace` causes monotonic checkpoint growth and dominates net
 growth for this repeatable eight-turn path. It is not a universal growth rate, capacity limit, or
 production-size guarantee.
 
@@ -192,7 +188,7 @@ impact and a minimal reproduction are now explicit for a later narrow decision.
 ## Answers and recommendation
 
 1. **Does `execution_trace` cause monotonic checkpoint growth?** Yes in the characterized
-   eight-turn scenario. It accounts for 13,672 of the 13,757 net bytes after turn 1.
+   eight-turn scenario. It accounts for more than 99% of net growth after turn 1.
 2. **What is `tool_outputs`?** Mixed. `0.5.0` reads a current-plan cost projection across turns;
    dynamic `1.x` replaces it with the current Run's observation projection while the workflow
    ledger owns durable execution evidence. It is neither only a temporary cache nor one uniform

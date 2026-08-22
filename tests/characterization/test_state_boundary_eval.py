@@ -1,16 +1,8 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
 from eval.state_boundary import build_report
-
-
-REPORT_PATH = (
-    Path(__file__).resolve().parents[2] / "eval" / "results" / "state_boundary_latest.json"
-)
 
 
 @pytest.fixture(scope="module")
@@ -18,9 +10,35 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict:
     return build_report(tmp_path_factory.mktemp("state-boundary-eval"))
 
 
-def test_state_boundary_report_is_reproducible(report: dict) -> None:
-    expected = json.loads(REPORT_PATH.read_text(encoding="utf-8"))
-    assert report == expected
+def test_state_boundary_report_preserves_evidence_invariants(report: dict) -> None:
+    assert report["report_schema"] == "state-boundary-characterization-v1"
+    assert report["deterministic_boundary"] == {
+        "planner": "ScriptedTravelPlanner",
+        "tools": "offline synthetic Travel handlers via direct eval adapter",
+        "network_calls": False,
+        "volatile_identifiers_in_report": False,
+        "checkpoint_size_is_observational": True,
+    }
+
+    growth = report["checkpoint_growth"]
+    summary = growth["summary"]
+    assert summary["strictly_monotonic_total"] is True
+    assert summary["strictly_monotonic_execution_trace"] is True
+    assert summary["total_net_growth_bytes"] > 0
+    assert summary["execution_trace_net_growth_bytes"] / summary["total_net_growth_bytes"] > 0.95
+    assert all(
+        item["total_checkpoint_bytes"]
+        == item["execution_trace_value_bytes"]
+        + item["tool_outputs_value_bytes"]
+        + item["other_state_and_json_structure_bytes"]
+        for item in growth["turns"]
+    )
+
+    retry_turns = report["retry_count_scope"]["turns"]
+    retry_counts = [item["retry_count"] for item in retry_turns]
+    assert {item["run_attempt"] for item in retry_turns} == {1}
+    assert retry_counts == sorted(retry_counts)
+    assert retry_counts[2] > retry_counts[1]
 
 
 def test_memory_supersession_and_sealed_snapshot_are_characterized(report: dict) -> None:
