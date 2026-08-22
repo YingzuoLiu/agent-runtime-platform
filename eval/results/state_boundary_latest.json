@@ -1,0 +1,356 @@
+{
+  "report_schema": "state-boundary-characterization-v1",
+  "deterministic_boundary": {
+    "planner": "ScriptedTravelPlanner",
+    "tools": "offline synthetic Travel handlers via direct eval adapter",
+    "network_calls": false,
+    "volatile_identifiers_in_report": false,
+    "checkpoint_size_is_observational": true
+  },
+  "memory_supersession": {
+    "logical_key": "flight.avoid_red_eye",
+    "version_history": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": true,
+        "status": "superseded"
+      },
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 2,
+        "value": false,
+        "status": "active"
+      }
+    ],
+    "new_run_snapshot": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 2,
+        "value": false
+      }
+    ],
+    "new_run_behavior": {
+      "itinerary_flight_type": "red_eye",
+      "checkpoint_preference_keys": []
+    }
+  },
+  "sealed_snapshot": {
+    "sealed_run_before_update": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": true
+      }
+    ],
+    "sealed_run_after_update": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": true
+      }
+    ],
+    "sealed_view_unchanged": true,
+    "new_run_after_update": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 2,
+        "value": false
+      }
+    ]
+  },
+  "budget_replacement": {
+    "checkpoint": {
+      "before": {
+        "revision": 1,
+        "budget": 9000,
+        "preferences": {}
+      },
+      "after": {
+        "revision": 2,
+        "budget": 12000,
+        "preferences": {}
+      },
+      "replacement_run_loaded": {
+        "source": "thread_store",
+        "revision": 1
+      }
+    },
+    "memory_before": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": true,
+        "status": "active"
+      }
+    ],
+    "memory_after": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": true,
+        "status": "active"
+      }
+    ],
+    "memory_changed": false
+  },
+  "negation_safety": {
+    "ambiguous_mentions": [
+      {
+        "message": "Do you offer red-eye flights?",
+        "parser_output": {},
+        "memory_mutation_events": 0
+      },
+      {
+        "message": "Tell me about a hotel near subway.",
+        "parser_output": {},
+        "memory_mutation_events": 0
+      },
+      {
+        "message": "What does a relaxed travel style mean?",
+        "parser_output": {},
+        "memory_mutation_events": 0
+      }
+    ],
+    "explicit_negative_intent": [
+      {
+        "message": "I do not mind red-eye flights.",
+        "parser_output": {
+          "avoid_red_eye": false
+        }
+      },
+      {
+        "message": "I do not want a hotel near subway.",
+        "parser_output": {
+          "hotel_near_subway": false
+        }
+      },
+      {
+        "message": "I prefer NOT a relaxed travel style.",
+        "parser_output": {
+          "travel_style": "balanced"
+        }
+      }
+    ],
+    "persisted_active_memories": [
+      {
+        "key": "flight.avoid_red_eye",
+        "version": 1,
+        "value": false,
+        "status": "active"
+      },
+      {
+        "key": "hotel.near_subway",
+        "version": 1,
+        "value": false,
+        "status": "active"
+      },
+      {
+        "key": "travel.style",
+        "version": 1,
+        "value": "balanced",
+        "status": "active"
+      }
+    ]
+  },
+  "confirm_plan_dependency": {
+    "previous_turn": {
+      "run_status": "completed",
+      "checkpoint_revision": 1,
+      "itinerary_total_cost": 7300,
+      "cost_breakdown": {
+        "flight_cost": 1800,
+        "hotel_cost_per_day": 650,
+        "activity_cost_per_day": 450
+      }
+    },
+    "confirmation_turn": {
+      "run_status": "completed",
+      "checkpoint_loaded": {
+        "source": "thread_store",
+        "revision": 1
+      },
+      "intent_observed": true,
+      "review_invocation_count": 2,
+      "review_evidence": {
+        "candidate_plan_present": true,
+        "budget_limit": 9000.0,
+        "cost_ledger_status": "complete",
+        "cost_ledger_total": 7300.0,
+        "cost_source_ids": [
+          "tool_outputs.cost_breakdown"
+        ],
+        "evidence_issues": []
+      },
+      "validation_errors": [],
+      "checkpoint_revision": 2
+    },
+    "observed_dependency": "confirm_plan reuses checkpoint itinerary/budget and the review evidence builder reads tool_outputs.cost_breakdown as a complete ledger",
+    "authority_note": "TravelValidator gates itinerary.total_cost against budget; the review builder has an existing plan-total fallback when cost_breakdown is absent"
+  },
+  "checkpoint_growth": {
+    "measurement_definition": "UTF-8 bytes of persisted compact state_json; field contributions are the compact serialized field values, and other includes all keys/punctuation",
+    "turns": [
+      {
+        "turn": 1,
+        "message": "Plan a 6-day Tokyo trip, budget 10000 SGD.",
+        "checkpoint_revision": 1,
+        "total_checkpoint_bytes": 2579,
+        "execution_trace_value_bytes": 2058,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 429,
+        "growth_from_previous_checkpoint_bytes": 2579,
+        "execution_trace_events": 7,
+        "retry_count": 0
+      },
+      {
+        "turn": 2,
+        "message": "I want a relaxed travel style.",
+        "checkpoint_revision": 2,
+        "total_checkpoint_bytes": 4629,
+        "execution_trace_value_bytes": 4081,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 456,
+        "growth_from_previous_checkpoint_bytes": 2050,
+        "execution_trace_events": 14,
+        "retry_count": 0
+      },
+      {
+        "turn": 3,
+        "message": "Avoid red-eye flights.",
+        "checkpoint_revision": 3,
+        "total_checkpoint_bytes": 6653,
+        "execution_trace_value_bytes": 6084,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 477,
+        "growth_from_previous_checkpoint_bytes": 2024,
+        "execution_trace_events": 21,
+        "retry_count": 0
+      },
+      {
+        "turn": 4,
+        "message": "Hotel near subway please.",
+        "checkpoint_revision": 4,
+        "total_checkpoint_bytes": 8713,
+        "execution_trace_value_bytes": 8108,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 513,
+        "growth_from_previous_checkpoint_bytes": 2060,
+        "execution_trace_events": 28,
+        "retry_count": 0
+      },
+      {
+        "turn": 5,
+        "message": "Change the trip to 8 days.",
+        "checkpoint_revision": 5,
+        "total_checkpoint_bytes": 11196,
+        "execution_trace_value_bytes": 10535,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 569,
+        "growth_from_previous_checkpoint_bytes": 2483,
+        "execution_trace_events": 36,
+        "retry_count": 1
+      },
+      {
+        "turn": 6,
+        "message": "Raise budget to 12000.",
+        "checkpoint_revision": 6,
+        "total_checkpoint_bytes": 13113,
+        "execution_trace_value_bytes": 12511,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 510,
+        "growth_from_previous_checkpoint_bytes": 1917,
+        "execution_trace_events": 43,
+        "retry_count": 1
+      },
+      {
+        "turn": 7,
+        "message": "Keep the relaxed style and no red-eye.",
+        "checkpoint_revision": 7,
+        "total_checkpoint_bytes": 15189,
+        "execution_trace_value_bytes": 14583,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 514,
+        "growth_from_previous_checkpoint_bytes": 2076,
+        "execution_trace_events": 50,
+        "retry_count": 1
+      },
+      {
+        "turn": 8,
+        "message": "Confirm everything looks good.",
+        "checkpoint_revision": 8,
+        "total_checkpoint_bytes": 16336,
+        "execution_trace_value_bytes": 15730,
+        "tool_outputs_value_bytes": 92,
+        "other_state_and_json_structure_bytes": 514,
+        "growth_from_previous_checkpoint_bytes": 1147,
+        "execution_trace_events": 56,
+        "retry_count": 1
+      }
+    ],
+    "summary": {
+      "total_bytes_first": 2579,
+      "total_bytes_last": 16336,
+      "total_net_growth_bytes": 13757,
+      "execution_trace_net_growth_bytes": 13672,
+      "strictly_monotonic_total": true,
+      "strictly_monotonic_execution_trace": true
+    }
+  },
+  "retry_count_scope": {
+    "turns": [
+      {
+        "turn": 1,
+        "message": "Plan a 5-day Tokyo trip under 1000 SGD.",
+        "run_attempt": 1,
+        "checkpoint_revision": 1,
+        "retry_count": 1,
+        "current_stage": "needs_repair",
+        "validation_errors": [
+          "Budget exceeded: total_cost=7300, budget=1000"
+        ]
+      },
+      {
+        "turn": 2,
+        "message": "Raise budget to 9000 SGD.",
+        "run_attempt": 1,
+        "checkpoint_revision": 2,
+        "retry_count": 1,
+        "current_stage": "planned",
+        "validation_errors": []
+      },
+      {
+        "turn": 3,
+        "message": "Cut budget to 1000 SGD.",
+        "run_attempt": 1,
+        "checkpoint_revision": 3,
+        "retry_count": 2,
+        "current_stage": "needs_repair",
+        "validation_errors": [
+          "Budget exceeded: total_cost=7300, budget=1000"
+        ]
+      },
+      {
+        "turn": 4,
+        "message": "Raise budget to 9000 SGD.",
+        "run_attempt": 1,
+        "checkpoint_revision": 4,
+        "retry_count": 2,
+        "current_stage": "planned",
+        "validation_errors": []
+      },
+      {
+        "turn": 5,
+        "message": "Cut budget to 1000 SGD.",
+        "run_attempt": 1,
+        "checkpoint_revision": 5,
+        "retry_count": 2,
+        "current_stage": "blocked",
+        "validation_errors": [
+          "Budget exceeded: total_cost=7300, budget=1000"
+        ]
+      }
+    ],
+    "observed_scope": "thread-scoped in current behavior: successful repair Runs do not reset retry_count, while each durable Run has its own attempt counter"
+  }
+}
