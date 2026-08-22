@@ -23,16 +23,26 @@ def provider_request(*, run_id: str, key: str) -> ExternalActionRequest:
     )
 
 
-def wait_for_held_effect(client: TestClient, run_id: str) -> dict:
+def wait_for_held_effect(
+    client: TestClient,
+    run_id: str,
+    *,
+    expected_attempts: int,
+) -> dict:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         response = client.get(f"/proof/actions/{run_id}")
         if response.status_code == 200:
             state = response.json()
-            if state["waiting_for_release"]:
+            if (
+                state["waiting_for_release"]
+                and state["attempt_count"] == expected_attempts
+            ):
                 return state
         time.sleep(0.02)
-    raise AssertionError(f"Provider did not hold the committed effect for {run_id}")
+    raise AssertionError(
+        f"Provider did not hold attempt {expected_attempts} for {run_id}"
+    )
 
 
 def test_demo_provider_health_is_public_and_minimal(tmp_path):
@@ -66,7 +76,11 @@ def test_idempotent_provider_persists_one_effect_and_replays_receipt_after_resta
                 json=body,
                 headers=headers,
             )
-            held = wait_for_held_effect(first_client, run_id)
+            held = wait_for_held_effect(
+                first_client,
+                run_id,
+                expected_attempts=1,
+            )
             released = first_client.post(f"/proof/actions/{run_id}/release", json={})
             first_response = pending.result(timeout=5)
 
@@ -121,8 +135,11 @@ def test_unsafe_provider_does_not_deduplicate_a_repeated_transport_request(tmp_p
                 json=body,
                 headers={"Idempotency-Key": provider_key},
             )
-            wait_for_held_effect(client, run_id)
-            client.post(f"/proof/actions/{run_id}/release", json={})
+            wait_for_held_effect(client, run_id, expected_attempts=1)
+            first_released = client.post(
+                f"/proof/actions/{run_id}/release",
+                json={},
+            )
             first_response = pending.result(timeout=5)
             repeated = executor.submit(
                 client.post,
@@ -130,13 +147,22 @@ def test_unsafe_provider_does_not_deduplicate_a_repeated_transport_request(tmp_p
                 json=body,
                 headers={"Idempotency-Key": provider_key},
             )
-            second_held = wait_for_held_effect(client, run_id)
-            client.post(f"/proof/actions/{run_id}/release", json={})
+            second_held = wait_for_held_effect(
+                client,
+                run_id,
+                expected_attempts=2,
+            )
+            second_released = client.post(
+                f"/proof/actions/{run_id}/release",
+                json={},
+            )
             second_response = repeated.result(timeout=5)
         proof = client.get(f"/proof/actions/{run_id}").json()
 
     assert first_response.status_code == 503
     assert second_response.status_code == 503
+    assert first_released.status_code == 200
+    assert second_released.status_code == 200
     assert second_held["attempt_count"] == 2
     assert second_held["effect_count"] == 2
     assert proof["scenario"] == "unsafe"
