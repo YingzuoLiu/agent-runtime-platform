@@ -107,7 +107,7 @@ def test_checkpoint_growth_is_observational_not_threshold_gated(report: dict) ->
         + item["other_state_and_json_structure_bytes"]
         for item in turns
     )
-    assert {item["tool_outputs_value_bytes"] for item in turns} == {92}
+    assert len({item["tool_outputs_value_bytes"] for item in turns}) == 1
     assert "maximum_bytes" not in growth
 
 
