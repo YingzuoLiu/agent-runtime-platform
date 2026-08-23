@@ -145,16 +145,46 @@ and 3.12:
 tests/conformance/test_run_store_contract.py
 tests/conformance/test_workflow_store_contract.py
 tests/conformance/test_execution_plane_contract.py
+tests/conformance/test_quarantine_evidence_contract.py
 ```
 
 A separate PostgreSQL mechanics file verifies schema bootstrap/version rejection, independent
 server connections, server-time lease authority, exact injected-clock expiry, transaction
-rollback/connection close behavior, reopen durability, expected database constraints, and test
-schema isolation.
+rollback/connection close behavior, reopen durability, expected database constraints, stale
+checkpoint-CAS rejection, and test schema isolation.
 
 The portability claim is behavioral: both backends must produce the same typed outcomes, durable
 state transitions, attempts, revisions, event ordering, recovery behavior, and quarantine
 semantics. It is not a claim that they share SQL, indexes, lock syntax, or query plans.
+
+### Mutation and counterfactual proof
+
+A separate PostgreSQL 16 CI job runs `tests/conformance/postgres_mutation_proof.py` after both
+PostgreSQL conformance matrix jobs pass. The runner changes source only in the ephemeral Actions
+working tree, executes the targeted semantic assertion, and restores the exact original bytes after
+each mutant. CI then requires `git diff --exit-code` so a mutation cannot leak into the submitted
+source.
+
+The proof covers these counterfactuals:
+
+| # | Counterfactual | Killing/proof test |
+| --- | --- | --- |
+| M01 | Remove the Run lease-token predicate | `test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced` |
+| M02 | Change exact lease expiry from `<=` to `<` | `test_lease_expiry_uses_the_injected_store_clock_exactly` |
+| M03 | Remove one-running-Run-per-Thread uniqueness | `test_postgres_expected_unique_and_fk_constraints_are_enforced` |
+| M04 | Remove tenant qualification from running-Thread uniqueness | `test_i4_thread_scope_allows_independent_claims` |
+| M05 | Remove the checkpoint revision CAS predicate | `test_postgres_checkpoint_write_rejects_stale_revision` |
+| M06 | Persist the full Run trace into the Thread checkpoint | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
+| M07 | Split Run/checkpoint/event completion into separately observable transactions | I6 checkpoint-write failure injection |
+| M08 | Append the terminal event outside the completion transaction | I6 terminal-event failure injection |
+| M09 | Retry an unsafe provider after an ambiguous dispatch | `test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect` |
+| M10 | Ignore the re-derived quarantine plan identity | `test_i9_workflow_evidence_change_after_plan_makes_plan_stale` |
+| M11 | Accept same-revision checkpoint evidence drift | `test_i9_same_revision_checkpoint_evidence_drift_is_detected_after_commit` |
+| M12 | Reject legal later successor checkpoint progress | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence` |
+
+M07 and M08 use the existing targeted transaction-failure injection rather than a committed
+source-text mutation. They prove the same externally observable counterfactual: a failure at those
+boundaries cannot leave a partial terminal Run, checkpoint, or event sequence.
 
 ## Application composition boundary
 
