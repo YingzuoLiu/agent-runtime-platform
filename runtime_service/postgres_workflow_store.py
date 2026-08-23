@@ -60,16 +60,24 @@ class PostgresWorkflowStore:
         connect_timeout_seconds: float = 30,
         statement_timeout_seconds: float | None = None,
         lock_timeout_seconds: float | None = None,
+        idle_in_transaction_session_timeout_seconds: float = 5.0,
         initialize: bool = True,
     ) -> None:
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
+        if idle_in_transaction_session_timeout_seconds <= 0:
+            raise ValueError(
+                "idle_in_transaction_session_timeout_seconds must be positive"
+            )
         self._dsn = dsn
         self.schema = validate_postgres_schema_name(schema)
         self._lease_clock_ms = lease_clock_ms
         self._connect_timeout_seconds = connect_timeout_seconds
         self._statement_timeout_seconds = statement_timeout_seconds
         self._lock_timeout_seconds = lock_timeout_seconds
+        self._idle_in_transaction_session_timeout_seconds = (
+            idle_in_transaction_session_timeout_seconds
+        )
         if initialize:
             initialize_postgres_schema(
                 dsn,
@@ -77,6 +85,9 @@ class PostgresWorkflowStore:
                 connect_timeout_seconds=connect_timeout_seconds,
                 statement_timeout_seconds=statement_timeout_seconds,
                 lock_timeout_seconds=lock_timeout_seconds,
+                idle_in_transaction_session_timeout_seconds=(
+                    idle_in_transaction_session_timeout_seconds
+                ),
             )
 
     def _connect(self):
@@ -86,6 +97,9 @@ class PostgresWorkflowStore:
             connect_timeout_seconds=self._connect_timeout_seconds,
             statement_timeout_seconds=self._statement_timeout_seconds,
             lock_timeout_seconds=self._lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                self._idle_in_transaction_session_timeout_seconds
+            ),
         )
 
     def ping(self) -> None:

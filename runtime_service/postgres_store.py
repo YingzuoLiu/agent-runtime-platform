@@ -84,12 +84,25 @@ class PostgresRunStore:
         connect_timeout_seconds: float = 30,
         statement_timeout_seconds: float | None = None,
         lock_timeout_seconds: float | None = None,
+        idle_in_transaction_session_timeout_seconds: float = 5.0,
         initialize: bool = True,
     ) -> None:
         if lease_operation_timeout_seconds <= 0:
             raise ValueError("lease_operation_timeout_seconds must be positive")
         if connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
+        if idle_in_transaction_session_timeout_seconds <= 0:
+            raise ValueError(
+                "idle_in_transaction_session_timeout_seconds must be positive"
+            )
+        if (
+            idle_in_transaction_session_timeout_seconds
+            <= lease_operation_timeout_seconds
+        ):
+            raise ValueError(
+                "idle_in_transaction_session_timeout_seconds must be greater than "
+                "lease_operation_timeout_seconds"
+            )
         self._dsn = dsn
         self.schema = validate_postgres_schema_name(schema)
         self._state_registry = state_registry
@@ -99,6 +112,9 @@ class PostgresRunStore:
         self._connect_timeout_seconds = connect_timeout_seconds
         self._statement_timeout_seconds = statement_timeout_seconds
         self._lock_timeout_seconds = lock_timeout_seconds
+        self._idle_in_transaction_session_timeout_seconds = (
+            idle_in_transaction_session_timeout_seconds
+        )
         if initialize:
             initialize_postgres_schema(
                 dsn,
@@ -106,6 +122,9 @@ class PostgresRunStore:
                 connect_timeout_seconds=connect_timeout_seconds,
                 statement_timeout_seconds=statement_timeout_seconds,
                 lock_timeout_seconds=lock_timeout_seconds,
+                idle_in_transaction_session_timeout_seconds=(
+                    idle_in_transaction_session_timeout_seconds
+                ),
             )
 
     def bind_state_registry(self, state_registry: StateRegistry) -> None:
@@ -127,6 +146,9 @@ class PostgresRunStore:
             connect_timeout_seconds=connect_timeout,
             statement_timeout_seconds=self._statement_timeout_seconds,
             lock_timeout_seconds=self._lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                self._idle_in_transaction_session_timeout_seconds
+            ),
         )
 
     def _lease_connect(self):
@@ -139,6 +161,9 @@ class PostgresRunStore:
             ),
             statement_timeout_seconds=self._lease_operation_timeout_seconds,
             lock_timeout_seconds=self._lease_operation_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                self._idle_in_transaction_session_timeout_seconds
+            ),
         )
 
     def _lease_now_ms(self, connection) -> int:

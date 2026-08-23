@@ -220,6 +220,7 @@ pip install -r requirements.txt -r requirements-postgres.txt
 export RUNTIME_STORE_BACKEND=postgres
 export RUNTIME_POSTGRES_DSN='postgresql://runtime:secret@127.0.0.1/runtime'
 export RUNTIME_POSTGRES_SCHEMA=agent_runtime
+export RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS=5
 export RUNTIME_TRAVEL_ACTION_PROVIDER_URL='https://provider.example/actions'
 export RUNTIME_TRAVEL_ACTION_PROVIDER_IDENTITY='travel-provider-v1'
 python -m runtime_service.postgres_bootstrap --dry-run

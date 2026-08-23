@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
+from pydantic import SecretStr
+
 from .memory import RuntimeMemoryStore, SQLiteMemoryStore
 from .run_store import RunStore
 from .store import SQLiteRunStore
@@ -25,11 +27,12 @@ class RuntimeStorageConfig:
 
     backend: RuntimeStoreBackend
     sqlite_path: Path | None = None
-    postgres_dsn: str | None = field(default=None, repr=False)
+    postgres_dsn: SecretStr | None = field(default=None, repr=False)
     postgres_schema: str | None = None
     connect_timeout_seconds: float | None = None
     statement_timeout_seconds: float | None = None
     lock_timeout_seconds: float | None = None
+    idle_in_transaction_session_timeout_seconds: float | None = None
     lease_operation_timeout_seconds: float | None = None
 
 
@@ -99,6 +102,7 @@ def resolve_runtime_storage_config(
     postgres_connect_timeout_seconds: float | None = None,
     postgres_statement_timeout_seconds: float | None = None,
     postgres_lock_timeout_seconds: float | None = None,
+    postgres_idle_in_transaction_session_timeout_seconds: float | None = None,
     postgres_lease_operation_timeout_seconds: float | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> RuntimeStorageConfig:
@@ -121,6 +125,7 @@ def resolve_runtime_storage_config(
         "RUNTIME_POSTGRES_CONNECT_TIMEOUT_SECONDS",
         "RUNTIME_POSTGRES_STATEMENT_TIMEOUT_SECONDS",
         "RUNTIME_POSTGRES_LOCK_TIMEOUT_SECONDS",
+        "RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS",
         "RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS",
     )
     has_postgres_timeout_environment = any(
@@ -133,6 +138,7 @@ def resolve_runtime_storage_config(
             postgres_connect_timeout_seconds,
             postgres_statement_timeout_seconds,
             postgres_lock_timeout_seconds,
+            postgres_idle_in_transaction_session_timeout_seconds,
             postgres_lease_operation_timeout_seconds,
         )
     )
@@ -168,34 +174,56 @@ def resolve_runtime_storage_config(
     from .postgres_schema import validate_postgres_schema_name
 
     validate_postgres_schema_name(resolved_schema)
+    connect_timeout_seconds = _resolved_seconds(
+        postgres_connect_timeout_seconds,
+        values,
+        "RUNTIME_POSTGRES_CONNECT_TIMEOUT_SECONDS",
+        5.0,
+    )
+    statement_timeout_seconds = _resolved_seconds(
+        postgres_statement_timeout_seconds,
+        values,
+        "RUNTIME_POSTGRES_STATEMENT_TIMEOUT_SECONDS",
+        30.0,
+    )
+    lock_timeout_seconds = _resolved_seconds(
+        postgres_lock_timeout_seconds,
+        values,
+        "RUNTIME_POSTGRES_LOCK_TIMEOUT_SECONDS",
+        5.0,
+    )
+    idle_in_transaction_session_timeout_seconds = _resolved_seconds(
+        postgres_idle_in_transaction_session_timeout_seconds,
+        values,
+        "RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS",
+        5.0,
+    )
+    lease_operation_timeout_seconds = _resolved_seconds(
+        postgres_lease_operation_timeout_seconds,
+        values,
+        "RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS",
+        1.0,
+    )
+    if (
+        idle_in_transaction_session_timeout_seconds
+        <= lease_operation_timeout_seconds
+    ):
+        raise RuntimeStorageConfigurationError(
+            "RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS "
+            "must be greater than "
+            "RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS"
+        )
     return RuntimeStorageConfig(
         backend=cast(RuntimeStoreBackend, selected),
-        postgres_dsn=resolved_dsn,
+        postgres_dsn=SecretStr(resolved_dsn),
         postgres_schema=resolved_schema,
-        connect_timeout_seconds=_resolved_seconds(
-            postgres_connect_timeout_seconds,
-            values,
-            "RUNTIME_POSTGRES_CONNECT_TIMEOUT_SECONDS",
-            5.0,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
         ),
-        statement_timeout_seconds=_resolved_seconds(
-            postgres_statement_timeout_seconds,
-            values,
-            "RUNTIME_POSTGRES_STATEMENT_TIMEOUT_SECONDS",
-            30.0,
-        ),
-        lock_timeout_seconds=_resolved_seconds(
-            postgres_lock_timeout_seconds,
-            values,
-            "RUNTIME_POSTGRES_LOCK_TIMEOUT_SECONDS",
-            5.0,
-        ),
-        lease_operation_timeout_seconds=_resolved_seconds(
-            postgres_lease_operation_timeout_seconds,
-            values,
-            "RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS",
-            1.0,
-        ),
+        lease_operation_timeout_seconds=lease_operation_timeout_seconds,
     )
 
 
@@ -222,6 +250,7 @@ def build_runtime_store_bundle(config: RuntimeStorageConfig) -> RuntimeStoreBund
     assert config.connect_timeout_seconds is not None
     assert config.statement_timeout_seconds is not None
     assert config.lock_timeout_seconds is not None
+    assert config.idle_in_transaction_session_timeout_seconds is not None
     assert config.lease_operation_timeout_seconds is not None
 
     from .postgres_memory_store import PostgresMemoryStore
@@ -229,37 +258,50 @@ def build_runtime_store_bundle(config: RuntimeStorageConfig) -> RuntimeStoreBund
     from .postgres_store import PostgresRunStore
     from .postgres_workflow_store import PostgresWorkflowStore
 
+    dsn = config.postgres_dsn.get_secret_value()
     versions = validate_postgres_application_schema(
-        config.postgres_dsn,
+        dsn,
         schema=config.postgres_schema,
         connect_timeout_seconds=config.connect_timeout_seconds,
         statement_timeout_seconds=config.statement_timeout_seconds,
         lock_timeout_seconds=config.lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            config.idle_in_transaction_session_timeout_seconds
+        ),
     )
     return RuntimeStoreBundle(
         run_store=PostgresRunStore(
-            config.postgres_dsn,
+            dsn,
             schema=config.postgres_schema,
             lease_operation_timeout_seconds=config.lease_operation_timeout_seconds,
             connect_timeout_seconds=config.connect_timeout_seconds,
             statement_timeout_seconds=config.statement_timeout_seconds,
             lock_timeout_seconds=config.lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                config.idle_in_transaction_session_timeout_seconds
+            ),
             initialize=False,
         ),
         memory_store=PostgresMemoryStore(
-            config.postgres_dsn,
+            dsn,
             schema=config.postgres_schema,
             connect_timeout_seconds=config.connect_timeout_seconds,
             statement_timeout_seconds=config.statement_timeout_seconds,
             lock_timeout_seconds=config.lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                config.idle_in_transaction_session_timeout_seconds
+            ),
             initialize=False,
         ),
         workflow_store=PostgresWorkflowStore(
-            config.postgres_dsn,
+            dsn,
             schema=config.postgres_schema,
             connect_timeout_seconds=config.connect_timeout_seconds,
             statement_timeout_seconds=config.statement_timeout_seconds,
             lock_timeout_seconds=config.lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                config.idle_in_transaction_session_timeout_seconds
+            ),
             initialize=False,
         ),
         metadata=RuntimeStorageMetadata(
@@ -271,6 +313,9 @@ def build_runtime_store_bundle(config: RuntimeStorageConfig) -> RuntimeStoreBund
                 "connect_timeout_seconds": config.connect_timeout_seconds,
                 "statement_timeout_seconds": config.statement_timeout_seconds,
                 "lock_timeout_seconds": config.lock_timeout_seconds,
+                "idle_in_transaction_session_timeout_seconds": (
+                    config.idle_in_transaction_session_timeout_seconds
+                ),
                 "lease_operation_timeout_seconds": (
                     config.lease_operation_timeout_seconds
                 ),

@@ -71,6 +71,7 @@ def open_postgres_connection(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> Connection[dict[str, object]]:
     """Open one explicit autocommit connection scoped to ``schema``.
 
@@ -80,6 +81,10 @@ def open_postgres_connection(
     """
 
     validate_postgres_schema_name(schema)
+    if idle_in_transaction_session_timeout_seconds <= 0:
+        raise ValueError(
+            "idle_in_transaction_session_timeout_seconds must be positive"
+        )
     timeout = max(1, int(connect_timeout_seconds + 0.999))
     try:
         connection = psycopg.connect(
@@ -103,6 +108,14 @@ def open_postgres_connection(
                 "SELECT set_config('lock_timeout', %s, false)",
                 (f"{milliseconds}ms",),
             )
+        idle_milliseconds = max(
+            1,
+            int(idle_in_transaction_session_timeout_seconds * 1000),
+        )
+        connection.execute(
+            "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
+            (f"{idle_milliseconds}ms",),
+        )
         return connection
     except psycopg.Error as exc:
         raise PostgresSchemaError("PostgreSQL connection setup failed") from exc
@@ -116,6 +129,7 @@ def postgres_connection(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> Iterator[Connection[dict[str, object]]]:
     connection = open_postgres_connection(
         dsn,
@@ -123,6 +137,9 @@ def postgres_connection(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     )
     try:
         yield connection
@@ -137,6 +154,7 @@ def initialize_postgres_schema(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> None:
     """Create or validate the explicit v1 PostgreSQL execution-plane schema.
 
@@ -184,6 +202,9 @@ def initialize_postgres_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     ) as connection:
         try:
             with connection.transaction():
@@ -427,6 +448,7 @@ def initialize_postgres_memory_schema(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> None:
     """Install or validate the versioned Memory component beside schema v1.
 
@@ -443,6 +465,9 @@ def initialize_postgres_memory_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     )
     with postgres_connection(
         dsn,
@@ -450,6 +475,9 @@ def initialize_postgres_memory_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     ) as connection:
         try:
             with connection.transaction():
@@ -669,6 +697,7 @@ def validate_postgres_application_schema(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> dict[str, int]:
     """Validate the complete application schema without mutating it."""
 
@@ -688,6 +717,9 @@ def validate_postgres_application_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     ) as connection:
         try:
             with connection.transaction():
@@ -737,6 +769,7 @@ def bootstrap_postgres_application_schema(
     connect_timeout_seconds: float = 30,
     statement_timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    idle_in_transaction_session_timeout_seconds: float = 5.0,
 ) -> dict[str, int]:
     """Apply the bounded v1 components and reread their authoritative shape."""
 
@@ -746,6 +779,9 @@ def bootstrap_postgres_application_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     )
     return validate_postgres_application_schema(
         dsn,
@@ -753,6 +789,9 @@ def bootstrap_postgres_application_schema(
         connect_timeout_seconds=connect_timeout_seconds,
         statement_timeout_seconds=statement_timeout_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
+        idle_in_transaction_session_timeout_seconds=(
+            idle_in_transaction_session_timeout_seconds
+        ),
     )
 
 

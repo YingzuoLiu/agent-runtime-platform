@@ -44,10 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         assert config.connect_timeout_seconds is not None
         assert config.statement_timeout_seconds is not None
         assert config.lock_timeout_seconds is not None
+        assert config.idle_in_transaction_session_timeout_seconds is not None
+        dsn = config.postgres_dsn.get_secret_value()
 
         if args.dry_run:
             status = inspect_postgres_application_schema(
-                config.postgres_dsn,
+                dsn,
                 schema=config.postgres_schema,
                 connect_timeout_seconds=config.connect_timeout_seconds,
             )
@@ -72,18 +74,24 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             versions = bootstrap_postgres_application_schema(
-                config.postgres_dsn,
+                dsn,
                 schema=config.postgres_schema,
                 connect_timeout_seconds=config.connect_timeout_seconds,
                 statement_timeout_seconds=config.statement_timeout_seconds,
                 lock_timeout_seconds=config.lock_timeout_seconds,
+                idle_in_transaction_session_timeout_seconds=(
+                    config.idle_in_transaction_session_timeout_seconds
+                ),
             )
             validated = validate_postgres_application_schema(
-                config.postgres_dsn,
+                dsn,
                 schema=config.postgres_schema,
                 connect_timeout_seconds=config.connect_timeout_seconds,
                 statement_timeout_seconds=config.statement_timeout_seconds,
                 lock_timeout_seconds=config.lock_timeout_seconds,
+                idle_in_transaction_session_timeout_seconds=(
+                    config.idle_in_transaction_session_timeout_seconds
+                ),
             )
             if validated != versions:
                 raise PostgresSchemaError(

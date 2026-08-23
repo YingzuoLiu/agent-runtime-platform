@@ -185,6 +185,7 @@ def create_app(
     postgres_connect_timeout_seconds: float | None = None,
     postgres_statement_timeout_seconds: float | None = None,
     postgres_lock_timeout_seconds: float | None = None,
+    postgres_idle_in_transaction_session_timeout_seconds: float | None = None,
     postgres_lease_operation_timeout_seconds: float | None = None,
     worker_count: int | None = None,
     authenticator: Authenticator | None = None,
@@ -206,6 +207,9 @@ def create_app(
         postgres_connect_timeout_seconds=postgres_connect_timeout_seconds,
         postgres_statement_timeout_seconds=postgres_statement_timeout_seconds,
         postgres_lock_timeout_seconds=postgres_lock_timeout_seconds,
+        postgres_idle_in_transaction_session_timeout_seconds=(
+            postgres_idle_in_transaction_session_timeout_seconds
+        ),
         postgres_lease_operation_timeout_seconds=(
             postgres_lease_operation_timeout_seconds
         ),

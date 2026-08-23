@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict, astuple
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from runtime_service.memory import SQLiteMemoryStore
 from runtime_service.storage import (
@@ -48,18 +51,25 @@ def test_postgres_configuration_is_secret_safe_and_bounded() -> None:
             "RUNTIME_POSTGRES_CONNECT_TIMEOUT_SECONDS": "3",
             "RUNTIME_POSTGRES_STATEMENT_TIMEOUT_SECONDS": "20",
             "RUNTIME_POSTGRES_LOCK_TIMEOUT_SECONDS": "4",
+            "RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS": "2",
             "RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS": "0.5",
         }
     )
 
     assert config.backend == "postgres"
-    assert config.postgres_dsn == secret_dsn
+    assert isinstance(config.postgres_dsn, SecretStr)
+    assert config.postgres_dsn.get_secret_value() == secret_dsn
     assert config.postgres_schema == "runtime_prod"
     assert config.connect_timeout_seconds == 3
     assert config.statement_timeout_seconds == 20
     assert config.lock_timeout_seconds == 4
+    assert config.idle_in_transaction_session_timeout_seconds == 2
     assert config.lease_operation_timeout_seconds == 0.5
-    assert secret_dsn not in repr(config)
+    projections = (config, asdict(config), astuple(config))
+    for projection in projections:
+        assert secret_dsn not in repr(projection)
+        assert secret_dsn not in str(projection)
+        assert secret_dsn not in json.dumps(projection, default=str)
 
 
 @pytest.mark.parametrize(
@@ -82,6 +92,17 @@ def test_postgres_configuration_is_secret_safe_and_bounded() -> None:
             "backend": "postgres",
             "postgres_dsn": "postgresql://secret",
             "postgres_connect_timeout_seconds": 0,
+        },
+        {
+            "backend": "postgres",
+            "postgres_dsn": "postgresql://secret",
+            "postgres_idle_in_transaction_session_timeout_seconds": 0,
+        },
+        {
+            "backend": "postgres",
+            "postgres_dsn": "postgresql://secret",
+            "postgres_idle_in_transaction_session_timeout_seconds": 1,
+            "postgres_lease_operation_timeout_seconds": 1,
         },
     ],
 )

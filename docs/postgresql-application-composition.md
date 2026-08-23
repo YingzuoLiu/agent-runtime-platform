@@ -32,8 +32,8 @@ deterministic startup decisions:
 | complete authority | one bundle constructs Run, Workflow, and Memory together | SQLite path plus PostgreSQL settings rejected |
 | schema ownership | explicit bootstrap command | workers never create or migrate schema |
 | compatibility | read-only metadata and shape validation before manager start | missing/incompatible components fail closed |
-| credential exposure | DSN read from environment and excluded from metadata/errors | readiness and CLI output never include DSN |
-| connection budget | short-lived per-operation connections with finite connect/statement/lock budgets | operations fail within configured bounds |
+| credential exposure | DSN read from environment, wrapped as `SecretStr`, and excluded from metadata/errors | readiness, CLI output, repr, and dataclass projections never include DSN material |
+| connection budget | short-lived per-operation connections with finite connect/statement/lock/idle-transaction budgets | statements, lock waits, and stalled transaction holders fail within configured bounds |
 | external provider boundary | PostgreSQL composition requires injected or HTTP provider | no implicit provider-side SQLite file |
 
 ## Configuration
@@ -54,6 +54,7 @@ export RUNTIME_POSTGRES_SCHEMA=agent_runtime
 export RUNTIME_POSTGRES_CONNECT_TIMEOUT_SECONDS=5
 export RUNTIME_POSTGRES_STATEMENT_TIMEOUT_SECONDS=30
 export RUNTIME_POSTGRES_LOCK_TIMEOUT_SECONDS=5
+export RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS=5
 export RUNTIME_POSTGRES_LEASE_OPERATION_TIMEOUT_SECONDS=1
 ```
 
@@ -68,6 +69,7 @@ The following combinations fail before work begins:
 - SQLite plus any PostgreSQL DSN, schema, or timeout configuration;
 - an invalid PostgreSQL schema identifier;
 - non-positive or greater-than-300-second PostgreSQL timeout budgets.
+- an idle-in-transaction timeout that is not greater than the lease-operation timeout.
 
 ## Bootstrap and startup
 
@@ -115,16 +117,31 @@ test double and is never selected implicitly by the PostgreSQL composition.
       "connect_timeout_seconds": 5.0,
       "statement_timeout_seconds": 30.0,
       "lock_timeout_seconds": 5.0,
+      "idle_in_transaction_session_timeout_seconds": 5.0,
       "lease_operation_timeout_seconds": 1.0
     }
   }
 }
 ```
 
-The DSN is never stored in application state or returned by readiness. This phase deliberately
-keeps the already-proven open/use/close lifecycle instead of introducing a pool without a measured
-need. Autocommit outside explicit transactions prevents ordinary reads from becoming idle in
-transaction; PostgreSQL application tests verify no such session remains after restart/admin flows.
+The DSN is never stored in application state or returned by readiness. `RuntimeStorageConfig`
+retains it as `SecretStr`, so ordinary repr/serialization helpers such as `asdict()` and
+`astuple()` preserve redaction. Code at the connection boundary must explicitly unwrap it.
+
+`/health` and `/ready` intentionally remain unauthenticated for container/orchestrator probes. The
+readiness payload exposes the selected backend, schema compatibility version, and public timeout
+policy, but no host, port, database, username, DSN, or credential material. Deployments that do not
+want this operational fingerprint exposed publicly should restrict the probe routes at their
+ingress or service-mesh boundary rather than giving the health probe a business API credential.
+
+This phase deliberately keeps the already-proven open/use/close lifecycle instead of introducing
+a pool without a measured need. Autocommit outside explicit transactions prevents ordinary reads
+from becoming idle in transaction. A finite PostgreSQL
+`idle_in_transaction_session_timeout` terminates a connection that stalls while holding an
+explicit transaction; it is configured above the bounded lease-operation timeout. Application
+tests prove the server setting is active, a deliberately stalled holder is terminated, and no
+idle-in-transaction session is leaked after restart/admin flows. Normal transient transaction
+states may still be observable while a transaction is actively progressing.
 
 ## Application proof and Cross-PR scan
 

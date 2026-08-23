@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -206,9 +207,43 @@ def test_postgres_store_bundle_uses_one_validated_authority(
         "memory": 1,
     }
     assert backend.dsn not in json.dumps(bundle.metadata.public_dict())
+    assert bundle.metadata.connection_policy[
+        "idle_in_transaction_session_timeout_seconds"
+    ] == 5.0
+    connection = bundle.run_store._connect()
+    try:
+        timeout = connection.execute(
+            """
+            SELECT extract(
+                epoch FROM current_setting('idle_in_transaction_session_timeout')::interval
+            ) AS seconds
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert timeout is not None and float(timeout["seconds"]) == 5.0
     bundle.run_store.ping()
     bundle.memory_store.ping()
     bundle.workflow_store.ping()
+
+
+def test_postgres_stalled_transaction_holder_is_terminated(
+    store_backend: StoreConformanceBackend,
+) -> None:
+    backend = _postgres_backend(store_backend)
+    connection = open_postgres_connection(
+        backend.dsn,
+        schema=backend.schema,
+        idle_in_transaction_session_timeout_seconds=0.25,
+    )
+    try:
+        connection.execute("BEGIN")
+        connection.execute("SELECT 1").fetchone()
+        time.sleep(0.75)
+        with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout):
+            connection.execute("SELECT 1").fetchone()
+    finally:
+        connection.close()
 
 
 def test_postgres_application_never_falls_back_to_sqlite_provider(
@@ -262,6 +297,7 @@ def test_postgres_application_processes_restarts_and_administers_memory(
                 "connect_timeout_seconds": 5.0,
                 "statement_timeout_seconds": 30.0,
                 "lock_timeout_seconds": 5.0,
+                "idle_in_transaction_session_timeout_seconds": 5.0,
                 "lease_operation_timeout_seconds": 1.0,
             },
         }
