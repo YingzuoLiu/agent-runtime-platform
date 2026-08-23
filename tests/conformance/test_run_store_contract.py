@@ -10,7 +10,7 @@ from runtime_service.store import (
     ThreadCheckpointRevisionConflictError,
 )
 
-from .backends import InjectedConformanceFailure, SQLiteConformanceBackend
+from .backends import InjectedConformanceFailure, StoreConformanceBackend
 from .scenarios import (
     LEASE_SECONDS,
     TENANT_ID,
@@ -22,7 +22,7 @@ from .scenarios import (
 
 
 def test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     first_store = store_backend.open_run_store()
     second_store = store_backend.open_run_store()
@@ -85,7 +85,7 @@ def test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced(
 
 
 def test_i3_one_running_run_per_tenant_qualified_thread(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     first_store = store_backend.open_run_store()
     second_store = store_backend.open_run_store()
@@ -123,7 +123,7 @@ def test_i3_one_running_run_per_tenant_qualified_thread(
     ids=["different-threads", "same-thread-name-different-tenants"],
 )
 def test_i4_thread_scope_allows_independent_claims(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
     first_tenant: str,
     first_thread: str,
     second_tenant: str,
@@ -155,7 +155,7 @@ def test_i4_thread_scope_allows_independent_claims(
 
 
 def test_i5_checkpoint_load_and_completion_require_expected_revision(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_run_store()
     create_queued_run(store, "run-checkpoint-seed", thread_id="cas-thread", order=1)
@@ -249,7 +249,7 @@ def test_i5_checkpoint_load_and_completion_require_expected_revision(
     ["checkpoint.write", "checkpoint.saved", "run.completed"],
 )
 def test_i6_completion_checkpoint_and_required_events_commit_atomically(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
     failure_point: str,
 ) -> None:
     store = store_backend.open_run_store()
@@ -336,7 +336,7 @@ def test_i6_completion_checkpoint_and_required_events_commit_atomically(
 
 
 def test_failure_and_cancellation_preserve_checkpoint_revision(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_run_store()
     create_queued_run(store, "run-terminal-seed", thread_id="terminal-thread", order=1)
@@ -416,7 +416,7 @@ def test_failure_and_cancellation_preserve_checkpoint_revision(
 
 
 def test_lease_expiry_uses_the_injected_store_clock_exactly(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_run_store()
     create_queued_run(store, "run-exact-expiry", thread_id="exact-expiry", order=1)

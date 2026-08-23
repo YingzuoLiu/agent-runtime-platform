@@ -9,13 +9,13 @@ from .quarantine import (
     QuarantineTargetNotFoundError,
 )
 from .registry import AgentRegistry
-from .store import SQLiteRunStore
+from .run_store import RunStore
 
 
 class QuarantineResolutionService:
     """Deterministic operator service; it never invokes Runtime or a provider."""
 
-    def __init__(self, *, store: SQLiteRunStore, registry: AgentRegistry) -> None:
+    def __init__(self, *, store: RunStore, registry: AgentRegistry) -> None:
         self.store = store
         self.registry = registry
 

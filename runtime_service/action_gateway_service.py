@@ -29,11 +29,9 @@ from .canonical import stable_hash
 from .external_actions import ExternalActionProviderRegistry
 from .manager import RuntimeManager
 from .models import RunCreateRequest, RunRecord, RunStatus
+from .run_store import RunStore
 from .sandbox import ToolRetryMode
-from .store import (
-    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
-    SQLiteRunStore,
-)
+from .store import THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
 from .workflow_store import (
     ExternalActionRecord,
     ExternalActionStatus,
@@ -587,7 +585,7 @@ class DurableActionGateway:
         self,
         *,
         manager: RuntimeManager,
-        run_store: SQLiteRunStore,
+        run_store: RunStore,
         workflow_store: WorkflowStore,
         provider_registry: ExternalActionProviderRegistry,
     ) -> None:

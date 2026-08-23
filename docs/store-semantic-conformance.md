@@ -1,161 +1,243 @@
 # Store Semantic Conformance
 
-This suite turns the durable execution plane's storage guarantees into adapter-driven executable
-scenarios. It records the SQLite reference semantics through observable outcomes, not through
-matching method names, schemas, SQL, indexes, or query plans.
+This suite turns the durable execution plane's storage guarantees into backend-driven executable
+scenarios. It defines observable semantics rather than requiring matching schemas, SQL, indexes,
+locking syntax, or query plans.
 
-The current passing implementation is the SQLite single-host reference execution plane. This
-document does **not** claim that `WorkflowStore` covers the entire execution plane:
+The suite now has two implementations:
 
-- `WorkflowStore` covers workflow executions, tool calls, external actions, and the workflow event
-  ledger.
-- Run claim, lease, Thread scheduling, checkpoint revision CAS, Run events, and quarantine remain
-  public behaviors of `SQLiteRunStore`.
-- `RuntimeManager` still depends directly on `SQLiteRunStore`.
+- SQLite, the default single-host application backend;
+- PostgreSQL, an execution-plane Run/Workflow backend exercised in CI against PostgreSQL 16.
 
-Only the SQLite adapter exists today, so this PR is not evidence of cross-backend compatibility. A
-future backend is not interchangeable merely because its method signatures resemble SQLite. It must
-execute the applicable scenarios through its own test-side adapter and produce the same typed
-outcomes, durable state, event order, revisions, attempts, and sanitized error codes.
+The portability claim is deliberately narrow. Both backends are required to preserve the same Run
+ownership, fencing, Thread serialization, checkpoint CAS, external-action recovery, and quarantine
+semantics. The default API composition remains SQLite because this phase does not add a PostgreSQL
+Memory Store or an application backend selector.
 
 ## Contract layers
 
 ### 1. Workflow Store Contract
 
-`tests/conformance/test_workflow_store_contract.py` drives the existing `WorkflowStore` surface.
+`tests/conformance/test_workflow_store_contract.py` drives the structural `WorkflowStore` surface.
 It covers execution and step identity, attempt-token fencing, dispatch-token fencing,
 prepare-before-dispatch, cancellation arbitration, transition/event atomicity, append-only event
 ordering, and restart-visible committed writes.
 
+Both `SQLiteWorkflowStore` and `PostgresWorkflowStore` execute these scenarios.
+
 ### 2. Run Store Behavioral Contract
 
-`tests/conformance/test_run_store_contract.py` drives public `SQLiteRunStore` behavior through a
-test-only backend bundle. It covers Run claim and exact lease expiry, stale lease fencing,
-tenant-qualified Thread scheduling, revision-qualified checkpoint loads, completion CAS, atomic
-full-Run/projected-checkpoint/event completion, failure/cancellation checkpoint preservation, and
-restart-visible writes.
+`tests/conformance/test_run_store_contract.py` drives the consumer-facing `RunStore` behavior. The
+production `RunStore` protocol is intentionally consumer-driven: it contains the operations used by
+RuntimeManager, the API/Action consumers, and quarantine resolution rather than exposing database
+paths, SQL connections, or test-only fault hooks.
 
-The bundle is deliberately not a production `RunStore` protocol. It exists only to create and
-reopen stores, inject a store clock, synchronize races, and inject backend-specific failures.
+The shared tests cover Run claim and exact lease expiry, stale lease fencing, tenant-qualified Thread
+scheduling, revision-qualified checkpoint loads, completion CAS, atomic full-Run/projected-checkpoint
+completion, failure/cancellation checkpoint preservation, and restart-visible writes.
+
+Test-only backend adapters remain responsible for resource setup, deterministic clocks, race
+synchronization, and equivalent fault injection.
 
 ### 3. Composite Execution-Plane Contract
 
-`tests/conformance/test_execution_plane_contract.py` retains semantics that genuinely cross the Run
-store, Workflow store, `RuntimeManager`, and external-action recovery coordinator. It proves that an
-ambiguous unsafe effect is reconciled before same-Thread successor work and that checkpoint drift
-during external-action reconciliation enters an inspectable, nonterminal quarantine. I9 adds the
-narrow operator path across the same Run/checkpoint/workflow/action tables: only an unchanged plan
-with terminal external evidence may atomically fail the Run and release its Thread.
+`tests/conformance/test_execution_plane_contract.py` retains semantics that cross Run storage,
+Workflow storage, `RuntimeManager`, and external-action recovery. It proves that an ambiguous unsafe
+effect is reconciled before same-Thread successor work, that checkpoint drift during recovery enters
+an inspectable nonterminal quarantine, and that the narrow operator resolution path can release only
+an unchanged eligible quarantine while preserving authoritative evidence.
+
+For PostgreSQL, the Run/checkpoint/workflow/tool/action/event tables needed by these scenarios live in
+one PostgreSQL schema so the same cross-ledger transactions remain possible.
+
+### 4. Quarantine Evidence Integrity Contract
+
+`tests/conformance/test_quarantine_evidence_contract.py` targets the evidence fingerprint itself. It
+proves that workflow evidence added after dry-run makes an apply plan stale, and that a checkpoint
+whose content changes without a revision advance is detected during post-commit verification. These
+scenarios use test-only out-of-band evidence writers in both backend adapters; production consumers
+do not receive those mutation hooks.
+
+## Backend selection
+
+The shared fixture is selected explicitly:
+
+```text
+STORE_CONFORMANCE_BACKENDS=sqlite
+STORE_CONFORMANCE_BACKENDS=postgres
+```
+
+PostgreSQL selection also requires:
+
+```text
+TEST_POSTGRES_DSN=postgresql://...
+```
+
+If PostgreSQL is requested without a DSN, collection fails as a configuration error. The suite does
+not convert a missing PostgreSQL environment into a skip and then claim portability.
+
+GitHub Actions runs the same four shared files once with SQLite and once with PostgreSQL on Python
+3.11 and 3.12. PostgreSQL-specific schema and connection mechanics remain in
+`tests/conformance/test_postgres_backend.py`; they are not mixed into the shared semantic scenarios.
 
 ## Invariant matrix
 
-Every test below executes through the reference-adapter fixture. Its only current parameter is
-`[sqlite]`; the parameter provides stable test IDs but does not by itself prove portability.
+Every invariant below is asserted through the same scenario semantics for SQLite and PostgreSQL.
+Backend-specific test IDs differ only by the fixture parameter suffix.
 
-| Invariant | Setup | Operation / race / failure injection | Externally observable result | Executable test ID |
+| Invariant | Setup | Operation / race / failure injection | Externally observable result | Executable evidence |
 | --- | --- | --- | --- | --- |
-| **I1 One live owner per Run attempt** | One queued Run; two store instances share durable storage and an injected clock. | Two claims cross an explicit `threading.Barrier`; a second claim is attempted before expiry, then the clock advances to the exact lease boundary. | Exactly one initial claim exists; no unexpired double-owner appears; takeover increments `attempt`, rotates the lease token, and records `lease_expired`. | `tests/conformance/test_run_store_contract.py::test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced[sqlite]`; `...::test_lease_expiry_uses_the_injected_store_clock_exactly[sqlite]` |
-| **I2 Stale attempt can never mutate durable state** | A replacement attempt owns the Run after exact clock-driven expiry; a Workflow step also has a newer attempt token after interrupted recovery. | The stale Run token tries an attempt event and completion; the stale tool token tries completion. | Run writes raise/return typed lease loss; tool completion raises `StaleAttemptError`; the winning output/checkpoint persists and no stale event or result appears. | `tests/conformance/test_run_store_contract.py::test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced[sqlite]`; `tests/conformance/test_workflow_store_contract.py::test_i2_stale_tool_attempt_cannot_mutate_durable_state[sqlite]` |
-| **I3 One running Run per tenant-qualified Thread** | Two queued Runs share tenant and Thread; two store instances race. | Both claim calls cross an explicit barrier. | Exactly one Run becomes running; the successor remains queued with `attempt == 0`. | `tests/conformance/test_run_store_contract.py::test_i3_one_running_run_per_tenant_qualified_thread[sqlite]` |
-| **I4 Thread serialization is tenant-qualified** | Two queued Runs either have different Thread IDs in one tenant or the same Thread ID in different tenants. | Two stores claim concurrently through the same barrier scenario as I3. | Both Run IDs are claimed; one tenant-qualified Thread does not serialize unrelated work. | `tests/conformance/test_run_store_contract.py::test_i4_thread_scope_allows_independent_claims[sqlite-*]` |
-| **I5 Checkpoint commit requires expected revision** | A completed predecessor creates revision 1; its successor captures base revision 1. | The backend adapter injects a mixed-writer checkpoint change to revision 2; revision-qualified load and stale completion are attempted. | Load raises `ThreadCheckpointRevisionConflictError(1, 2)`; completion returns `CHECKPOINT_CONFLICT`; the Run fails with `thread_checkpoint_conflict`; revision 2 and its state are not overwritten. | `tests/conformance/test_run_store_contract.py::test_i5_checkpoint_load_and_completion_require_expected_revision[sqlite]` |
-| **I6 Terminal Run + checkpoint + required events preserve atomic semantics** | A currently leased Run returns a typed state with trace evidence. A second scenario starts from a legal legacy checkpoint with a non-empty trace before failure and cancellation. | The backend separately fails the checkpoint write, `checkpoint.saved`, and `run.completed` after the completion transaction has started; failure and cancellation then execute normally. | Every injected failure leaves the Run running with its lease, checkpoint absent, and no partial terminal events. A later commit atomically stores the full Run trace, a same-type checkpoint with `execution_trace=[]`, truthful projection counts, revision, `checkpoint.saved`, and `run.completed`. Failed/cancelled Runs preserve the legacy payload and revision. | `tests/conformance/test_run_store_contract.py::test_i6_completion_checkpoint_and_required_events_commit_atomically[sqlite-*]`; `...::test_failure_and_cancellation_preserve_checkpoint_revision[sqlite]` |
-| **I7 Recovery never guesses an ambiguous external effect** | An unsafe provider is entered once; terminal evidence write fails, leaving a durable `dispatching` action and reconciliation-pending Run; a same-Thread successor is queued. | Store and coordinator instances are recreated after exact lease expiry; recovery executes with a provider that fails the test if called. | Recovery claims the predecessor first, never calls the provider again, finalizes `outcome_unknown` with dispatch count 1, and only then permits the successor claim. The outcome and sanitized error code survive another reopen. | `tests/conformance/test_execution_plane_contract.py::test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect[sqlite]` |
-| **I8 Detected semantic conflict fails closed into inspectable quarantine** | A reconciliation-pending predecessor owns a dispatched action at checkpoint base 1; a same-Thread successor waits; the adapter injects checkpoint revision 2. | A recreated `RuntimeManager` recovers the expired predecessor. An explicit event observes quarantine; the test then recreates the store, requests cancellation, and attempts takeover. | Runtime construction never occurs. The predecessor remains nonterminal `running`, has no lease, carries `thread_checkpoint_conflict_reconciliation_pending`, and appends `checkpoint.conflict` with expected/observed revisions and quarantine disposition. Restart/takeover/cancellation do not terminalize it; the successor stays queued while another Thread remains claimable. | `tests/conformance/test_execution_plane_contract.py::test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine[sqlite]` |
-| **I9 Quarantine release requires an unchanged eligible plan and preserves authoritative evidence** | A predecessor has checkpoint base 1, a durable terminal external action, quarantine at current revision 2, and two queued same-Thread successors. | Dry-run derives an opaque plan without writes; apply rederives it in one transaction and fails the Run. The first released successor then commits revision 3 before the original commit is verified and exactly replayed after reopen. | Dry-run leaves Run/checkpoint/workflow/action/events unchanged. Apply first preserves revision 2 and identical workflow/action evidence, performs zero provider calls, and writes one resolution plus one `run.failed`. Legal successor CAS progress does not turn verification into `500` or poison delayed replay; the exact plan is reused without duplicate events while the later successor remains ordered. | `tests/conformance/test_execution_plane_contract.py::test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence[sqlite]` |
+| **I1 One live owner per Run attempt** | One queued Run; independent store instances share durable storage and a deterministic test clock. | Two claims race; a second claim is attempted before expiry; the clock advances to the exact boundary. | Exactly one initial owner exists; takeover increments `attempt`, rotates the lease token, and records `lease_expired`. | `test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced`; `test_lease_expiry_uses_the_injected_store_clock_exactly` |
+| **I2 Stale attempt can never mutate durable state** | A replacement attempt owns the Run; a Workflow step/action also has a newer attempt/dispatch token. | Old Run/tool/action authority attempts a durable mutation. | Stale writes fail with the existing typed fencing outcomes; the winning output/evidence remains authoritative. | Run-store fencing scenario plus workflow attempt/dispatch fencing scenarios |
+| **I3 One running Run per tenant-qualified Thread** | Two queued Runs share tenant and Thread; independent stores race. | Concurrent claim. | Exactly one becomes `running`; the successor remains queued with `attempt == 0`. | `test_i3_one_running_run_per_tenant_qualified_thread` plus the PostgreSQL unique-constraint mechanics proof |
+| **I4 Thread serialization is tenant-qualified** | Runs use different Threads in one tenant, or the same Thread name in different tenants. | Concurrent claim. | Both independent tenant-qualified Threads may run. | `test_i4_thread_scope_allows_independent_claims` |
+| **I5 Checkpoint commit requires expected revision** | A predecessor creates revision 1 and the successor captures base revision 1. | The adapter injects a revision-2 writer before load/completion. | Load reports expected/observed revision mismatch; stale completion returns `CHECKPOINT_CONFLICT`; revision 2 is preserved. | `test_i5_checkpoint_load_and_completion_require_expected_revision`; `test_postgres_checkpoint_write_rejects_stale_revision` |
+| **I6 Run + projected checkpoint + required events are atomic** | A leased Run has typed final state and trace evidence. | Equivalent failures are injected at checkpoint write, `checkpoint.saved`, and `run.completed`. | No partial terminal state survives. A later success stores full Run trace, checkpoint `execution_trace=[]`, one revision advance, truthful projection evidence, and terminal events together. Failure/cancellation preserve the prior checkpoint. | `test_i6_completion_checkpoint_and_required_events_commit_atomically`; `test_failure_and_cancellation_preserve_checkpoint_revision` |
+| **I7 Recovery never guesses an ambiguous external effect** | An unsafe effect is durably dispatching when terminal evidence persistence fails; a same-Thread successor waits. | Storage/coordinator objects restart and the expired predecessor is recovered. | Recovery never calls the unsafe provider again; uncertainty is reconciled first; only then may successor work proceed. | `test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect` |
+| **I8 Semantic conflict fails closed into inspectable quarantine** | Reconciliation-pending work has checkpoint base 1; current checkpoint is externally advanced to 2. | A recreated manager recovers the expired predecessor. | Runtime construction does not proceed; the Run remains nonterminal, lease-free, visibly quarantined, and continues blocking its same-Thread successor. | `test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine` |
+| **I9 Quarantine release requires an unchanged eligible plan and evidence** | Quarantined predecessor has terminal external evidence and queued same-Thread successors. | Dry-run derives a plan; workflow/checkpoint evidence may drift; apply rederives the plan in one transaction; later legal successor CAS progress occurs; exact replay is retried. | Changed pre-apply evidence makes the plan stale; same-revision post-commit evidence drift is detected; an unchanged apply preserves checkpoint/external evidence, writes one resolution and one Run failure, releases the Thread, tolerates later legal revision progress, and is exact-replay idempotent. | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence`; both tests in `test_quarantine_evidence_contract.py` |
+
+The shared tests intentionally do not assert a specific SQL statement, index name, identity-sequence
+value, PRAGMA, PostgreSQL isolation setting, or lock primitive. Those are implementation mechanics.
+They assert durable behavior that consumers rely on.
 
 ## Cross-PR durable checkpoint integrity
 
-The combined system property is:
+The combined system property established by the ownership, serialization, state-boundary, and
+operator-repair work is:
 
 > For one tenant-qualified Thread, only the current leased Run attempt may atomically advance the
 > checkpoint from its captured revision. A successful completion stores the full validated Run
 > result and a same-type resumable checkpoint projection together with truthful events. A stale,
 > conflicting, failed, cancelled, partially committed, or quarantined attempt cannot overwrite or
-> ambiguously reinterpret the authoritative checkpoint; operator repair may release quarantine
-> only while its evidence-bound plan remains unchanged.
+> ambiguously reinterpret the authoritative checkpoint; operator repair may release quarantine only
+> while its evidence-bound plan remains unchanged.
 
-| Property slice | Production enforcement point | Executable evidence |
-| --- | --- | --- |
-| Current writer only | Run lease token/deadline predicates in `SQLiteRunStore`; workflow/action attempt and dispatch fencing | I1, I2, I7 |
-| One ordered Thread writer | tenant-qualified running-Run unique index and claim arbitration | I3, I4 |
-| Correct predecessor | captured `checkpoint_base_revision`, revision-qualified load, completion CAS | I5; `tests/test_thread_serialization.py` |
-| Full result versus resumable projection | `project_thread_checkpoint_state()` called inside `commit_completed_run()` after result validation; distinct Run/checkpoint JSON | I6; `tests/test_checkpoint_projection.py`; `tests/test_contracts.py` |
-| One atomic observable completion | one `BEGIN IMMEDIATE` transaction covers Run update, checkpoint CAS, `checkpoint.saved`, `run.completed`, and lease clearing | I6 failures at checkpoint write and both event boundaries |
-| Truthful projection evidence | `checkpoint.saved.trace_events=0`, `run_trace_events=<full Run count>`, and `projection=execution_trace_reset` | I6; state-boundary characterization v2; API test |
-| Conflict and recovery interpretation | revision drift terminalizes ordinary completion, but reconciliation precedence enters inspectable nonterminal quarantine | I5, I7, I8 |
-| Controlled repair | plan rederivation, hash equality, terminal external evidence, and atomic resolution/Run failure | I9; quarantine-resolution unit and API tests |
+The second backend is accepted only if it preserves this system property without weakening the
+shared assertions.
 
-The scan found no production consumer that uses an earlier checkpoint trace for a decision. The
-dynamic workflow hash already excludes it; API and Demo consumers treat the completed Run state as
-Run evidence and the Thread endpoint as current resumable state. The remaining explicit assumptions
-are that SQLite is the single-host reference backend, old/new binaries do not write concurrently,
-and Run/workflow event ledgers are not claimed to reproduce every `TraceEvent` payload byte for
-byte. Projected checkpoints remain ordinary schema-v1 payloads, so inspection, restart takeover,
-conformance loading, and quarantine plan hashing require no alternate decoder.
+| Property slice | SQLite enforcement | PostgreSQL enforcement | Executable evidence |
+| --- | --- | --- | --- |
+| Current writer only | lease-token/deadline predicates inside SQLite transactions | lease-token/deadline predicates plus PostgreSQL row locking/conditional updates | I1, I2, I7 |
+| One ordered Thread writer | tenant-qualified running-Run uniqueness and claim arbitration | partial unique `(tenant_id, thread_id) WHERE status='running'` plus claim arbitration | I3, I4 |
+| Correct predecessor | captured `checkpoint_base_revision` and revision CAS | captured `checkpoint_base_revision` and revision-qualified upsert | I5, I6 |
+| Full result versus resumable projection | `project_thread_checkpoint_state()` inside terminal transaction | same typed projection inside PostgreSQL terminal transaction | I6; checkpoint-projection tests |
+| One atomic observable completion | one SQLite transaction covers Run/checkpoint/events/lease clear | one PostgreSQL transaction covers the same durable effects | I6 injected failures and M07/M08 source mutants |
+| Truthful projection evidence | persisted Run count versus projected checkpoint count | same event payload semantics | I6; state-boundary characterization |
+| Recovery interpretation | reconciliation precedence and nonterminal quarantine on drift | same shared recovery/quarantine outcomes | I7, I8 |
+| Controlled repair | plan rederivation, evidence checks, atomic resolution/failure | same logical evidence rederivation within one PostgreSQL schema/transaction domain | I9 plus quarantine evidence integrity contract |
 
-Upgrade behavior is lazy and failure-safe: an old non-empty trace is supplied unchanged to the
-first post-upgrade execution, the first successful commit advances the revision and projects it
-out, and failure/cancellation leaves it intact. CAS conflict preserves the observed checkpoint;
-transaction failures roll back both representations and their events. Quarantine repair preserves
-the checkpoint rather than re-projecting it, and the first later successful successor applies the
-normal projection boundary.
+Checkpoint projection does not change workflow identity: `dynamic_loop.py` excludes
+`execution_trace` from the dynamic workflow input hash. Therefore an old full-trace checkpoint and a
+new projected checkpoint with the same semantic state do not create a false workflow identity
+mismatch.
+
+Upgrade behavior remains lazy and failure-safe. An old non-empty checkpoint trace may be loaded by
+the first post-upgrade execution; the first successful completion advances the revision and projects
+that trace out of the resumable checkpoint. Failure, cancellation, conflict, or quarantine does not
+silently rewrite the checkpoint.
 
 ## Additional Workflow Store scenarios
 
-| Semantic contract | Observable proof | Executable test ID |
-| --- | --- | --- |
-| Execution identity | Typed `CREATED`, `EXISTING`, input mismatch, and workflow-type mismatch outcomes. | `test_workflow_execution_identity_outcomes[sqlite]` |
-| Step identity | Cached, input-mismatch, and definition-mismatch checks do not append events. | `test_workflow_step_identity_checks_do_not_append_events[sqlite]` |
-| Event order, cursor reads, and restart visibility | Sequences are contiguous; cursor reads return the suffix; a reopened store returns the same terminal execution, step, and events. | `test_workflow_event_order_cursor_and_restart_visibility[sqlite]` |
-| Prepare-before-dispatch and dispatch-token fencing | Dispatch before preparation fails; retry rotates the token; a late result raises `StaleDispatchError` and cannot finalize the current action or parent step. | `test_prepare_precedes_dispatch_and_dispatch_token_fences_late_result[sqlite]` |
-| Cancellation arbitration | Cancellation committed before first dispatch returns `RUN_CANCELLED`; action remains prepared with dispatch count 0 and has no dispatch event. | `test_cancellation_wins_before_first_external_dispatch[sqlite]` |
-| Workflow transition/event atomicity | Injected `step.completed` event failure rolls the step transition back; reopen sees the original running step and no terminal event. | `test_workflow_state_transition_and_event_append_are_atomic[sqlite]` |
-| External action / parent step / event atomicity | Injected parent `step.completed` event failure rolls back the action success, parent completion, and both terminal events. | `test_external_action_parent_step_and_events_finalize_atomically[sqlite]` |
+The workflow contract also covers:
 
-The test IDs in this table are relative to
-`tests/conformance/test_workflow_store_contract.py::` unless a full path is shown.
+- typed execution identity outcomes and mismatch detection;
+- step identity/caching mismatch rules without spurious events;
+- ordered cursor reads and reopen visibility;
+- prepare-before-dispatch and dispatch-token fencing;
+- cancellation winning before first external dispatch;
+- workflow transition/event atomicity;
+- external-action, parent-step, and terminal-event atomicity.
+
+These scenarios run unchanged against both workflow-store implementations.
 
 ## Deterministic execution rules
 
-- Lease scenarios use the injected store clock. They never sleep to wait for expiry.
+- Lease scenarios use an injected store clock; they do not sleep for expiry.
 - Claim races use explicit barriers and bounded thread joins/results.
-- Recovery closes the logical lifetime of prior objects by creating new store, coordinator, or
-  manager instances against the same durable database.
-- Composite synchronization uses `threading.Event`; it does not infer that a race occurred because
-  enough wall-clock time passed.
-- Assertions target typed outcomes, durable status, attempt, revision, event sequence/payload,
-  provider call count, and sanitized error code.
+- Recovery recreates store/coordinator/manager objects against the same durable backend.
+- Composite synchronization uses explicit events rather than wall-clock assumptions.
+- Assertions target typed outcomes, status, attempt, revision, durable event order/payload, provider
+  call count, and sanitized error codes.
+- The PostgreSQL production-clock mechanics test separately proves that a non-injected
+  `PostgresRunStore` derives lease time from the database.
 
 ## Backend adapter boundary
 
-`tests/conformance/backends.py` contains the current SQLite adapter. Its fault-injection hooks may
-use implementation knowledge to create a failure or mixed-writer condition, but the shared scenario
-does not inspect or assert SQL, PRAGMA values, index names, migrations, or query plans. Those remain
-implementation-specific tests.
+`tests/conformance/backends.py` contains `StoreConformanceBackend` plus SQLite and PostgreSQL
+implementations. This is a **test-resource** protocol, separate from the production `RunStore`
+protocol.
 
-The adapter currently returns concrete `SQLiteRunStore` objects and its failure hooks patch private
-SQLite methods or issue controlled SQL. That coupling is isolated to the adapter; it is also why the
-suite is described as an SQLite reference contract rather than a completed backend abstraction.
+Adapters may use implementation knowledge only to create equivalent conditions such as:
 
-Overlapping behavioral tests were migrated from `tests/test_run_leasing.py` and
-`tests/test_thread_serialization.py` into this directory. The original files retain SQLite-specific
-schema, index, corruption, and RuntimeManager regressions; the conformance directory is now the
-canonical home for the shared lease, Thread, CAS, and atomic-terminal semantics.
+- a checkpoint revision change from an out-of-band writer;
+- a same-revision checkpoint-content change for evidence-integrity testing;
+- an extra workflow event after a quarantine plan is derived;
+- a failure at checkpoint persistence;
+- a failure at a Run or Workflow event boundary.
 
-Adding a future backend means:
+The shared scenario cannot inspect backend SQL to decide whether it passed.
 
-1. generalize the test-side surface only as required by the real implementation;
-2. add an adapter that creates and recreates the backend and supplies equivalent clock and
-   fault-injection hooks;
-3. add it to the conformance fixture and run the same observable scenario semantics;
-4. keep backend schema/migration/performance tests separate;
-5. do not claim semantic interchangeability until all applicable scenarios pass.
+The PostgreSQL adapter creates an isolated validated schema per test and drops only that generated
+schema during cleanup. SQLite continues to use isolated temporary database files.
 
-## Explicit non-goals
+## PostgreSQL mechanics kept outside the shared contract
 
-This suite does not add PostgreSQL, Redis, a queue, multi-host coordination, arbitrary operator
-repair, a generic production store interface, a checkpoint schema change, automatic unquarantine,
-or Runtime/provider retry. It records the SQLite single-host semantics, including the one narrow
-operator resolution, in executable reference contracts prepared for reuse when a real second
-backend exists.
+`tests/conformance/test_postgres_backend.py` verifies implementation-specific facts that should not
+be generalized into cross-backend assertions:
+
+- schema bootstrap is idempotent;
+- incompatible and unversioned execution-plane schemas fail closed;
+- invalid schema identifiers are rejected;
+- independent stores use independent PostgreSQL server connections and no Python `_lock`;
+- production lease time is database-derived;
+- deterministic exact-expiry testing remains possible with the injected clock;
+- explicit transaction failure rolls back and the context closes its connection;
+- committed state survives reopen;
+- expected unique and foreign-key constraints are enforced;
+- a stale checkpoint revision cannot satisfy the PostgreSQL upsert CAS predicate;
+- generated test schemas do not leak data.
+
+## Mutation gate
+
+`tests/conformance/postgres_mutation_proof.py` makes the portability evidence mutation-sensitive.
+After the PostgreSQL 3.11 and 3.12 conformance jobs pass, a PostgreSQL 16 / Python 3.12 CI job
+applies twelve temporary source mutations and runs the targeted semantic assertion for each. Every
+mutation is restored byte-for-byte, and CI finishes the job with `git diff --exit-code`.
+
+The mutation set is sampled rather than exhaustive: it removes representative lease fencing,
+exact-expiry, Thread uniqueness/tenant qualification, checkpoint CAS/projection, transaction
+atomicity, unsafe-provider recovery, and quarantine evidence properties. In particular M01 samples
+one lease-token predicate; it is not a claim that every lease predicate was independently mutated.
+
+M07 and M08 are real source mutations rather than relabeled baseline tests. M07 commits terminal Run
+status before the checkpoint/event transaction; M08 moves `run.completed` outside the transaction.
+The existing I6 three-way failure-injection assertion kills both by observing the resulting partial
+durable state.
+
+The exact mutant-to-test mapping is documented in
+[`postgresql-store-backend.md`](postgresql-store-backend.md).
+
+## Application boundary and non-goals
+
+The default service still composes `SQLiteRunStore`, `SQLiteWorkflowStore`, and
+`SQLiteMemoryStore`. PostgreSQL is not wired into the application root in this phase. The default
+`requirements.txt` does not install Psycopg; PostgreSQL users install `requirements-postgres.txt`,
+while `requirements-dev.txt` includes it for conformance testing.
+
+This is intentional. Governed memory checks current Run/lease authority in the same storage
+transaction as memory mutation. Combining PostgreSQL Run/Workflow storage with `SQLiteMemoryStore`
+would split that authority check across databases and weaken the existing fencing property.
+
+Accordingly, this portability phase does **not** add:
+
+- a PostgreSQL Memory Store;
+- an application backend selector or `RUNTIME_DATABASE_URL`;
+- connection pooling or a migration framework;
+- a distributed queue/wake mechanism;
+- multi-replica or HA deployment claims;
+- JSONB normalization or checkpoint-schema changes;
+- Redis or another new coordination backend.
+
+The demonstrated result is storage-semantic portability for the Run/Workflow execution plane, not a
+claim that the complete application has already migrated from SQLite to PostgreSQL.

@@ -15,7 +15,7 @@ from runtime_service.workflow_store import (
     WorkflowStatus,
 )
 
-from .backends import InjectedConformanceFailure, SQLiteConformanceBackend
+from .backends import InjectedConformanceFailure, StoreConformanceBackend
 from .scenarios import (
     INPUT_HASH,
     TOOL_NAME,
@@ -28,7 +28,7 @@ from .scenarios import (
 
 
 def test_workflow_execution_identity_outcomes(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
     created = store.create_or_get_execution("workflow-identity", WORKFLOW_TYPE, INPUT_HASH)
@@ -52,7 +52,7 @@ def test_workflow_execution_identity_outcomes(
 
 
 def test_workflow_step_identity_checks_do_not_append_events(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
     store.create_or_get_execution("workflow-step-identity", WORKFLOW_TYPE, INPUT_HASH)
@@ -102,7 +102,7 @@ def test_workflow_step_identity_checks_do_not_append_events(
 
 
 def test_workflow_event_order_cursor_and_restart_visibility(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
     store.create_or_get_execution("workflow-events", WORKFLOW_TYPE, INPUT_HASH)
@@ -148,7 +148,7 @@ def test_workflow_event_order_cursor_and_restart_visibility(
 
 
 def test_i2_stale_tool_attempt_cannot_mutate_durable_state(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
     store.create_or_get_execution("workflow-attempt-fence", WORKFLOW_TYPE, INPUT_HASH)
@@ -189,7 +189,7 @@ def test_i2_stale_tool_attempt_cannot_mutate_durable_state(
 
 
 def test_prepare_precedes_dispatch_and_dispatch_token_fences_late_result(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     run_store = store_backend.open_run_store()
     store = store_backend.open_workflow_store()
@@ -271,7 +271,7 @@ def test_prepare_precedes_dispatch_and_dispatch_token_fences_late_result(
 
 
 def test_cancellation_wins_before_first_external_dispatch(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     run_store, store, run_claim, step_claim, action = create_managed_workflow(
         store_backend,
@@ -298,7 +298,7 @@ def test_cancellation_wins_before_first_external_dispatch(
 
 
 def test_workflow_state_transition_and_event_append_are_atomic(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     store = store_backend.open_workflow_store()
     store.create_or_get_execution("workflow-atomic", WORKFLOW_TYPE, INPUT_HASH)
@@ -331,7 +331,7 @@ def test_workflow_state_transition_and_event_append_are_atomic(
 
 
 def test_external_action_parent_step_and_events_finalize_atomically(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     _, store, run_claim, step_claim, action = create_managed_workflow(
         store_backend,
