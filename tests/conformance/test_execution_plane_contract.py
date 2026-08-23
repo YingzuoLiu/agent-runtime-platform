@@ -30,7 +30,7 @@ from runtime_service.store import (
 )
 from runtime_service.workflow_store import ExternalActionStatus, ToolCallStatus, WorkflowStore
 
-from .backends import InjectedConformanceFailure, SQLiteConformanceBackend
+from .backends import InjectedConformanceFailure, StoreConformanceBackend
 from .scenarios import (
     PROVIDER_IDENTITY,
     PROVIDER_NAME,
@@ -182,7 +182,7 @@ def leave_unsafe_dispatch_pending(
 
 
 def test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     run_store = store_backend.open_run_store()
     workflow_store = store_backend.open_workflow_store()
@@ -280,7 +280,7 @@ def test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect(
 
 
 def test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     run_store = store_backend.open_run_store()
     workflow_store = store_backend.open_workflow_store()
@@ -440,7 +440,7 @@ def test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine(
 
 
 def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
-    store_backend: SQLiteConformanceBackend,
+    store_backend: StoreConformanceBackend,
 ) -> None:
     run_id = "run-controlled-quarantine-resolution"
     thread_id = "controlled-quarantine-thread"
