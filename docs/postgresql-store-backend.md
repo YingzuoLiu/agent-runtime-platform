@@ -27,6 +27,22 @@ The PostgreSQL backend provides:
 `WorkflowStore` remains the existing structural workflow contract. The PostgreSQL implementation
 uses explicit PostgreSQL SQL rather than a generic SQL dialect layer or ORM.
 
+## Optional driver boundary
+
+The default SQLite runtime does not require Psycopg. `requirements.txt` remains sufficient for the
+existing application composition, and the package-level PostgreSQL exports are loaded lazily only
+when explicitly requested.
+
+Install PostgreSQL support with:
+
+```bash
+pip install -r requirements.txt -r requirements-postgres.txt
+```
+
+`requirements-dev.txt` includes both the default and PostgreSQL requirements because the test suite
+imports and exercises both backends. This keeps PostgreSQL optional for SQLite-only deployment
+without making the portability tests conditional on a missing driver.
+
 ## Transaction and ownership model
 
 ### Database time is lease authority
@@ -157,7 +173,7 @@ The portability claim is behavioral: both backends must produce the same typed o
 state transitions, attempts, revisions, event ordering, recovery behavior, and quarantine
 semantics. It is not a claim that they share SQL, indexes, lock syntax, or query plans.
 
-### Mutation and counterfactual proof
+### Mutation proof
 
 A separate PostgreSQL 16 CI job runs `tests/conformance/postgres_mutation_proof.py` after both
 PostgreSQL conformance matrix jobs pass. The runner changes source only in the ephemeral Actions
@@ -165,26 +181,30 @@ working tree, executes the targeted semantic assertion, and restores the exact o
 each mutant. CI then requires `git diff --exit-code` so a mutation cannot leak into the submitted
 source.
 
-The proof covers these counterfactuals:
+The proof is deliberately sampled rather than exhaustive: for example, M01 removes one
+representative Run lease-token predicate rather than every lease predicate in the store. Each mutant
+removes or weakens a concrete property, and the selected semantic test must fail with pytest exit 1;
+collection, usage, and internal pytest errors do not count as kills.
 
-| # | Counterfactual | Killing/proof test |
+| # | Source mutation | Killing test |
 | --- | --- | --- |
-| M01 | Remove the Run lease-token predicate | `test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced` |
+| M01 | Remove one sampled Run lease-token predicate | `test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced` |
 | M02 | Change exact lease expiry from `<=` to `<` | `test_lease_expiry_uses_the_injected_store_clock_exactly` |
 | M03 | Remove one-running-Run-per-Thread uniqueness | `test_postgres_expected_unique_and_fk_constraints_are_enforced` |
 | M04 | Remove tenant qualification from running-Thread uniqueness | `test_i4_thread_scope_allows_independent_claims` |
 | M05 | Remove the checkpoint revision CAS predicate | `test_postgres_checkpoint_write_rejects_stale_revision` |
 | M06 | Persist the full Run trace into the Thread checkpoint | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
-| M07 | Split Run/checkpoint/event completion into separately observable transactions | I6 checkpoint-write failure injection |
-| M08 | Append the terminal event outside the completion transaction | I6 terminal-event failure injection |
+| M07 | Commit terminal Run status before the checkpoint/event transaction | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
+| M08 | Move `run.completed` append outside the completion transaction | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
 | M09 | Retry an unsafe provider after an ambiguous dispatch | `test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect` |
 | M10 | Ignore the re-derived quarantine plan identity | `test_i9_workflow_evidence_change_after_plan_makes_plan_stale` |
 | M11 | Accept same-revision checkpoint evidence drift | `test_i9_same_revision_checkpoint_evidence_drift_is_detected_after_commit` |
 | M12 | Reject legal later successor checkpoint progress | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence` |
 
-M07 and M08 use the existing targeted transaction-failure injection rather than a committed
-source-text mutation. They prove the same externally observable counterfactual: a failure at those
-boundaries cannot leave a partial terminal Run, checkpoint, or event sequence.
+M07 and M08 are now real source mutations. M07 creates an observable split by committing terminal Run
+status before the transaction that should contain Run/checkpoint/events together. M08 keeps the
+normal completion transaction but moves `run.completed` outside it. The existing three-way I6 fault
+injection then kills both mutants by observing partial durable state.
 
 ## Application composition boundary
 
