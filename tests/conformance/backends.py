@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, closing, contextmanager
@@ -94,6 +95,23 @@ class StoreConformanceBackend(Protocol):
         thread_id: str,
         state: BaseRuntimeState,
         expected_revision: int,
+    ) -> None: ...
+
+    def replace_checkpoint_state_without_revision_out_of_band(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        state: BaseRuntimeState,
+        expected_revision: int,
+    ) -> None: ...
+
+    def append_workflow_event_out_of_band(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
     ) -> None: ...
 
     def close(self) -> None: ...
@@ -227,6 +245,68 @@ class SQLiteConformanceBackend:
             rowcount = cursor.rowcount
         if rowcount != 1:
             raise AssertionError("Checkpoint drift injection did not match the expected revision")
+
+    def replace_checkpoint_state_without_revision_out_of_band(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        state: BaseRuntimeState,
+        expected_revision: int,
+    ) -> None:
+        with closing(sqlite3.connect(self.database_path, timeout=30)) as connection, connection:
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            cursor = connection.execute(
+                """
+                UPDATE thread_states SET state_json = ?
+                WHERE tenant_id = ? AND thread_id = ? AND revision = ?
+                """,
+                (
+                    state.model_dump_json(),
+                    tenant_id,
+                    thread_id,
+                    expected_revision,
+                ),
+            )
+            rowcount = cursor.rowcount
+        if rowcount != 1:
+            raise AssertionError(
+                "Same-revision checkpoint evidence injection did not match the expected revision"
+            )
+
+    def append_workflow_event_out_of_band(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with closing(sqlite3.connect(self.database_path, timeout=30)) as connection, connection:
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_events (
+                    run_id, sequence, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    sequence,
+                    event_type,
+                    json.dumps(payload),
+                    "2026-08-23T00:00:00+00:00",
+                ),
+            )
 
     def close(self) -> None:
         return None
@@ -387,6 +467,75 @@ class PostgresConformanceBackend:
             connection.close()
         if row is None:
             raise AssertionError("Checkpoint drift injection did not match the expected revision")
+
+    def replace_checkpoint_state_without_revision_out_of_band(
+        self,
+        *,
+        tenant_id: str,
+        thread_id: str,
+        state: BaseRuntimeState,
+        expected_revision: int,
+    ) -> None:
+        connection = open_postgres_connection(self.dsn, schema=self.schema)
+        try:
+            with connection.transaction():
+                row = connection.execute(
+                    """
+                    UPDATE thread_states SET state_json = %s
+                    WHERE tenant_id = %s AND thread_id = %s AND revision = %s
+                    RETURNING revision
+                    """,
+                    (
+                        state.model_dump_json(),
+                        tenant_id,
+                        thread_id,
+                        expected_revision,
+                    ),
+                ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise AssertionError(
+                "Same-revision checkpoint evidence injection did not match the expected revision"
+            )
+
+    def append_workflow_event_out_of_band(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        connection = open_postgres_connection(self.dsn, schema=self.schema)
+        try:
+            with connection.transaction():
+                execution = connection.execute(
+                    "SELECT run_id FROM workflow_executions WHERE run_id = %s FOR UPDATE",
+                    (run_id,),
+                ).fetchone()
+                if execution is None:
+                    raise AssertionError("Workflow evidence injection requires an execution")
+                sequence_row = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM workflow_events WHERE run_id = %s",
+                    (run_id,),
+                ).fetchone()
+                assert sequence_row is not None
+                connection.execute(
+                    """
+                    INSERT INTO workflow_events (
+                        run_id, sequence, event_type, payload_json, created_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        run_id,
+                        int(sequence_row["sequence"]),
+                        event_type,
+                        json.dumps(payload),
+                        "2026-08-23T00:00:00+00:00",
+                    ),
+                )
+        finally:
+            connection.close()
 
     def close(self) -> None:
         validate_postgres_schema_name(self.schema)
