@@ -50,6 +50,14 @@ an unchanged eligible quarantine while preserving authoritative evidence.
 For PostgreSQL, the Run/checkpoint/workflow/tool/action/event tables needed by these scenarios live in
 one PostgreSQL schema so the same cross-ledger transactions remain possible.
 
+### 4. Quarantine Evidence Integrity Contract
+
+`tests/conformance/test_quarantine_evidence_contract.py` targets the evidence fingerprint itself. It
+proves that workflow evidence added after dry-run makes an apply plan stale, and that a checkpoint
+whose content changes without a revision advance is detected during post-commit verification. These
+scenarios use test-only out-of-band evidence writers in both backend adapters; production consumers
+do not receive those mutation hooks.
+
 ## Backend selection
 
 The shared fixture is selected explicitly:
@@ -68,7 +76,7 @@ TEST_POSTGRES_DSN=postgresql://...
 If PostgreSQL is requested without a DSN, collection fails as a configuration error. The suite does
 not convert a missing PostgreSQL environment into a skip and then claim portability.
 
-GitHub Actions runs the same three shared files once with SQLite and once with PostgreSQL on Python
+GitHub Actions runs the same four shared files once with SQLite and once with PostgreSQL on Python
 3.11 and 3.12. PostgreSQL-specific schema and connection mechanics remain in
 `tests/conformance/test_postgres_backend.py`; they are not mixed into the shared semantic scenarios.
 
@@ -81,13 +89,13 @@ Backend-specific test IDs differ only by the fixture parameter suffix.
 | --- | --- | --- | --- | --- |
 | **I1 One live owner per Run attempt** | One queued Run; independent store instances share durable storage and a deterministic test clock. | Two claims race; a second claim is attempted before expiry; the clock advances to the exact boundary. | Exactly one initial owner exists; takeover increments `attempt`, rotates the lease token, and records `lease_expired`. | `test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced`; `test_lease_expiry_uses_the_injected_store_clock_exactly` |
 | **I2 Stale attempt can never mutate durable state** | A replacement attempt owns the Run; a Workflow step/action also has a newer attempt/dispatch token. | Old Run/tool/action authority attempts a durable mutation. | Stale writes fail with the existing typed fencing outcomes; the winning output/evidence remains authoritative. | Run-store fencing scenario plus workflow attempt/dispatch fencing scenarios |
-| **I3 One running Run per tenant-qualified Thread** | Two queued Runs share tenant and Thread; independent stores race. | Concurrent claim. | Exactly one becomes `running`; the successor remains queued with `attempt == 0`. | `test_i3_one_running_run_per_tenant_qualified_thread` |
+| **I3 One running Run per tenant-qualified Thread** | Two queued Runs share tenant and Thread; independent stores race. | Concurrent claim. | Exactly one becomes `running`; the successor remains queued with `attempt == 0`. | `test_i3_one_running_run_per_tenant_qualified_thread` plus the PostgreSQL unique-constraint mechanics proof |
 | **I4 Thread serialization is tenant-qualified** | Runs use different Threads in one tenant, or the same Thread name in different tenants. | Concurrent claim. | Both independent tenant-qualified Threads may run. | `test_i4_thread_scope_allows_independent_claims` |
-| **I5 Checkpoint commit requires expected revision** | A predecessor creates revision 1 and the successor captures base revision 1. | The adapter injects a revision-2 writer before load/completion. | Load reports expected/observed revision mismatch; stale completion returns `CHECKPOINT_CONFLICT`; revision 2 is preserved. | `test_i5_checkpoint_load_and_completion_require_expected_revision` |
+| **I5 Checkpoint commit requires expected revision** | A predecessor creates revision 1 and the successor captures base revision 1. | The adapter injects a revision-2 writer before load/completion. | Load reports expected/observed revision mismatch; stale completion returns `CHECKPOINT_CONFLICT`; revision 2 is preserved. | `test_i5_checkpoint_load_and_completion_require_expected_revision`; `test_postgres_checkpoint_write_rejects_stale_revision` |
 | **I6 Run + projected checkpoint + required events are atomic** | A leased Run has typed final state and trace evidence. | Equivalent failures are injected at checkpoint write, `checkpoint.saved`, and `run.completed`. | No partial terminal state survives. A later success stores full Run trace, checkpoint `execution_trace=[]`, one revision advance, truthful projection evidence, and terminal events together. Failure/cancellation preserve the prior checkpoint. | `test_i6_completion_checkpoint_and_required_events_commit_atomically`; `test_failure_and_cancellation_preserve_checkpoint_revision` |
 | **I7 Recovery never guesses an ambiguous external effect** | An unsafe effect is durably dispatching when terminal evidence persistence fails; a same-Thread successor waits. | Storage/coordinator objects restart and the expired predecessor is recovered. | Recovery never calls the unsafe provider again; uncertainty is reconciled first; only then may successor work proceed. | `test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect` |
 | **I8 Semantic conflict fails closed into inspectable quarantine** | Reconciliation-pending work has checkpoint base 1; current checkpoint is externally advanced to 2. | A recreated manager recovers the expired predecessor. | Runtime construction does not proceed; the Run remains nonterminal, lease-free, visibly quarantined, and continues blocking its same-Thread successor. | `test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine` |
-| **I9 Quarantine release requires an unchanged eligible plan** | Quarantined predecessor has terminal external evidence and queued same-Thread successors. | Dry-run derives a plan; apply rederives it in one transaction; later legal successor CAS progress occurs; exact replay is retried. | Dry-run writes nothing. Apply preserves checkpoint and external evidence, writes one resolution and one Run failure, releases the Thread, tolerates later legal revision progress, and is exact-replay idempotent. | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence` |
+| **I9 Quarantine release requires an unchanged eligible plan and evidence** | Quarantined predecessor has terminal external evidence and queued same-Thread successors. | Dry-run derives a plan; workflow/checkpoint evidence may drift; apply rederives the plan in one transaction; later legal successor CAS progress occurs; exact replay is retried. | Changed pre-apply evidence makes the plan stale; same-revision post-commit evidence drift is detected; an unchanged apply preserves checkpoint/external evidence, writes one resolution and one Run failure, releases the Thread, tolerates later legal revision progress, and is exact-replay idempotent. | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence`; both tests in `test_quarantine_evidence_contract.py` |
 
 The shared tests intentionally do not assert a specific SQL statement, index name, identity-sequence
 value, PRAGMA, PostgreSQL isolation setting, or lock primitive. Those are implementation mechanics.
@@ -117,7 +125,7 @@ shared assertions.
 | One atomic observable completion | one SQLite transaction covers Run/checkpoint/events/lease clear | one PostgreSQL transaction covers the same durable effects | I6 injected failures |
 | Truthful projection evidence | persisted Run count versus projected checkpoint count | same event payload semantics | I6; state-boundary characterization |
 | Recovery interpretation | reconciliation precedence and nonterminal quarantine on drift | same shared recovery/quarantine outcomes | I7, I8 |
-| Controlled repair | plan rederivation, evidence checks, atomic resolution/failure | same logical evidence rederivation within one PostgreSQL schema/transaction domain | I9 |
+| Controlled repair | plan rederivation, evidence checks, atomic resolution/failure | same logical evidence rederivation within one PostgreSQL schema/transaction domain | I9 plus quarantine evidence integrity contract |
 
 Checkpoint projection does not change workflow identity: `dynamic_loop.py` excludes
 `execution_trace` from the dynamic workflow input hash. Therefore an old full-trace checkpoint and a
@@ -163,6 +171,8 @@ protocol.
 Adapters may use implementation knowledge only to create equivalent conditions such as:
 
 - a checkpoint revision change from an out-of-band writer;
+- a same-revision checkpoint-content change for evidence-integrity testing;
+- an extra workflow event after a quarantine plan is derived;
 - a failure at checkpoint persistence;
 - a failure at a Run or Workflow event boundary.
 
@@ -185,9 +195,24 @@ be generalized into cross-backend assertions:
 - explicit transaction failure rolls back and the context closes its connection;
 - committed state survives reopen;
 - expected unique and foreign-key constraints are enforced;
+- a stale checkpoint revision cannot satisfy the PostgreSQL upsert CAS predicate;
 - generated test schemas do not leak data.
 
-See [`postgresql-store-backend.md`](postgresql-store-backend.md) for the implementation boundary.
+## Mutation and counterfactual gate
+
+`tests/conformance/postgres_mutation_proof.py` makes the portability evidence mutation-sensitive.
+After the PostgreSQL 3.11 and 3.12 conformance jobs pass, a PostgreSQL 16 / Python 3.12 CI job
+applies ten temporary source mutations and runs the targeted assertion for each. Two transaction
+boundary counterfactuals use the existing directed I6 failure injection. Every source mutation is
+restored byte-for-byte, and CI finishes the job with `git diff --exit-code`.
+
+The twelve required counterfactuals cover lease-token fencing, exact expiry, Thread uniqueness and
+tenant qualification, checkpoint CAS, checkpoint trace projection, atomic completion, terminal-event
+atomicity, unsafe-provider no-retry, quarantine plan rederivation, same-revision evidence drift, and
+legal later successor checkpoint progress.
+
+The exact mutant-to-test mapping is documented in
+[`postgresql-store-backend.md`](postgresql-store-backend.md).
 
 ## Application boundary and non-goals
 
