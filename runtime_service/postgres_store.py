@@ -81,18 +81,51 @@ class PostgresRunStore:
         state_registry: StateRegistry | None = None,
         lease_operation_timeout_seconds: float = 1.0,
         lease_clock_ms: Callable[[], int] | None = None,
+        connect_timeout_seconds: float = 30,
+        statement_timeout_seconds: float | None = None,
+        lock_timeout_seconds: float | None = None,
+        idle_in_transaction_session_timeout_seconds: float = 5.0,
         initialize: bool = True,
     ) -> None:
         if lease_operation_timeout_seconds <= 0:
             raise ValueError("lease_operation_timeout_seconds must be positive")
+        if connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be positive")
+        if idle_in_transaction_session_timeout_seconds <= 0:
+            raise ValueError(
+                "idle_in_transaction_session_timeout_seconds must be positive"
+            )
+        if (
+            idle_in_transaction_session_timeout_seconds
+            <= lease_operation_timeout_seconds
+        ):
+            raise ValueError(
+                "idle_in_transaction_session_timeout_seconds must be greater than "
+                "lease_operation_timeout_seconds"
+            )
         self._dsn = dsn
         self.schema = validate_postgres_schema_name(schema)
         self._state_registry = state_registry
         self._state_models: dict[tuple[str, str], type[BaseRuntimeState]] = {}
         self._lease_operation_timeout_seconds = lease_operation_timeout_seconds
         self._lease_clock_ms = lease_clock_ms
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._statement_timeout_seconds = statement_timeout_seconds
+        self._lock_timeout_seconds = lock_timeout_seconds
+        self._idle_in_transaction_session_timeout_seconds = (
+            idle_in_transaction_session_timeout_seconds
+        )
         if initialize:
-            initialize_postgres_schema(dsn, schema=self.schema)
+            initialize_postgres_schema(
+                dsn,
+                schema=self.schema,
+                connect_timeout_seconds=connect_timeout_seconds,
+                statement_timeout_seconds=statement_timeout_seconds,
+                lock_timeout_seconds=lock_timeout_seconds,
+                idle_in_transaction_session_timeout_seconds=(
+                    idle_in_transaction_session_timeout_seconds
+                ),
+            )
 
     def bind_state_registry(self, state_registry: StateRegistry) -> None:
         if self._state_registry is not None and self._state_registry is not state_registry:
@@ -103,19 +136,34 @@ class PostgresRunStore:
     def lease_operation_timeout_seconds(self) -> float:
         return self._lease_operation_timeout_seconds
 
-    def _connect(self, *, timeout_seconds: float = 30):
+    def _connect(self, *, timeout_seconds: float | None = None):
+        connect_timeout = self._connect_timeout_seconds
+        if timeout_seconds is not None:
+            connect_timeout = min(connect_timeout, timeout_seconds)
         return open_postgres_connection(
             self._dsn,
             schema=self.schema,
-            connect_timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout,
+            statement_timeout_seconds=self._statement_timeout_seconds,
+            lock_timeout_seconds=self._lock_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                self._idle_in_transaction_session_timeout_seconds
+            ),
         )
 
     def _lease_connect(self):
         return open_postgres_connection(
             self._dsn,
             schema=self.schema,
-            connect_timeout_seconds=self._lease_operation_timeout_seconds,
+            connect_timeout_seconds=min(
+                self._connect_timeout_seconds,
+                self._lease_operation_timeout_seconds,
+            ),
+            statement_timeout_seconds=self._lease_operation_timeout_seconds,
             lock_timeout_seconds=self._lease_operation_timeout_seconds,
+            idle_in_transaction_session_timeout_seconds=(
+                self._idle_in_transaction_session_timeout_seconds
+            ),
         )
 
     def _lease_now_ms(self, connection) -> int:

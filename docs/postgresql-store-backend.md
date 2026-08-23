@@ -5,9 +5,11 @@ Memory storage. They prove that the storage contracts are not accidentally tied 
 or process-local locking. This document focuses on Run/Workflow; the Memory transaction and schema
 component are documented in [`postgresql-memory-store.md`](postgresql-memory-store.md).
 
-The implementation is intentionally narrower than a production database migration. The default
-application composition remains SQLite, and PostgreSQL is exercised through the store semantic
-conformance suite and PostgreSQL-specific mechanics tests.
+The implementation is intentionally narrower than an online database migration. SQLite remains
+the default, while `create_app()` can now select one complete PostgreSQL application authority
+after an explicit bootstrap and read-only startup validation. Composition and operational commands
+are documented in
+[`postgresql-application-composition.md`](postgresql-application-composition.md).
 
 ## Implemented surface
 
@@ -212,33 +214,21 @@ outside it. The existing three-way I6 fault injection kills both by observing pa
 
 ## Application composition boundary
 
-The default API composition still constructs:
+SQLite remains the zero-configuration default. PostgreSQL selection constructs
+`PostgresRunStore`, `PostgresWorkflowStore`, and `PostgresMemoryStore` from one DSN/schema only.
+Mixed SQLite/PostgreSQL configuration fails before `RuntimeManager` starts. Workers validate but do
+not mutate schema; one explicit bootstrap command owns dry-run/apply and postcondition reread.
 
-```text
-SQLiteRunStore
-SQLiteWorkflowStore
-SQLiteMemoryStore
-```
-
-There is deliberately no application backend selector or `RUNTIME_DATABASE_URL` switch in this
-phase.
-
-A PostgreSQL Run/Workflow backend must **not** be combined at the application composition root with
-`SQLiteMemoryStore`. Governed memory validates current Run/lease authority in the same database
-transaction as memory mutation. Splitting those stores across PostgreSQL and SQLite would weaken
-that fencing property.
-
-`PostgresMemoryStore` now provides the same-authority implementation required for a coherent future
-composition. This phase still does not select or wire that composition: backend configuration,
-startup compatibility checks, migration authority, and invalid mixed-backend rejection remain a
-separate bounded change.
+See [`postgresql-application-composition.md`](postgresql-application-composition.md) for the exact
+configuration matrix, readiness metadata, connection budgets, executable application proof, and
+remaining non-goals.
 
 ## Explicit non-goals
 
 This phase does not add:
 
-- a runtime backend-selection environment variable;
 - connection pooling;
+- online SQLite-to-PostgreSQL data migration;
 - multi-replica Runtime deployment;
 - a distributed queue or wake-up channel;
 - HA/failover operational claims;

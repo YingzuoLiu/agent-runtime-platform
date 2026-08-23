@@ -58,7 +58,10 @@ The API passes only the principal's derived `TenantContext` into
 `RuntimeManager`; request models reject extra fields, so a client cannot select or override
 `tenant_id` in JSON. With no configured credentials, protected endpoints fail closed.
 
-In normal runtime mode, only `/health` and `/ready` are public. `/agents`, `/tools`, tool
+In normal runtime mode, only `/health` and `/ready` are public so infrastructure probes do not need
+a business API credential. Their responses contain no credential, DSN, database host, or username;
+restrict these routes at the ingress/service-mesh boundary if backend/schema/version fingerprinting
+is outside the deployment's disclosure policy. `/agents`, `/tools`, tool
 execution, the synchronous compatibility endpoint, runs, cancellation, event history/SSE, and
 thread checkpoints require `Authorization: Bearer <api-key>`. Missing and invalid keys share one
 `401` response. Resource lookups that are unknown or owned by another tenant share one `404`

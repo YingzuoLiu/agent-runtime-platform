@@ -163,7 +163,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | --- | --- | --- |
 | Planning | Strict `CALL_TOOL`, `REQUEST_CLARIFICATION`, and `FINISH` decisions | [`runtime_service/dynamic_loop.py`](runtime_service/dynamic_loop.py) |
 | Policy | Fixed step-limit, allowlist, permission, and argument-schema checks before execution | [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) |
-| Durability | Default application storage is SQLite; PostgreSQL Run/Workflow and Memory stores implement the same applicable tested semantics | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/postgres_store.py`](runtime_service/postgres_store.py), [`runtime_service/postgres_memory_store.py`](runtime_service/postgres_memory_store.py) |
+| Durability | SQLite remains the default; the application can select one coherent PostgreSQL Run/Workflow/Memory authority after explicit bootstrap and read-only startup validation | [`runtime_service/storage.py`](runtime_service/storage.py), [`docs/postgresql-application-composition.md`](docs/postgresql-application-composition.md) |
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
 | Checkpoint state boundary | Full per-Run final state plus a same-type Thread projection with `execution_trace=[]`, committed atomically | [`docs/state-boundaries.md`](docs/state-boundaries.md), [`tests/test_checkpoint_projection.py`](tests/test_checkpoint_projection.py) |
@@ -210,6 +210,29 @@ Verify the public health endpoints:
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/ready
 ```
+
+To run the complete application on PostgreSQL, install the optional driver and configure one
+authority. Preview first, apply through the designated bootstrap command, then start workers that
+only validate compatibility:
+
+```bash
+pip install -r requirements.txt -r requirements-postgres.txt
+export RUNTIME_STORE_BACKEND=postgres
+export RUNTIME_POSTGRES_DSN='postgresql://runtime:secret@127.0.0.1/runtime'
+export RUNTIME_POSTGRES_SCHEMA=agent_runtime
+export RUNTIME_POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS=5
+export RUNTIME_TRAVEL_ACTION_PROVIDER_URL='https://provider.example/actions'
+export RUNTIME_TRAVEL_ACTION_PROVIDER_IDENTITY='travel-provider-v1'
+python -m runtime_service.postgres_bootstrap --dry-run
+python -m runtime_service.postgres_bootstrap --apply
+uvicorn api.main:app
+```
+
+PostgreSQL cannot be combined with `RUNTIME_DB_PATH`, and SQLite cannot be combined with
+PostgreSQL settings. The DSN is never accepted as a bootstrap CLI argument or returned by
+`GET /ready`. See
+[`docs/postgresql-application-composition.md`](docs/postgresql-application-composition.md) for
+timeouts, provider requirements, failure behavior, and rollback limits.
 
 Submit a Phase 7A Travel run with an explicit synthetic hold request:
 
@@ -328,12 +351,12 @@ flowchart TB
     C[Client] --> A[FastAPI control plane]
     A --> I[Authentication and typed RBAC]
     I --> M[RuntimeManager and AgentRegistry]
-    M --> S[(SQLite runs, events, checkpoints)]
+    M --> S[(Selected Run, Workflow, event, checkpoint authority)]
     M --> T[Travel runtimes]
     M --> R[Release-validation runtimes]
     M --> U[Trusted opt-in domains]
     T --> X[Governed memory]
-    X --> Q[(SQLite memories and run snapshots)]
+    X --> Q[(Memory and snapshots in the same authority)]
     T --> L[DynamicToolLoop]
     R --> G[Static validated DAG]
     L --> P[Planner and policy gate]
@@ -747,6 +770,8 @@ input signatures still match; the source run is never mutated.
 | [`runtime_service/external_actions.py`](runtime_service/external_actions.py) | Provider contracts, registry, and sanitized dispatch boundary |
 | [`runtime_service/http_external_action.py`](runtime_service/http_external_action.py) | Optional server-configured JSON-over-HTTP provider adapter |
 | [`runtime_service/manager.py`](runtime_service/manager.py) | Durable Run polling, lease heartbeat/takeover, cancellation, and fenced finalization |
+| [`runtime_service/storage.py`](runtime_service/storage.py) | Coherent SQLite/PostgreSQL selection, mixed-config rejection, safe metadata, and connection budgets |
+| [`runtime_service/postgres_bootstrap.py`](runtime_service/postgres_bootstrap.py) | PostgreSQL schema dry-run/apply authority and postcondition reporting |
 | [`runtime_service/postgres_store.py`](runtime_service/postgres_store.py) | PostgreSQL Run ownership, checkpoint CAS, atomic completion, and quarantine semantics |
 | [`runtime_service/postgres_memory_store.py`](runtime_service/postgres_memory_store.py) | PostgreSQL governed Memory fencing, versioning, sealed snapshots, and audit transactions |
 | [`runtime_service/postgres_workflow_store.py`](runtime_service/postgres_workflow_store.py) | PostgreSQL workflow/tool/external-action durability and fencing |
@@ -779,10 +804,13 @@ input signatures still match; the source run is never mutated.
 - [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): shared SQLite/PostgreSQL
   executable store contracts and the invariant-to-test matrix;
 - [`docs/postgresql-store-backend.md`](docs/postgresql-store-backend.md): PostgreSQL schema,
-  transaction/lease model, conformance boundary, application-composition limit, and non-goals;
+  transaction/lease model, conformance boundary, application composition, and non-goals;
 - [`docs/postgresql-memory-store.md`](docs/postgresql-memory-store.md): PostgreSQL Memory schema
   component, same-authority fencing, concurrency/version order, shared contract, mutation proof,
   and cross-PR scan;
+- [`docs/postgresql-application-composition.md`](docs/postgresql-application-composition.md):
+  coherent backend selection, schema bootstrap/startup authority, connection budgets, readiness,
+  application integration proof, and rollback limits;
 - [`docs/state-boundaries.md`](docs/state-boundaries.md): persisted state ownership,
   cross-turn dependencies, governed-memory authority, and checkpoint-growth characterization;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
@@ -859,21 +887,16 @@ the Docker Action-recovery proof and uploads only its sanitized artifact.
 ## Deployment boundary
 
 Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest are included. The
-default application composition remains SQLite plus durable polling and an in-process wake signal,
-which keeps the local demo self-contained. Multiple Managers sharing one local SQLite database are
-fenced, but this is not a multi-host or horizontally scalable deployment claim.
+default local demo remains SQLite plus durable polling and an in-process wake signal. A configured
+application may instead select one complete PostgreSQL authority, but this is not yet a multi-host
+or horizontally scalable deployment claim.
 
-Durable Run consumers target the structural `RunStore` contract, workflow consumers target the
-structural `WorkflowStore` contract, and governed execution targets the narrow `MemoryStore`
-contract. SQLite and PostgreSQL now both implement their applicable semantics exercised by the
-conformance suite. The service composition root still supplies `SQLiteRunStore`,
-`SQLiteWorkflowStore`, and `SQLiteMemoryStore`.
-
-That composition boundary is deliberate. `PostgresMemoryStore` can validate current PostgreSQL
-Run/lease authority in the same transaction as a Memory mutation, but this phase does not add the
-configuration, schema-startup, or migration authority required to switch the complete application.
-Wiring PostgreSQL Run/Workflow stores together with `SQLiteMemoryStore` remains prohibited, and
-there is no application backend selector in this PR.
+Durable Run consumers target `RunStore`, workflow consumers target `WorkflowStore`, governed
+execution targets `MemoryStore`, and subject-scoped admin routes target `MemoryAdminStore`.
+`runtime_service/storage.py` constructs all three concrete stores from one selection. Mixed
+SQLite/PostgreSQL settings fail before work starts; PostgreSQL workers validate the complete schema
+read-only and never race to migrate it. The separate bootstrap command owns dry-run/apply and
+authoritative reread.
 
 The first lease-aware SQLite deployment requires a stop-the-old-runtime boundary: stop and verify
 every pre-leasing process, run the additive migration, and then start only lease-aware binaries.
@@ -886,13 +909,12 @@ no durable record of the checkpoint revision it originally read, so the new Runt
 guess and fails startup closed. Mixed old/new binaries and direct rollback remain unsupported: old
 state-only writes do not increment the revision and cannot be detected by the new CAS.
 
-Before increasing replicas or switching the full application to PostgreSQL, the architecture would
-still need:
+Before increasing replicas, the architecture would still need:
 
 ```text
-coherent PostgreSQL application selection and schema/bootstrap authority
-+ Redis, Pub/Sub, or another distributed queue/wake mechanism
-+ production connection pooling and migration operations
+Redis, Pub/Sub, or another distributed queue/wake mechanism
++ a measured connection-pooling policy if short-lived connections become a bottleneck
++ production release orchestration around the existing bootstrap authority
 + provider-specific reconciliation and compensation
 + OpenTelemetry traces and metrics
 + container-backed sandbox workers
@@ -909,8 +931,10 @@ Kubernetes manifest expects `RUNTIME_API_KEYS_JSON` in Secret `travel-agent-runt
 This is a completed portfolio/reference milestone, not a claim of a complete production Agent
 platform.
 
-- the default application still uses SQLite; PostgreSQL Run/Workflow/Memory semantics are
-  conformance-proven below the composition root, but there is no runtime backend selector yet;
+- the default application still uses SQLite; PostgreSQL selection requires an explicitly prepared
+  schema and does not migrate existing SQLite data;
+- PostgreSQL uses bounded short-lived per-operation connections; no pool sizing or saturation claim
+  is made without process-level measurements;
 - PostgreSQL lease/fencing behavior is tested with independent server connections, but the
   repository still makes no multi-host Runtime, horizontal-scaling, or HA deployment claim;
 - durable polling plus a local wake signal remains the application scheduling mechanism rather than

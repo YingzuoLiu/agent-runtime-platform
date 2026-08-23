@@ -223,6 +223,47 @@ class MemoryStore(Protocol):
         ...
 
 
+class MemoryAdminStore(Protocol):
+    """Subject-scoped Memory operations consumed by readiness and HTTP routes."""
+
+    def ping(self) -> None:
+        ...
+
+    def list_memories(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        domain_id: str | None = None,
+        kind: MemoryKind | None = None,
+        include_inactive: bool = False,
+    ) -> list[MemoryRecord]:
+        ...
+
+    def get_memory_for_subject(
+        self,
+        memory_id: str,
+        *,
+        tenant_id: str,
+        subject_id: str,
+    ) -> MemoryRecord | None:
+        ...
+
+    def forget_memory(
+        self,
+        memory_id: str,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        actor_subject_id: str,
+    ) -> MemoryRecord:
+        ...
+
+
+class RuntimeMemoryStore(MemoryStore, MemoryAdminStore, Protocol):
+    """Complete Memory surface required by the application composition root."""
+
+
 class SQLiteMemoryStore:
     """SQLite-backed, tenant-and-subject-scoped long-term memory storage."""
 

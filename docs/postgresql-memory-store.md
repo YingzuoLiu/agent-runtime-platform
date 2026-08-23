@@ -17,9 +17,9 @@ X1: validate active Run identity and lease/fence
     in one database transaction and schema authority
 ```
 
-This phase adds the missing PostgreSQL implementation and evidence. It does not wire PostgreSQL
-into `create_app()`; coherent application selection and migration/startup authority remain a
-separate phase.
+This phase added the missing PostgreSQL implementation and evidence. The later application
+composition now wires all three PostgreSQL stores only as one authority; see
+[`postgresql-application-composition.md`](postgresql-application-composition.md).
 
 ## Deterministic authority boundary
 
@@ -123,7 +123,7 @@ The runner restores every touched source file byte-for-byte. CI follows it with
 | One logical key has ordered versions and one active row | administrative or Run-owned upsert | scoped transaction lock, active row lock, partial unique index, unique scoped version | record statuses/versions plus ordered audit ids | shared concurrent/version/rollback cases; PostgreSQL unique mechanics; MM03/MM05 | transaction error fails closed; no partial audit | direct database writes are outside the public/runtime API and schema constraints still reject duplicate active rows |
 | First Run snapshot is immutable | governed or explicit test snapshot API | persisted Run identity; one `run_id` primary key; existing-row reuse | `run_memory_snapshots` including `[]` | shared sealed non-empty/empty/identity cases; MM04 | identity mismatch is typed and inspectable | forgetting and later writes deliberately do not rewrite historical snapshots |
 | Audit/public-event handoff is retry-safe | `GovernedMemory.remember` | Memory audit commits with mutation; mirror identifies `(event_type, audit_event_id)` and appends through fenced Run attempt | `memory_events` and `run_events` | shared successor-repair case | stale mirror attempt fails with lease loss; successor rereads audit | the two ledgers are not one atomic transaction, so repair is required and explicitly tested |
-| Application has no split durable authority | `create_app`, state-boundary eval harness | composition remains three SQLite stores | application state and existing API tests | full SQLite/API regression plus source scan | application continues to report/use local SQLite behavior | no PostgreSQL selector or mixed composition exists in this phase |
+| Application has no split durable authority | `create_app`, state-boundary eval harness | one complete SQLite or PostgreSQL store bundle; mixed configuration rejection | readiness backend/schema metadata | full SQLite/API regression plus PostgreSQL composition/restart/admin proof | readiness pings and reports the selected authority without DSN | state-boundary eval remains an explicit SQLite evidence harness |
 
 The scan found no additional production mutation entry point. Travel runtime reaches Memory only
 through `GovernedMemory`; the HTTP surface exposes subject-scoped list and forget operations, not a
@@ -134,15 +134,15 @@ composition.
 
 - Default installs and imports still do not require Psycopg. `PostgresMemoryStore` is a lazy package
   export, and the default application still constructs SQLite stores.
-- PostgreSQL users install `requirements-postgres.txt` and explicitly construct all stores against
-  the same DSN/schema in tests or future composition work.
+- PostgreSQL users install `requirements-postgres.txt`, run the explicit bootstrap authority, and
+  select one DSN/schema for all stores through application composition.
 - This phase creates an additive Memory component in an explicitly selected PostgreSQL schema. It
   does not migrate existing SQLite data.
 - Before application wiring, rollback is removal of this unused component/code path. Where test
   schemas are disposable, the isolated schema can be dropped. No production-data downgrade path is
   claimed because production composition is not enabled here.
-- No connection pooling, backend selector, multi-process scheduling proof, distributed queue,
-  cloud deployment, HA, Redis, or new Memory/checkpoint semantics are included.
+- No connection pooling, online SQLite data migration, multi-process scheduling proof, distributed
+  queue, cloud deployment, HA, Redis, or new Memory/checkpoint semantics are included.
 
 ## Verification
 
