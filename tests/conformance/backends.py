@@ -12,6 +12,8 @@ import psycopg
 from psycopg import sql
 
 from agent.contracts import BaseRuntimeState
+from runtime_service.memory import MemoryEvent, SQLiteMemoryStore
+from runtime_service.postgres_memory_store import PostgresMemoryStore
 from runtime_service.postgres_schema import (
     open_postgres_connection,
     validate_postgres_schema_name,
@@ -22,6 +24,9 @@ from runtime_service.registry import AgentRegistry, build_default_registry
 from runtime_service.run_store import RunStore
 from runtime_service.store import SQLiteRunStore
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
+
+
+MemoryConformanceStore = SQLiteMemoryStore | PostgresMemoryStore
 
 
 class InjectedConformanceFailure(RuntimeError):
@@ -71,6 +76,8 @@ class StoreConformanceBackend(Protocol):
         bind_default_registry: bool = True,
     ) -> RunStore: ...
 
+    def open_memory_store(self) -> MemoryConformanceStore: ...
+
     def fail_workflow_event(
         self,
         store: WorkflowStore,
@@ -80,6 +87,12 @@ class StoreConformanceBackend(Protocol):
     def fail_run_event(
         self,
         store: RunStore,
+        event_type: str,
+    ) -> AbstractContextManager[None]: ...
+
+    def fail_memory_event(
+        self,
+        store: MemoryConformanceStore,
         event_type: str,
     ) -> AbstractContextManager[None]: ...
 
@@ -148,6 +161,12 @@ class SQLiteConformanceBackend:
             lease_clock_ms=self.clock,
         )
 
+    def open_memory_store(self) -> SQLiteMemoryStore:
+        return SQLiteMemoryStore(
+            self.database_path,
+            lease_clock_ms=self.clock,
+        )
+
     @contextmanager
     def fail_workflow_event(
         self,
@@ -195,6 +214,29 @@ class SQLiteConformanceBackend:
             if actual_event_type == event_type:
                 raise InjectedConformanceFailure(f"injected run event failure: {event_type}")
             return original(connection, run_id, actual_event_type, payload)
+
+        store._append_event_with_connection = injected  # type: ignore[method-assign]
+        try:
+            yield
+        finally:
+            store._append_event_with_connection = original  # type: ignore[method-assign]
+
+    @contextmanager
+    def fail_memory_event(
+        self,
+        store: MemoryConformanceStore,
+        event_type: str,
+    ) -> Iterator[None]:
+        if not isinstance(store, SQLiteMemoryStore):
+            raise TypeError("SQLite event injection requires SQLiteMemoryStore")
+        original = store._append_event_with_connection
+
+        def injected(connection: sqlite3.Connection, event: MemoryEvent):
+            if event.event_type == event_type:
+                raise InjectedConformanceFailure(
+                    f"injected memory event failure: {event_type}"
+                )
+            return original(connection, event)
 
         store._append_event_with_connection = injected  # type: ignore[method-assign]
         try:
@@ -369,6 +411,16 @@ class PostgresConformanceBackend:
         assert isinstance(store, PostgresRunStore)
         return store
 
+    def open_memory_store(self) -> PostgresMemoryStore:
+        return PostgresMemoryStore(
+            self.dsn,
+            schema=self.schema,
+            lease_clock_ms=self.clock,
+        )
+
+    def open_postgres_memory_store(self) -> PostgresMemoryStore:
+        return self.open_memory_store()
+
     @contextmanager
     def fail_workflow_event(
         self,
@@ -416,6 +468,29 @@ class PostgresConformanceBackend:
             if actual_event_type == event_type:
                 raise InjectedConformanceFailure(f"injected run event failure: {event_type}")
             return original(connection, run_id, actual_event_type, payload)
+
+        store._append_event_with_connection = injected  # type: ignore[method-assign]
+        try:
+            yield
+        finally:
+            store._append_event_with_connection = original  # type: ignore[method-assign]
+
+    @contextmanager
+    def fail_memory_event(
+        self,
+        store: MemoryConformanceStore,
+        event_type: str,
+    ) -> Iterator[None]:
+        if not isinstance(store, PostgresMemoryStore):
+            raise TypeError("PostgreSQL event injection requires PostgresMemoryStore")
+        original = store._append_event_with_connection
+
+        def injected(connection, event: MemoryEvent):
+            if event.event_type == event_type:
+                raise InjectedConformanceFailure(
+                    f"injected memory event failure: {event_type}"
+                )
+            return original(connection, event)
 
         store._append_event_with_connection = injected  # type: ignore[method-assign]
         try:
