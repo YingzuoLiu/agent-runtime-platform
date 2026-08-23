@@ -297,7 +297,7 @@ def test_postgres_application_processes_restarts_and_administers_memory(
             permissions=(),
         ),
     )
-    recovery_store.create_run_with_event(recoverable, event_type="run.created")
+    recovery_store.create_run_with_event(recoverable, event_type="run.queued")
     abandoned = recovery_store.claim_next_run(
         owner_id="terminated-worker",
         lease_duration_seconds=60,
