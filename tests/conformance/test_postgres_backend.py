@@ -155,6 +155,7 @@ def test_postgres_manual_clock_exact_expiry_boundary(store_backend) -> None:
 
 def test_postgres_failed_transaction_rolls_back_and_connection_closes(store_backend) -> None:
     backend = _postgres_backend(store_backend)
+    initialize_postgres_schema(backend.dsn, schema=backend.schema)
     connection = None
     with pytest.raises(RuntimeError, match="rollback probe"):
         with postgres_connection(backend.dsn, schema=backend.schema) as active:
