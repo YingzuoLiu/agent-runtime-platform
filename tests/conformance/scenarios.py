@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from agent.contracts import RuntimeExecutionAuthority, TraceEvent
 from domains.travel.state import AgentState
 from runtime_service.models import RunCommitOutcome, RunRecord, RunStatus
-from runtime_service.store import SQLiteRunStore
+from runtime_service.run_store import RunStore
 from runtime_service.workflow_store import (
     ExternalActionPrepareResult,
     ExternalActionRetryMode,
@@ -14,7 +14,7 @@ from runtime_service.workflow_store import (
     WorkflowStore,
 )
 
-from .backends import SQLiteConformanceBackend
+from .backends import StoreConformanceBackend
 
 
 TENANT_ID = "conformance-tenant"
@@ -29,7 +29,7 @@ ARGUMENTS_JSON = '{"value":1}'
 
 
 def create_queued_run(
-    store: SQLiteRunStore,
+    store: RunStore,
     run_id: str,
     *,
     thread_id: str,
@@ -61,7 +61,7 @@ def create_queued_run(
     return run
 
 
-def claim_run(store: SQLiteRunStore, owner_id: str):
+def claim_run(store: RunStore, owner_id: str):
     return store.claim_next_run(
         owner_id=owner_id,
         lease_duration_seconds=LEASE_SECONDS,
@@ -70,12 +70,12 @@ def claim_run(store: SQLiteRunStore, owner_id: str):
 
 
 def claim_concurrently(
-    first_store: SQLiteRunStore,
-    second_store: SQLiteRunStore,
+    first_store: RunStore,
+    second_store: RunStore,
 ):
     barrier = threading.Barrier(3)
 
-    def claim(store: SQLiteRunStore, owner_id: str):
+    def claim(store: RunStore, owner_id: str):
         barrier.wait(timeout=5)
         return claim_run(store, owner_id)
 
@@ -87,7 +87,7 @@ def claim_concurrently(
 
 
 def complete_with_budget(
-    store: SQLiteRunStore,
+    store: RunStore,
     claim,
     *,
     budget: int,
@@ -106,7 +106,7 @@ def complete_with_budget(
 
 
 def create_managed_workflow(
-    backend: SQLiteConformanceBackend,
+    backend: StoreConformanceBackend,
     *,
     run_id: str,
     thread_id: str | None = None,
@@ -179,7 +179,7 @@ def prepare_external_action(
 
 
 def create_action_quarantine(
-    backend: SQLiteConformanceBackend,
+    backend: StoreConformanceBackend,
     *,
     run_id: str,
     thread_id: str,
