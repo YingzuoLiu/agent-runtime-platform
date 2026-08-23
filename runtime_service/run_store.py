@@ -258,6 +258,21 @@ def _sqlstate(exc: BaseException) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _is_psycopg_error(exc: BaseException) -> bool:
+    return exc.__class__.__module__.startswith("psycopg")
+
+
+def is_run_store_error(exc: BaseException) -> bool:
+    """Recognize SQLite/Psycopg database failures without coupling API consumers."""
+
+    for current in _exception_chain(exc):
+        if isinstance(current, sqlite3.Error):
+            return True
+        if _sqlstate(current) is not None or _is_psycopg_error(current):
+            return True
+    return False
+
+
 def is_run_store_integrity_error(exc: BaseException) -> bool:
     """Recognize only database integrity conflicts needed for idempotent submit.
 
@@ -307,7 +322,7 @@ def is_run_store_retryable_error(exc: BaseException) -> bool:
             state.startswith("08") or state in {"40001", "40P01", "55P03", "57014"}
         ):
             return True
-        if current.__class__.__module__.startswith("psycopg") and current.__class__.__name__ in {
+        if _is_psycopg_error(current) and current.__class__.__name__ in {
             "OperationalError",
             "InterfaceError",
         }:
