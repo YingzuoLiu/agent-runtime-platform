@@ -6,6 +6,8 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from domains.travel.state import AgentState
+from runtime_service.models import RunCommitOutcome
 from runtime_service.postgres_schema import (
     PostgresSchemaError,
     initialize_postgres_schema,
@@ -16,7 +18,12 @@ from runtime_service.postgres_schema import (
 from runtime_service.postgres_store import PostgresRunStore
 
 from .backends import PostgresConformanceBackend, StoreConformanceBackend
-from .scenarios import TENANT_ID, claim_run, create_queued_run
+from .scenarios import (
+    TENANT_ID,
+    claim_run,
+    complete_with_budget,
+    create_queued_run,
+)
 
 
 def _postgres_backend(
@@ -227,6 +234,44 @@ def test_postgres_expected_unique_and_fk_constraints_are_enforced(store_backend)
                 )
     finally:
         connection.close()
+
+
+def test_postgres_checkpoint_write_rejects_stale_revision(store_backend) -> None:
+    backend = _postgres_backend(store_backend)
+    store = backend.open_postgres_run_store()
+    create_queued_run(store, "pg-stale-cas", thread_id="pg-stale-cas-thread", order=1)
+    claim = claim_run(store, "pg-stale-cas-owner")
+    assert claim is not None
+    assert complete_with_budget(store, claim, budget=6_000) == RunCommitOutcome.COMMITTED
+
+    stale_state = AgentState(
+        thread_id="pg-stale-cas-thread",
+        destination="Stale writer",
+        budget=99_999,
+    )
+    connection = open_postgres_connection(backend.dsn, schema=backend.schema)
+    try:
+        with connection.transaction():
+            row = store._write_checkpoint_with_connection(
+                connection,
+                run=claim.run,
+                state_json=stale_state.model_dump_json(),
+                updated_at="2026-08-23T00:00:00+00:00",
+                observed_revision=0,
+            )
+            assert row is None
+    finally:
+        connection.close()
+
+    snapshot = backend.open_postgres_run_store().load_thread_state_snapshot(
+        "pg-stale-cas-thread",
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert snapshot.revision == 1
+    assert isinstance(snapshot.state, AgentState)
+    assert snapshot.state.budget == 6_000
 
 
 def test_postgres_test_schemas_do_not_leak_data(store_backend) -> None:
