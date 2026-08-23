@@ -244,12 +244,20 @@ class RunStore(Protocol):
 
 
 def _exception_chain(exc: BaseException):
+    """Yield only explicit exception causality.
+
+    ``__context__`` is intentionally ignored. Python attaches it automatically
+    when any new exception escapes an ``except`` block, so traversing context
+    would misclassify an unrelated programming bug as the database error that
+    happened to be handled immediately beforehand.
+    """
+
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         yield current
-        next_exc = current.__cause__ or current.__context__
+        next_exc = current.__cause__
         current = next_exc if isinstance(next_exc, BaseException) else None
 
 
