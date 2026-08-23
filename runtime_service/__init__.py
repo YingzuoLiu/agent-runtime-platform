@@ -92,8 +92,25 @@ from .sandbox import (
     ToolSpec,
 )
 from .store import RunLeaseLostError, SQLiteRunStore, ThreadStateConflictError
-from .postgres_store import PostgresRunStore
-from .postgres_workflow_store import PostgresWorkflowStore
+
+
+def __getattr__(name: str):
+    """Load optional PostgreSQL exports only when explicitly requested.
+
+    The default SQLite application imports ``runtime_service`` without needing
+    the Psycopg runtime package. Deployments/tests that use the PostgreSQL store
+    install the PostgreSQL requirements and request these names explicitly.
+    """
+
+    if name == "PostgresRunStore":
+        from .postgres_store import PostgresRunStore
+
+        return PostgresRunStore
+    if name == "PostgresWorkflowStore":
+        from .postgres_workflow_store import PostgresWorkflowStore
+
+        return PostgresWorkflowStore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_default_tool_registry() -> ToolRegistry:
