@@ -342,16 +342,25 @@ payload may contain `source` and `revision`; neither is an authority token.
 1. verify Run status, tenant, current unexpired Run lease token, and cancellation predicate;
 2. require a validated checkpoint state for a successful managed completion;
 3. compare the current logical thread revision with `checkpoint_base_revision`;
-4. insert revision `1` when the base is `0`, or update `N -> N + 1` with `WHERE revision = N`;
-5. transition the Run to `completed` and clear its lease;
-6. append `checkpoint.saved` with `base_revision` and `revision`;
-7. append `run.completed`;
-8. commit all changes together.
+4. serialize the full validated state for the Run row and derive a same-type, deep-independent
+   Thread projection with `execution_trace=[]`;
+5. transition the Run to `completed`, persist its full state, and clear its lease;
+6. insert projected revision `1` when the base is `0`, or update `N -> N + 1` with
+   `WHERE revision = N`;
+7. append `checkpoint.saved` with checkpoint/run trace counts, the projection identifier,
+   `base_revision`, and `revision`;
+8. append `run.completed`;
+9. commit all changes together.
 
 Any zero-row checkpoint CAS rolls back the whole transaction. In particular, it must not leave a
 completed Run without its checkpoint or append terminal evidence for a rejected result.
 Calling the public store method with no state is a programming error: it raises before mutation and
 leaves the Run `running` with its current lease and checkpoint unchanged.
+
+The projection occurs only at successful persistence, after Runtime execution and result
+validation. A legacy checkpoint with a non-empty trace is therefore passed unchanged to the first
+post-upgrade Runtime invocation and is compacted only if that Run commits successfully. Failure and
+cancellation continue to preserve the previous payload and revision.
 
 `commit_failed_run()` and `commit_cancelled_run()` continue to require the current Run lease but do
 not compare or increment checkpoint revision because they do not save state. Their terminal status

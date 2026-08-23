@@ -32,8 +32,8 @@ ordering, and restart-visible committed writes.
 `tests/conformance/test_run_store_contract.py` drives public `SQLiteRunStore` behavior through a
 test-only backend bundle. It covers Run claim and exact lease expiry, stale lease fencing,
 tenant-qualified Thread scheduling, revision-qualified checkpoint loads, completion CAS, atomic
-Run/checkpoint/event completion, failure/cancellation checkpoint preservation, and restart-visible
-writes.
+full-Run/projected-checkpoint/event completion, failure/cancellation checkpoint preservation, and
+restart-visible writes.
 
 The bundle is deliberately not a production `RunStore` protocol. It exists only to create and
 reopen stores, inject a store clock, synchronize races, and inject backend-specific failures.
@@ -59,10 +59,47 @@ Every test below executes through the reference-adapter fixture. Its only curren
 | **I3 One running Run per tenant-qualified Thread** | Two queued Runs share tenant and Thread; two store instances race. | Both claim calls cross an explicit barrier. | Exactly one Run becomes running; the successor remains queued with `attempt == 0`. | `tests/conformance/test_run_store_contract.py::test_i3_one_running_run_per_tenant_qualified_thread[sqlite]` |
 | **I4 Thread serialization is tenant-qualified** | Two queued Runs either have different Thread IDs in one tenant or the same Thread ID in different tenants. | Two stores claim concurrently through the same barrier scenario as I3. | Both Run IDs are claimed; one tenant-qualified Thread does not serialize unrelated work. | `tests/conformance/test_run_store_contract.py::test_i4_thread_scope_allows_independent_claims[sqlite-*]` |
 | **I5 Checkpoint commit requires expected revision** | A completed predecessor creates revision 1; its successor captures base revision 1. | The backend adapter injects a mixed-writer checkpoint change to revision 2; revision-qualified load and stale completion are attempted. | Load raises `ThreadCheckpointRevisionConflictError(1, 2)`; completion returns `CHECKPOINT_CONFLICT`; the Run fails with `thread_checkpoint_conflict`; revision 2 and its state are not overwritten. | `tests/conformance/test_run_store_contract.py::test_i5_checkpoint_load_and_completion_require_expected_revision[sqlite]` |
-| **I6 Terminal Run + checkpoint + required events preserve atomic semantics** | A currently leased Run returns a typed checkpoint state. A second scenario starts from an existing checkpoint before failure and cancellation. | The backend fails the `run.completed` event append after the completion transaction has started; failure and cancellation then execute normally. | The injected failure leaves Run running, lease current, checkpoint absent, and no partial terminal events. A later commit persists Run + revision + `checkpoint.saved` + `run.completed`. Failed/cancelled Runs do not advance the prior revision. | `tests/conformance/test_run_store_contract.py::test_i6_completion_checkpoint_and_required_events_commit_atomically[sqlite]`; `...::test_failure_and_cancellation_preserve_checkpoint_revision[sqlite]` |
+| **I6 Terminal Run + checkpoint + required events preserve atomic semantics** | A currently leased Run returns a typed state with trace evidence. A second scenario starts from a legal legacy checkpoint with a non-empty trace before failure and cancellation. | The backend separately fails the checkpoint write, `checkpoint.saved`, and `run.completed` after the completion transaction has started; failure and cancellation then execute normally. | Every injected failure leaves the Run running with its lease, checkpoint absent, and no partial terminal events. A later commit atomically stores the full Run trace, a same-type checkpoint with `execution_trace=[]`, truthful projection counts, revision, `checkpoint.saved`, and `run.completed`. Failed/cancelled Runs preserve the legacy payload and revision. | `tests/conformance/test_run_store_contract.py::test_i6_completion_checkpoint_and_required_events_commit_atomically[sqlite-*]`; `...::test_failure_and_cancellation_preserve_checkpoint_revision[sqlite]` |
 | **I7 Recovery never guesses an ambiguous external effect** | An unsafe provider is entered once; terminal evidence write fails, leaving a durable `dispatching` action and reconciliation-pending Run; a same-Thread successor is queued. | Store and coordinator instances are recreated after exact lease expiry; recovery executes with a provider that fails the test if called. | Recovery claims the predecessor first, never calls the provider again, finalizes `outcome_unknown` with dispatch count 1, and only then permits the successor claim. The outcome and sanitized error code survive another reopen. | `tests/conformance/test_execution_plane_contract.py::test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect[sqlite]` |
 | **I8 Detected semantic conflict fails closed into inspectable quarantine** | A reconciliation-pending predecessor owns a dispatched action at checkpoint base 1; a same-Thread successor waits; the adapter injects checkpoint revision 2. | A recreated `RuntimeManager` recovers the expired predecessor. An explicit event observes quarantine; the test then recreates the store, requests cancellation, and attempts takeover. | Runtime construction never occurs. The predecessor remains nonterminal `running`, has no lease, carries `thread_checkpoint_conflict_reconciliation_pending`, and appends `checkpoint.conflict` with expected/observed revisions and quarantine disposition. Restart/takeover/cancellation do not terminalize it; the successor stays queued while another Thread remains claimable. | `tests/conformance/test_execution_plane_contract.py::test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine[sqlite]` |
 | **I9 Quarantine release requires an unchanged eligible plan and preserves authoritative evidence** | A predecessor has checkpoint base 1, a durable terminal external action, quarantine at current revision 2, and two queued same-Thread successors. | Dry-run derives an opaque plan without writes; apply rederives it in one transaction and fails the Run. The first released successor then commits revision 3 before the original commit is verified and exactly replayed after reopen. | Dry-run leaves Run/checkpoint/workflow/action/events unchanged. Apply first preserves revision 2 and identical workflow/action evidence, performs zero provider calls, and writes one resolution plus one `run.failed`. Legal successor CAS progress does not turn verification into `500` or poison delayed replay; the exact plan is reused without duplicate events while the later successor remains ordered. | `tests/conformance/test_execution_plane_contract.py::test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence[sqlite]` |
+
+## Cross-PR durable checkpoint integrity
+
+The combined system property is:
+
+> For one tenant-qualified Thread, only the current leased Run attempt may atomically advance the
+> checkpoint from its captured revision. A successful completion stores the full validated Run
+> result and a same-type resumable checkpoint projection together with truthful events. A stale,
+> conflicting, failed, cancelled, partially committed, or quarantined attempt cannot overwrite or
+> ambiguously reinterpret the authoritative checkpoint; operator repair may release quarantine
+> only while its evidence-bound plan remains unchanged.
+
+| Property slice | Production enforcement point | Executable evidence |
+| --- | --- | --- |
+| Current writer only | Run lease token/deadline predicates in `SQLiteRunStore`; workflow/action attempt and dispatch fencing | I1, I2, I7 |
+| One ordered Thread writer | tenant-qualified running-Run unique index and claim arbitration | I3, I4 |
+| Correct predecessor | captured `checkpoint_base_revision`, revision-qualified load, completion CAS | I5; `tests/test_thread_serialization.py` |
+| Full result versus resumable projection | `project_thread_checkpoint_state()` called inside `commit_completed_run()` after result validation; distinct Run/checkpoint JSON | I6; `tests/test_checkpoint_projection.py`; `tests/test_contracts.py` |
+| One atomic observable completion | one `BEGIN IMMEDIATE` transaction covers Run update, checkpoint CAS, `checkpoint.saved`, `run.completed`, and lease clearing | I6 failures at checkpoint write and both event boundaries |
+| Truthful projection evidence | `checkpoint.saved.trace_events=0`, `run_trace_events=<full Run count>`, and `projection=execution_trace_reset` | I6; state-boundary characterization v2; API test |
+| Conflict and recovery interpretation | revision drift terminalizes ordinary completion, but reconciliation precedence enters inspectable nonterminal quarantine | I5, I7, I8 |
+| Controlled repair | plan rederivation, hash equality, terminal external evidence, and atomic resolution/Run failure | I9; quarantine-resolution unit and API tests |
+
+The scan found no production consumer that uses an earlier checkpoint trace for a decision. The
+dynamic workflow hash already excludes it; API and Demo consumers treat the completed Run state as
+Run evidence and the Thread endpoint as current resumable state. The remaining explicit assumptions
+are that SQLite is the single-host reference backend, old/new binaries do not write concurrently,
+and Run/workflow event ledgers are not claimed to reproduce every `TraceEvent` payload byte for
+byte. Projected checkpoints remain ordinary schema-v1 payloads, so inspection, restart takeover,
+conformance loading, and quarantine plan hashing require no alternate decoder.
+
+Upgrade behavior is lazy and failure-safe: an old non-empty trace is supplied unchanged to the
+first post-upgrade execution, the first successful commit advances the revision and projects it
+out, and failure/cancellation leaves it intact. CAS conflict preserves the observed checkpoint;
+transaction failures roll back both representations and their events. Quarantine repair preserves
+the checkpoint rather than re-projecting it, and the first later successful successor applies the
+normal projection boundary.
 
 ## Additional Workflow Store scenarios
 

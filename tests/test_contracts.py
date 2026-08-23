@@ -20,10 +20,16 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 from agent import RuntimeResponse as PackageRuntimeResponse
-from agent.contracts import BaseRuntimeState
+from agent.contracts import BaseRuntimeState, TraceEvent, project_thread_checkpoint_state
 from agent.contracts import RuntimeResponse as GenericRuntimeResponse
 from domains.travel.runtime import TravelAgentRuntime
 from domains.travel.state import AgentState, TravelPlan
+from domains.release_validation.models import (
+    ReleaseValidationResult,
+    ReleaseValidationState,
+    ReleaseValidationStatus,
+    SelectiveReplaySummary,
+)
 from api.main import create_app
 from runtime_service import (
     ApiKeyCredential,
@@ -120,6 +126,76 @@ def test_domain_id_and_schema_version_are_classvars_not_pydantic_fields():
     round_tripped = AgentState.model_validate_json(state.model_dump_json())
     assert round_tripped.domain_id == "travel"
     assert round_tripped.schema_version == "1"
+
+
+def test_thread_checkpoint_projection_is_pure_and_preserves_concrete_state():
+    state = _sample_state(thread_id="projection-contract")
+    state.execution_trace = [
+        TraceEvent(
+            event="plan.created",
+            reason="projection purity marker",
+            payload={"nested": {"value": 1}},
+            timestamp="2026-08-23T00:00:00+00:00",
+        )
+    ]
+    original_payload = state.model_dump(mode="python")
+
+    projected = project_thread_checkpoint_state(state)
+
+    assert type(projected) is AgentState
+    assert projected.domain_id == state.domain_id
+    assert projected.schema_version == state.schema_version
+    assert projected.thread_id == state.thread_id
+    assert projected.execution_trace == []
+    assert projected.model_dump(exclude={"execution_trace"}) == state.model_dump(
+        exclude={"execution_trace"}
+    )
+    assert state.model_dump(mode="python") == original_payload
+    assert AgentState.model_validate_json(projected.model_dump_json()) == projected
+
+    projected.preferences["travel_style"] = "fast-paced"
+    assert projected.itinerary is not None
+    projected.itinerary.notes.append("projected-only")
+    projected.tool_outputs["cost_breakdown"]["flight_cost"] = 9999
+    projected.blockers.append("projected-only")
+
+    assert state.preferences["travel_style"] == "relaxed"
+    assert state.itinerary is not None and state.itinerary.notes == []
+    assert state.tool_outputs["cost_breakdown"]["flight_cost"] == 2300
+    assert state.blockers == ["placeholder blocker"]
+
+
+def test_thread_checkpoint_projection_preserves_release_selective_replay_state():
+    state = ReleaseValidationState(
+        thread_id="release-projection",
+        execution_trace=[
+            TraceEvent(
+                event="workflow.completed",
+                reason="selective replay completed",
+                timestamp="2026-08-23T00:00:00+00:00",
+            )
+        ],
+        result=ReleaseValidationResult(
+            run_id="release-run",
+            status=ReleaseValidationStatus.READY,
+            replay=SelectiveReplaySummary(
+                source_run_id="source-run",
+                requested_step_ids=["run_unit_tests"],
+                replayed_step_ids=["run_unit_tests"],
+                reused_step_ids=["load_manifest"],
+                automatically_invalidated_step_ids=["generate_evidence"],
+            ),
+        ),
+        current_stage="completed",
+    )
+
+    projected = project_thread_checkpoint_state(state)
+
+    assert type(projected) is ReleaseValidationState
+    assert projected.execution_trace == []
+    assert projected.result == state.result
+    assert projected.result is not state.result
+    assert projected.current_stage == "completed"
 
 
 def test_naive_base_class_annotation_would_lose_subclass_fields():

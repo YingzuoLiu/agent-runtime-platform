@@ -5,6 +5,7 @@ from .contracts import (
     RuntimeProtocol,
     RuntimeResponse,
     TraceEvent,
+    project_thread_checkpoint_state,
     utc_now,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "RuntimeProtocol",
     "RuntimeResponse",
     "TraceEvent",
+    "project_thread_checkpoint_state",
     "utc_now",
 ]

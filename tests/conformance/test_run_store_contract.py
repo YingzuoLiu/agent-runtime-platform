@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent.contracts import TraceEvent
 from domains.travel.state import AgentState
 from runtime_service.models import RunCommitOutcome, RunLeaseRecoveryReason, RunStatus
 from runtime_service.store import (
@@ -173,6 +174,13 @@ def test_i5_checkpoint_load_and_completion_require_expected_revision(
             thread_id="cas-thread",
             destination="Tokyo",
             budget=7_777,
+            execution_trace=[
+                TraceEvent(
+                    event="mixed-writer.marker",
+                    reason="authoritative checkpoint",
+                    payload={"marker": "preserve-me"},
+                )
+            ],
         ),
         expected_revision=1,
     )
@@ -216,6 +224,8 @@ def test_i5_checkpoint_load_and_completion_require_expected_revision(
     assert snapshot.revision == 2
     assert isinstance(snapshot.state, AgentState)
     assert snapshot.state.budget == 7_777
+    assert snapshot.state.execution_trace[0].payload == {"marker": "preserve-me"}
+    assert persisted.state is None
     events = reopened.list_events(stale.run.run_id)
     event_types = [event.event_type for event in events]
     assert event_types == [
@@ -234,8 +244,13 @@ def test_i5_checkpoint_load_and_completion_require_expected_revision(
     assert "run.completed" not in event_types
 
 
+@pytest.mark.parametrize(
+    "failure_point",
+    ["checkpoint.write", "checkpoint.saved", "run.completed"],
+)
 def test_i6_completion_checkpoint_and_required_events_commit_atomically(
     store_backend: SQLiteConformanceBackend,
+    failure_point: str,
 ) -> None:
     store = store_backend.open_run_store()
     create_queued_run(store, "run-atomic-completion", thread_id="atomic-thread", order=1)
@@ -245,10 +260,22 @@ def test_i6_completion_checkpoint_and_required_events_commit_atomically(
         thread_id=claim.run.thread_id,
         destination="Tokyo",
         budget=8_000,
+        execution_trace=[
+            TraceEvent(
+                event="completion.marker",
+                reason="full Run evidence",
+                payload={"marker": "run-atomic-completion"},
+            )
+        ],
     )
     claim.run.output_message = "atomic result"
 
-    with store_backend.fail_run_event(store, "run.completed"):
+    failure = (
+        store_backend.fail_checkpoint_write(store)
+        if failure_point == "checkpoint.write"
+        else store_backend.fail_run_event(store, failure_point)
+    )
+    with failure:
         with pytest.raises(InjectedConformanceFailure):
             store.commit_completed_run(claim.run, lease_token=claim.lease_token)
 
@@ -284,7 +311,24 @@ def test_i6_completion_checkpoint_and_required_events_commit_atomically(
     )
     durable_run = durable.get_run_internal(claim.run.run_id)
     assert durable_run is not None and durable_run.status == RunStatus.COMPLETED
+    assert isinstance(durable_run.state, AgentState)
+    assert len(durable_run.state.execution_trace) == 1
     assert durable_snapshot.revision == 1
+    assert isinstance(durable_snapshot.state, AgentState)
+    assert durable_snapshot.state.execution_trace == []
+    checkpoint_event = next(
+        event
+        for event in durable.list_events(claim.run.run_id)
+        if event.event_type == "checkpoint.saved"
+    )
+    assert checkpoint_event.payload == {
+        "thread_id": "atomic-thread",
+        "trace_events": 0,
+        "run_trace_events": 1,
+        "projection": "execution_trace_reset",
+        "base_revision": 0,
+        "revision": 1,
+    }
     assert [event.event_type for event in durable.list_events(claim.run.run_id)][-2:] == [
         "checkpoint.saved",
         "run.completed",
@@ -299,6 +343,24 @@ def test_failure_and_cancellation_preserve_checkpoint_revision(
     seed = claim_run(store, "terminal-seed-owner")
     assert seed is not None
     assert complete_with_budget(store, seed, budget=6_000) == RunCommitOutcome.COMMITTED
+    legacy_checkpoint = AgentState(
+        thread_id="terminal-thread",
+        destination="Tokyo",
+        budget=6_000,
+        execution_trace=[
+            TraceEvent(
+                event="legacy.marker",
+                reason="must survive non-successful Runs",
+                payload={"marker": "legacy"},
+            )
+        ],
+    )
+    store_backend.replace_checkpoint_out_of_band(
+        tenant_id=TENANT_ID,
+        thread_id="terminal-thread",
+        state=legacy_checkpoint,
+        expected_revision=1,
+    )
 
     create_queued_run(store, "run-terminal-failed", thread_id="terminal-thread", order=2)
     failed = claim_run(store, "terminal-failed-owner")
@@ -338,9 +400,10 @@ def test_failure_and_cancellation_preserve_checkpoint_revision(
         domain_id="travel",
         schema_version="1",
     )
-    assert snapshot.revision == 1
+    assert snapshot.revision == 2
     assert isinstance(snapshot.state, AgentState)
     assert snapshot.state.budget == 6_000
+    assert snapshot.state.execution_trace == legacy_checkpoint.execution_trace
     failed_run = reopened.get_run_internal("run-terminal-failed")
     cancelled_run = reopened.get_run_internal("run-terminal-cancelled")
     assert failed_run is not None and failed_run.error_code == "conformance_expected_failure"

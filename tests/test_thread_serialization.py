@@ -186,6 +186,8 @@ def test_successor_claim_captures_predecessor_checkpoint_revision_and_state(tmp_
         {
             "thread_id": "revision-thread",
             "trace_events": 0,
+            "run_trace_events": 0,
+            "projection": "execution_trace_reset",
             "base_revision": 1,
             "revision": 2,
         }

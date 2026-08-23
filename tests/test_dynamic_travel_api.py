@@ -161,7 +161,17 @@ def test_dynamic_travel_happy_path_is_visible_through_existing_api_and_sse(tmp_p
         assert streamed_events == events
 
         thread_state = client.get("/threads/dynamic-happy/state").json()
-        assert thread_state == result["state"]
+        assert result["state"]["execution_trace"]
+        assert thread_state["execution_trace"] == []
+        assert {
+            key: value
+            for key, value in thread_state.items()
+            if key != "execution_trace"
+        } == {
+            key: value
+            for key, value in result["state"].items()
+            if key != "execution_trace"
+        }
         internal = client.app.state.run_store.get_run_internal(run_id)
         assert internal is not None and internal.execution_authority is not None
         assert internal.execution_authority.subject_id == "phase5a-subject"

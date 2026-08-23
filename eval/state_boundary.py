@@ -75,6 +75,12 @@ class CheckpointObservation:
     state: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RunStateObservation:
+    raw_json: str
+    state: dict[str, Any]
+
+
 class ManagedHarness:
     """Small deterministic driver around the real managed Run lifecycle."""
 
@@ -151,6 +157,20 @@ class ManagedHarness:
         raw_json = str(row[1])
         return CheckpointObservation(
             revision=int(row[0]),
+            raw_json=raw_json,
+            state=json.loads(raw_json),
+        )
+
+    def run_state(self, run_id: str) -> RunStateObservation:
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT state_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise AssertionError(f"missing completed Run state for {run_id}")
+        raw_json = str(row[0])
+        return RunStateObservation(
             raw_json=raw_json,
             state=json.loads(raw_json),
         )
@@ -514,11 +534,16 @@ def characterize_confirm_plan(workspace: Path) -> dict[str, Any]:
             if event.event_type == "checkpoint.loaded"
         )
 
+    first_state = AgentState.model_validate(first_run.state)
     confirmed_state = AgentState.model_validate(confirmed_run.state)
     return {
         "previous_turn": {
             "run_status": first_run.status.value,
             "checkpoint_revision": first_checkpoint.revision,
+            "checkpoint_execution_trace_events": len(
+                first_checkpoint.state["execution_trace"]
+            ),
+            "run_result_execution_trace_events": len(first_state.execution_trace),
             "itinerary_total_cost": first_checkpoint.state["itinerary"]["total_cost"],
             "cost_breakdown": first_checkpoint.state["tool_outputs"]["cost_breakdown"],
         },
@@ -533,6 +558,10 @@ def characterize_confirm_plan(workspace: Path) -> dict[str, Any]:
             "review_evidence": review.observations[-1],
             "validation_errors": confirmed_run.validation_errors,
             "checkpoint_revision": confirmed_checkpoint.revision,
+            "checkpoint_execution_trace_events": len(
+                confirmed_checkpoint.state["execution_trace"]
+            ),
+            "run_result_execution_trace_events": len(confirmed_state.execution_trace),
         },
         "observed_dependency": (
             "confirm_plan reuses checkpoint itinerary/budget and the review evidence "
@@ -551,24 +580,33 @@ def _serialized_value_bytes(value: Any) -> int:
 
 def _checkpoint_size(
     checkpoint: CheckpointObservation,
+    run_state: RunStateObservation,
     *,
     turn: int,
     message: str,
     previous_total: int,
+    checkpoint_event: dict[str, Any],
 ) -> dict[str, Any]:
     total = len(checkpoint.raw_json.encode("utf-8"))
-    execution_trace = _serialized_value_bytes(checkpoint.state["execution_trace"])
+    checkpoint_trace = _serialized_value_bytes(checkpoint.state["execution_trace"])
+    run_trace = _serialized_value_bytes(run_state.state["execution_trace"])
     tool_outputs = _serialized_value_bytes(checkpoint.state["tool_outputs"])
     return {
         "turn": turn,
         "message": message,
         "checkpoint_revision": checkpoint.revision,
         "total_checkpoint_bytes": total,
-        "execution_trace_value_bytes": execution_trace,
+        "checkpoint_execution_trace_value_bytes": checkpoint_trace,
+        "checkpoint_execution_trace_events": len(checkpoint.state["execution_trace"]),
+        "run_result_total_bytes": len(run_state.raw_json.encode("utf-8")),
+        "run_result_execution_trace_value_bytes": run_trace,
+        "run_result_execution_trace_events": len(run_state.state["execution_trace"]),
         "tool_outputs_value_bytes": tool_outputs,
-        "other_state_and_json_structure_bytes": total - execution_trace - tool_outputs,
+        "other_state_and_json_structure_bytes": total - checkpoint_trace - tool_outputs,
         "growth_from_previous_checkpoint_bytes": total - previous_total,
-        "execution_trace_events": len(checkpoint.state["execution_trace"]),
+        "checkpoint_event_trace_events": checkpoint_event["trace_events"],
+        "checkpoint_event_run_trace_events": checkpoint_event["run_trace_events"],
+        "checkpoint_projection": checkpoint_event["projection"],
         "retry_count": checkpoint.state["retry_count"],
     }
 
@@ -589,23 +627,33 @@ def characterize_checkpoint_growth(workspace: Path) -> dict[str, Any]:
     previous_total = 0
     with harness:
         for index, message in enumerate(turns, start=1):
-            harness.submit(
+            run = harness.submit(
                 thread_id="growth-thread",
                 agent_version="0.5.0",
                 message=message,
             )
             checkpoint = harness.checkpoint("growth-thread")
+            run_state = harness.run_state(run.run_id)
+            checkpoint_event = next(
+                event.payload
+                for event in harness.store.list_events(run.run_id)
+                if event.event_type == "checkpoint.saved"
+            )
             measurement = _checkpoint_size(
                 checkpoint,
+                run_state,
                 turn=index,
                 message=message,
                 previous_total=previous_total,
+                checkpoint_event=checkpoint_event,
             )
             measurements.append(measurement)
             previous_total = measurement["total_checkpoint_bytes"]
 
     totals = [item["total_checkpoint_bytes"] for item in measurements]
-    traces = [item["execution_trace_value_bytes"] for item in measurements]
+    checkpoint_traces = [
+        item["checkpoint_execution_trace_value_bytes"] for item in measurements
+    ]
     return {
         "measurement_definition": (
             "UTF-8 bytes of persisted compact state_json; field contributions are the "
@@ -616,12 +664,25 @@ def characterize_checkpoint_growth(workspace: Path) -> dict[str, Any]:
             "total_bytes_first": totals[0],
             "total_bytes_last": totals[-1],
             "total_net_growth_bytes": totals[-1] - totals[0],
-            "execution_trace_net_growth_bytes": traces[-1] - traces[0],
-            "strictly_monotonic_total": all(
-                later > earlier for earlier, later in zip(totals, totals[1:])
+            "checkpoint_execution_trace_net_growth_bytes": (
+                checkpoint_traces[-1] - checkpoint_traces[0]
             ),
-            "strictly_monotonic_execution_trace": all(
-                later > earlier for earlier, later in zip(traces, traces[1:])
+            "checkpoint_execution_trace_empty_all": all(
+                item["checkpoint_execution_trace_events"] == 0
+                for item in measurements
+            ),
+            "checkpoint_execution_trace_size_stable": len(set(checkpoint_traces)) == 1,
+            "run_result_execution_trace_nonempty_all": all(
+                item["run_result_execution_trace_events"] > 0
+                for item in measurements
+            ),
+            "checkpoint_event_counts_truthful": all(
+                item["checkpoint_event_trace_events"]
+                == item["checkpoint_execution_trace_events"]
+                and item["checkpoint_event_run_trace_events"]
+                == item["run_result_execution_trace_events"]
+                and item["checkpoint_projection"] == "execution_trace_reset"
+                for item in measurements
             ),
         },
     }
@@ -668,7 +729,7 @@ def characterize_retry_scope(workspace: Path) -> dict[str, Any]:
 def build_report(workspace: Path) -> dict[str, Any]:
     workspace.mkdir(parents=True, exist_ok=True)
     return {
-        "report_schema": "state-boundary-characterization-v1",
+        "report_schema": "state-boundary-characterization-v2",
         "deterministic_boundary": {
             "planner": "ScriptedTravelPlanner",
             "tools": "offline synthetic Travel handlers via direct eval adapter",

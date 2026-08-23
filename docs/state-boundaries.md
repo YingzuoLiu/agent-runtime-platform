@@ -1,9 +1,10 @@
 # Persisted state boundaries
 
-This document characterizes the state boundaries that exist at commit `b97df235`. It is an
-observational contract for deciding whether a later checkpoint-cleanup change is justified. It
-does not change the Travel state schema, checkpoint compare-and-swap, memory behavior, or Runtime
-scheduling, and it does not claim that every observed behavior is the intended long-term design.
+This document defines the persisted state boundaries after the narrow checkpoint-trace projection
+was introduced. The Travel and other domain schemas remain unchanged. Run completion still uses
+the existing lease fence, checkpoint revision compare-and-swap, and one transaction; the change is
+that the Run row retains the full validated result while the Thread checkpoint receives a
+deterministic projection with `execution_trace=[]`.
 
 The accompanying evaluator is [`eval/state_boundary.py`](../eval/state_boundary.py). Its committed
 output is [`eval/results/state_boundary_latest.json`](../eval/results/state_boundary_latest.json).
@@ -15,24 +16,30 @@ output is [`eval/results/state_boundary_latest.json`](../eval/results/state_boun
 | Run control | One `run_id`, tenant-qualified; scheduling additionally uses `(tenant_id, thread_id)` | `RuntimeManager` and `SQLiteRunStore` | Submission through terminal Run retention; a nonterminal expired lease remains recoverable | `runs` row plus ordered `run_events` | Store-time lease deadline, current `lease_token`, status/cancellation CAS, and one-running-Run-per-thread constraint fence managed mutations | submit/create, `claim_next_run`, heartbeat renewal, cancellation CAS, and fenced completion/failure/cancellation methods |
 | Workflow ledger | Run, workflow execution, step/tool attempt, and external action | `DynamicToolLoop`, `ExternalActionCoordinator`, and `WorkflowStore` | Durable execution and external-effect evidence retained after Run terminalization | `workflow_executions`, `tool_calls`, `external_actions`, and `workflow_events`; `read_run_snapshot` gives one read transaction | Stable workflow/step/action identity; attempt and dispatch tokens fence stale results; the managed path also supplies the current Run lease token | `WorkflowStore` transition methods atomically update their row and workflow event; external-action finalization also binds the parent tool result |
 | Event history | Per Run, split between public Run events and internal workflow events | Run store/event sink and workflow store; `EvidenceProjector` mirrors workflow facts | Append-only evidence for the retained Run | `run_events` ordered by per-Run sequence; `workflow_events` ordered separately | Unique ordered sequence per stream. Workflow/action rows are authoritative before their public Run-event mirror; not every cross-store mirror is one transaction | Run atomic transition methods, attempt-fenced append, workflow atomic transitions, and evidence projection/repair |
-| Domain checkpoint | One `(tenant_id, thread_id)` with one pinned `domain_id` and `schema_version` | Domain Runtime produces typed state; `RuntimeManager` validates it; `SQLiteRunStore` commits it | Latest cross-turn state until the next successful managed completion replaces it | Latest `thread_states.state_json`; completed Run rows retain historical result state | Same-thread serialization, captured base revision, revision CAS at load and completion, and current Run lease fencing | First seed only on an empty thread; otherwise only the atomic successful completion path writes the checkpoint and increments revision |
+| Domain checkpoint | One `(tenant_id, thread_id)` with one pinned `domain_id` and `schema_version` | Domain Runtime produces typed state; `RuntimeManager` validates it; `SQLiteRunStore` projects and commits it | Latest cross-turn state until the next successful managed completion replaces it | Latest `thread_states.state_json`; completed Run rows retain the full historical result state | Same-thread serialization, captured base revision, revision CAS at load and completion, current Run lease fencing, and a store-enforced trace projection | First seed only on an empty thread; otherwise only the atomic successful completion path writes `execution_trace=[]` and increments revision |
 | Governed memory | Logical `(tenant_id, subject_id, domain_id, kind, key)` | `GovernedMemory`, `MemoryStore`, and the domain memory policy | Cross-thread version history until operational forgetting; expiry may hide an active record | `memory_records` versions and `memory_events` mutation audit | At most one active logical version; different values supersede in one transaction; tenant/subject scope and persisted Run permissions fail closed | Allowlisted extraction followed by `remember`/`upsert_from_run`; administrative APIs list or tombstone the subject's logical key |
 | Sealed memory snapshot | One Run, bound to its persisted tenant, subject, and domain | `GovernedMemory` and `MemoryStore` | Immutable Run evidence, including an explicitly empty retrieval | `run_memory_snapshots` | First get-or-create seals the view. Managed retrieval requires the current Run lease and validates persisted Run authority; later memory writes or deletion do not rewrite it | First memory retrieval at the Run boundary; retries and recovered attempts reuse the existing row |
 
 Important qualifications:
 
-- `runs.state_json` and `thread_states.state_json` receive the same typed result during successful
-  completion, but they have different scopes: the former is the immutable result of that Run; the
-  latter becomes input to the next Run on the thread.
+- `runs.state_json` receives the full validated final state, including that Run's
+  `execution_trace`. `thread_states.state_json` receives the same concrete state type and all the
+  same non-trace fields, but persists `execution_trace=[]` for the next Run.
 - `run_events` are not the authority for an external action when their mirror is incomplete. The
   workflow/action ledger remains authoritative and drives reconciliation.
 - A checkpoint is a latest-state projection, not an append-only history. Revision CAS proves which
-  predecessor it was derived from; it does not make every field equally suitable for cross-turn
-  retention.
+  predecessor it was derived from; Run/workflow events and each completed Run's full state retain
+  execution evidence without copying prior trace prefixes into mutable Thread state.
+
+Legacy checkpoints with non-empty traces remain readable. They are not rewritten at startup and
+their revision does not change merely because the binary was upgraded. The next Run receives the
+legacy checkpoint unchanged; only its next successful completion stores an empty checkpoint trace.
+Failure or cancellation leaves the legacy row and revision untouched. The following successor then
+loads the compacted checkpoint. No schema-version bump or table migration is required.
 
 ## Travel field classification
 
-The classifications below describe current reads and writes, not a target schema.
+The classifications below describe current enforced reads and writes, not a broader target schema.
 
 | Field | Characterization | Current evidence and remaining gap |
 | --- | --- | --- |
@@ -42,7 +49,7 @@ The classifications below describe current reads and writes, not a target schema
 | `tool_outputs` | Mixed/unclear semantics | In `0.5.0`, `cost_breakdown` is read on a later `confirm_plan` turn by `PlanEvidenceBuilder` as a complete cost ledger. If absent, the existing builder falls back to `itinerary.total_cost`, so the breakdown is enhanced evidence rather than the only admissible source. In dynamic `1.x`, `_prepare_state` clears this field at the start of each Run and the completed state stores a projection of that Run's tool observations while the workflow ledger remains durable execution authority. The whole field cannot be classified as only cache or only cross-turn state. |
 | `blockers` | Derived current-thread projection | Validation or clarification writes it and later actionable input clears/replaces it. It affects the current response/stage, but no recovery path uses it as tool/action authority. Whether older blockers should remain available belongs to history/evidence, not yet a proven checkpoint requirement. |
 | `current_stage` | Derived but needed across turns and API reads | It is the current domain outcome projection (`planning`, `planned`, `needs_repair`, and so on). Dynamic follow-ups overwrite it. It is not the Run status and must not be used as Run-control authority. |
-| `execution_trace` | Replay/evidence-shaped, run-scoped candidate; exact authority is unproven | Production code appends to it but does not make a later decision by reading earlier trace entries; the dynamic workflow input hash explicitly excludes it. The checkpoint-growth eval shows cumulative retention. However, the Run/workflow event streams are not proven to reconstruct every trace payload exactly, so calling it fully replayable from other ledgers would overstate the evidence. |
+| `execution_trace` | Run-scoped final-state evidence; projected out of the next checkpoint | Production code appends current execution observations, and the completed Run row retains them. `SQLiteRunStore.commit_completed_run()` enforces a same-type, deep-independent checkpoint projection with an empty trace after Runtime execution and validation. Existing event ledgers remain unchanged, but they are not claimed to reconstruct every `TraceEvent` payload exactly. |
 | `retry_count` | Authoritative durable state in current behavior; semantic scope is unclear | `TravelAgentRuntime` reads it against `retry_limit`, increments it on validation failure, persists it in the checkpoint, and never resets it after a successful repair. The eval proves it therefore behaves as a thread-level cumulative counter across independent Runs, while `RunRecord.attempt` separately remains per Run. No published product contract establishes whether the cumulative behavior is intended. |
 
 ## Characterization method
@@ -151,22 +158,23 @@ that every tool output must remain in the checkpoint forever.
 
 ### Checkpoint growth
 
-Size is the UTF-8 byte length of the exact compact `thread_states.state_json`. The two field
-columns are compact serialized value sizes; `other` includes all other values plus JSON keys and
-punctuation. No persisted checkpoint was altered to calculate the breakdown.
+Size is the UTF-8 byte length of the exact compact persisted JSON. Checkpoint and Run-result trace
+columns are measured separately; `other` includes all non-trace/non-`tool_outputs` checkpoint
+values plus JSON keys and punctuation. No persisted row was altered to calculate the breakdown.
 
 | Observation | Characterized result |
 | --- | --- |
-| Total checkpoint size | Increased on every turn |
-| `execution_trace` contribution | Increased on every turn |
-| Net-growth attribution | More than 99% came from `execution_trace`; the regression invariant requires more than 95% |
+| Total checkpoint size | 523 bytes on turn 1 and 608 on turn 8; intermediate growth was positive, negative, or zero |
+| Checkpoint `execution_trace` | Empty on all eight successful revisions; serialized value remained 2 bytes (`[]`) |
+| Run-result `execution_trace` | Non-empty on all eight completed Runs |
+| `checkpoint.saved` counts | `trace_events` matched the persisted checkpoint and `run_trace_events` matched the full Run result on every turn |
 | `tool_outputs` contribution | Remained constant across the scenario |
 | Field accounting | Total bytes equal trace value + tool-output value + other state/JSON structure on every turn |
 
-The exact per-turn byte measurements remain in the committed JSON evidence. The proportional result
-answers the scoped question: `execution_trace` causes monotonic checkpoint growth and dominates net
-growth for this repeatable eight-turn path. It is not a universal growth rate, capacity limit, or
-production-size guarantee.
+The exact per-turn byte measurements remain in the committed JSON evidence. They prove that
+cumulative trace prefixes are no longer a checkpoint growth source while per-Run trace evidence is
+retained. They do not prove that checkpoint size is globally bounded, that other fields cannot
+grow, or that every derived field should be projected out.
 
 ### `retry_count` scope
 
@@ -187,8 +195,9 @@ impact and a minimal reproduction are now explicit for a later narrow decision.
 
 ## Answers and recommendation
 
-1. **Does `execution_trace` cause monotonic checkpoint growth?** Yes in the characterized
-   eight-turn scenario. It accounts for more than 99% of net growth after turn 1.
+1. **Does `execution_trace` still cause monotonic checkpoint growth?** No in the characterized
+   eight-turn managed path. Every persisted checkpoint trace is `[]`, while every completed Run
+   retains a non-empty current-Run trace.
 2. **What is `tool_outputs`?** Mixed. `0.5.0` reads a current-plan cost projection across turns;
    dynamic `1.x` replaces it with the current Run's observation projection while the workflow
    ledger owns durable execution evidence. It is neither only a temporary cache nor one uniform
@@ -203,14 +212,9 @@ impact and a minimal reproduction are now explicit for a later narrow decision.
    memory-free version. That is intentional layered overlap with explicit precedence, not proof of
    two coequal authorities and not proof that overlap can never become stale. The `preferences`
    container therefore remains version- and key-sensitive.
-5. **Recommended next option:** **B — add a narrow checkpoint projection**, if cleanup is pursued.
-   The evidence supports first stopping cumulative `execution_trace` prefixes from flowing into
-   the next thread checkpoint while retaining per-Run result/evidence. It does **not** support
-   projecting away all `tool_outputs`, moving `retry_count`, or changing the schema in the same
-   PR. Before implementing B, specify whether API consumers rely on cumulative checkpoint traces
-   and prove which Run/workflow evidence must preserve each trace payload.
+5. **What cleanup is enforced?** Only the narrow `execution_trace` projection. It does **not**
+   project away `tool_outputs`, move `retry_count`, change governed memory, or change the schema.
 
-Option C (split a mixed field) may become justified for `tool_outputs`, but its 92-byte value was
-flat in this scenario and the exact per-version consumer contract is not yet characterized enough
-to make that the first cleanup. Option D (move Run-scoped data) is premature until the intended
-retry episode is defined. No production-state semantics were modified by this characterization.
+Splitting `tool_outputs` may become justified later, but its 92-byte value was flat in this scenario
+and the exact per-version consumer contract is not characterized enough for that change. Moving
+`retry_count` also remains premature until the intended retry episode is defined.

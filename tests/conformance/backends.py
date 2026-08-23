@@ -17,6 +17,28 @@ class InjectedConformanceFailure(RuntimeError):
     """Stable failure used to prove transactional rollback at event boundaries."""
 
 
+class _FailingCheckpointConnection:
+    """Test-only connection proxy that fails at the checkpoint write boundary."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def execute(self, sql: str, parameters=()):
+        if "INSERT INTO thread_states" in sql:
+            raise InjectedConformanceFailure("injected checkpoint write failure")
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
 class AdjustableStoreClock(Protocol):
     def __call__(self) -> int: ...
 
@@ -108,6 +130,19 @@ class SQLiteConformanceBackend:
             yield
         finally:
             store._append_event_with_connection = original  # type: ignore[method-assign]
+
+    @contextmanager
+    def fail_checkpoint_write(self, store: SQLiteRunStore) -> Iterator[None]:
+        original = store._lease_connect
+
+        def injected():
+            return _FailingCheckpointConnection(original())
+
+        store._lease_connect = injected  # type: ignore[method-assign]
+        try:
+            yield
+        finally:
+            store._lease_connect = original  # type: ignore[method-assign]
 
     def replace_checkpoint_out_of_band(
         self,

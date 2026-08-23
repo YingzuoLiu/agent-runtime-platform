@@ -5,7 +5,7 @@ import threading
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from agent.contracts import RuntimeExecutionContext, RuntimeExecutionError
+from agent.contracts import RuntimeExecutionContext, RuntimeExecutionError, TraceEvent
 from domains.travel.runtime import TravelMessageInput
 from domains.travel.state import AgentState
 from runtime_service.evidence import EvidenceProjector
@@ -317,6 +317,13 @@ def test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine(
             thread_id=thread_id,
             destination="Tokyo",
             budget=7_777,
+            execution_trace=[
+                TraceEvent(
+                    event="legacy.conflict_marker",
+                    reason="checkpoint preserved through restart quarantine",
+                    payload={"marker": "quarantine-checkpoint"},
+                )
+            ],
         ),
         expected_revision=1,
     )
@@ -409,6 +416,17 @@ def test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine(
     assert after_cancel.status == RunStatus.RUNNING
     assert after_cancel.error_code == THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
     assert after_cancel.cancel_requested
+    quarantined_checkpoint = restarted.load_thread_state_snapshot(
+        thread_id,
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert quarantined_checkpoint.revision == 2
+    assert isinstance(quarantined_checkpoint.state, AgentState)
+    assert quarantined_checkpoint.state.execution_trace[0].payload == {
+        "marker": "quarantine-checkpoint"
+    }
 
     create_queued_run(
         restarted,
@@ -451,6 +469,10 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
         schema_version="1",
     )
     before_workflow = workflow_store.read_run_snapshot(run_id)
+    assert isinstance(before_checkpoint.state, AgentState)
+    assert before_checkpoint.state.execution_trace[0].payload == {
+        "marker": "quarantine-checkpoint"
+    }
 
     plan = run_store.plan_quarantine_resolution(
         run_id,
@@ -517,11 +539,23 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
     successor = claim_run(store_backend.open_run_store(), "released-successor-owner")
     assert successor is not None
     assert successor.run.run_id == successor_id
+    successor.run.state = AgentState(
+        thread_id=thread_id,
+        destination="Tokyo",
+        budget=7_000,
+        execution_trace=[
+            TraceEvent(
+                event="successor.marker",
+                reason="full successor Run evidence",
+                payload={"marker": "post-repair-successor"},
+            )
+        ],
+    )
+    successor.run.output_message = "budget=7000"
     assert (
-        complete_with_budget(
-            store_backend.open_run_store(),
-            successor,
-            budget=7_000,
+        store_backend.open_run_store().commit_completed_run(
+            successor.run,
+            lease_token=successor.lease_token,
         )
         == RunCommitOutcome.COMMITTED
     )
@@ -532,6 +566,16 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
         schema_version="1",
     )
     assert advanced_checkpoint.revision == before_checkpoint.revision + 1
+    assert isinstance(advanced_checkpoint.state, AgentState)
+    assert advanced_checkpoint.state.execution_trace == []
+    durable_successor = store_backend.open_run_store().get_run_internal(
+        successor.run.run_id
+    )
+    assert durable_successor is not None
+    assert isinstance(durable_successor.state, AgentState)
+    assert durable_successor.state.execution_trace[0].payload == {
+        "marker": "post-repair-successor"
+    }
 
     # The released successor may legally win the post-commit readback race.
     # Forward checkpoint progress must not turn a committed resolution into 500.
