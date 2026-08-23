@@ -95,6 +95,21 @@ class ExternalActionStatusSummary(BaseModel):
     succeeded: int = Field(ge=0)
     failed: int = Field(ge=0)
     outcome_unknown: int = Field(ge=0)
+    unrecognized: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_total(self) -> "ExternalActionStatusSummary":
+        counted = (
+            self.prepared
+            + self.dispatching
+            + self.succeeded
+            + self.failed
+            + self.outcome_unknown
+            + self.unrecognized
+        )
+        if self.total != counted:
+            raise ValueError("external action status counts must equal total")
+        return self
 
 
 class QuarantineThreadReference(BaseModel):
@@ -123,6 +138,7 @@ class QuarantineResolutionPlan(BaseModel):
     thread: QuarantineThreadReference
     current_run_status: RunStatus
     current_quarantine_code: str | None = None
+    cancel_requested: bool
     checkpoint_base_revision: int | None = Field(default=None, ge=0)
     observed_checkpoint_revision: int = Field(ge=0)
     external_actions: ExternalActionStatusSummary
@@ -163,4 +179,3 @@ class QuarantineResolutionCommit(BaseModel):
     reused: bool
     workflow_evidence_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     checkpoint_evidence_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    checkpoint_state_json: str | None = Field(default=None, exclude=True)

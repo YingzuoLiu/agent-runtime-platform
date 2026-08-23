@@ -326,6 +326,40 @@ def test_nonterminal_action_is_ineligible_and_never_releases_thread(
     )
 
 
+def test_unrecognized_action_status_is_counted_and_ineligible(
+    backend: SQLiteConformanceBackend,
+) -> None:
+    run_id, _thread_id, _successor_id, run_store, _workflow_store = (
+        create_quarantine(
+            backend,
+            suffix="unrecognized-action-status",
+        )
+    )
+    with closing(sqlite3.connect(backend.database_path, timeout=30)) as connection, connection:
+        connection.execute(
+            "UPDATE external_actions SET status = 'provider_specific' WHERE run_id = ?",
+            (run_id,),
+        )
+
+    _target, plan = plan_for(run_store, run_id)
+
+    assert not plan.eligible
+    assert plan.external_actions.total == 1
+    assert plan.external_actions.unrecognized == 1
+    assert sum(
+        (
+            plan.external_actions.prepared,
+            plan.external_actions.dispatching,
+            plan.external_actions.succeeded,
+            plan.external_actions.failed,
+            plan.external_actions.outcome_unknown,
+            plan.external_actions.unrecognized,
+        )
+    ) == plan.external_actions.total
+    assert plan.workflow_reconciliation_required
+    assert "external_action_nonterminal" in plan.ineligibility_reasons
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["cancel", "lease", "attempt", "status", "quarantine_code"],
@@ -462,6 +496,37 @@ def test_post_commit_checkpoint_change_returns_evidence_incomplete(
                 TENANT_ID,
                 thread_id,
             ),
+        )
+
+    with pytest.raises(QuarantineResolutionEvidenceIncompleteError):
+        run_store.verify_quarantine_resolution(commit)
+
+
+def test_post_commit_checkpoint_revision_regression_returns_evidence_incomplete(
+    backend: SQLiteConformanceBackend,
+) -> None:
+    run_id, thread_id, _successor_id, run_store, _workflow_store = create_quarantine(
+        backend,
+        suffix="post-commit-revision-regression",
+    )
+    target, plan = plan_for(run_store, run_id)
+    assert plan.plan_id is not None
+    commit = run_store.apply_quarantine_resolution(
+        run_id,
+        tenant_id=TENANT_ID,
+        target=target,
+        resolution=RESOLUTION,
+        expected_plan_id=plan.plan_id,
+        operator_subject_id="operator",
+        operator_credential_id="credential",
+    )
+    with closing(sqlite3.connect(backend.database_path, timeout=30)) as connection, connection:
+        connection.execute(
+            """
+            UPDATE thread_states SET revision = revision - 1
+            WHERE tenant_id = ? AND thread_id = ?
+            """,
+            (TENANT_ID, thread_id),
         )
 
     with pytest.raises(QuarantineResolutionEvidenceIncompleteError):

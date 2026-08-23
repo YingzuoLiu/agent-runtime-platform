@@ -449,8 +449,11 @@ def test_public_run_resolution_enforces_permission_tenant_and_exact_replay(tmp_p
     assert stale_apply.json()["error"]["code"] == (
         "quarantine_resolution_plan_stale"
     )
+    stale_current_plan = stale_apply.json()["error"]["details"]["current_plan"]
+    assert stale_current_plan["cancel_requested"] is True
     assert refreshed_dry_run.status_code == 200
     assert refreshed_dry_run.json()["plan"]["eligible"]
+    assert refreshed_dry_run.json()["plan"] == stale_current_plan
     assert plan_id != stale_plan_id
     assert applied.status_code == 200
     assert applied.json()["outcome"] == "applied"

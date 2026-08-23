@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -127,12 +127,14 @@ class ActionRouteError(Exception):
         message: str,
         *,
         headers: Mapping[str, str] | None = None,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.headers = dict(headers or {})
+        self.details = dict(details) if details is not None else None
 
 
 class NoStoreStaticFiles(StaticFiles):
@@ -506,11 +508,15 @@ def create_app(
         exc: ActionRouteError,
     ) -> JSONResponse:
         envelope = ActionApiErrorEnvelope(
-            error=ActionApiErrorBody(code=exc.code, message=exc.message)
+            error=ActionApiErrorBody(
+                code=exc.code,
+                message=exc.message,
+                details=exc.details,
+            )
         )
         return JSONResponse(
             status_code=exc.status_code,
-            content=envelope.model_dump(mode="json"),
+            content=envelope.model_dump(mode="json", exclude_none=True),
             headers=exc.headers,
         )
 
@@ -896,11 +902,14 @@ def create_app(
                 "quarantine_target_not_found",
                 "Quarantine target not found.",
             ) from None
-        except QuarantineResolutionStalePlanError:
+        except QuarantineResolutionStalePlanError as exc:
             raise ActionRouteError(
                 status.HTTP_409_CONFLICT,
                 "quarantine_resolution_plan_stale",
                 "The quarantine resolution plan is stale; run dry-run again.",
+                details={
+                    "current_plan": exc.current_plan.model_dump(mode="json"),
+                },
             ) from None
         except QuarantineResolutionEvidenceIncompleteError:
             raise ActionRouteError(

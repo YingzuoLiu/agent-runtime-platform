@@ -40,9 +40,10 @@ POST /operator/quarantine-resolutions
 permission: quarantine:resolve
 ```
 
-The default Viewer role does not have this permission. The default Operator role does. Lookup is
-tenant-scoped before authorization: an unknown target and a cross-tenant target return the same
-`404 quarantine_target_not_found`, while a same-tenant Viewer receives
+The permission is typed separately from ordinary Run permissions. The current static role mapping
+grants it to every Operator and not to Viewer; custom or incident-only roles are not implemented.
+Lookup is tenant-scoped before authorization: an unknown target and a cross-tenant target return the
+same `404 quarantine_target_not_found`, while a same-tenant Viewer receives
 `403 operation_not_permitted`.
 
 A public Run is targeted by `run_id`:
@@ -68,6 +69,12 @@ A private Durable Action is targeted by its public `action_id`:
 Exactly one target field is allowed. A private Action-owned Run remains unavailable through generic
 Run routes. Its plan uses `action_id` as the public Thread-slot reference and never exposes the
 private Run's Thread ID.
+
+Public-Run visibility is resolved from the live agent registry. If a formerly public agent version
+has been deregistered, the operation fails closed as not found because the persisted Run row does
+not record whether that version was public. Re-register the pinned version before using this API;
+blindly treating every unknown non-Action version as public could expose a historically private
+domain. Persisting Run visibility is outside this SQLite slice.
 
 ## Eligibility
 
@@ -99,8 +106,9 @@ outcome_unknown
 
 `outcome_unknown` is not a guess that the provider succeeded or failed. It is an explicit durable
 terminal safety conclusion: the Runtime will not redispatch the uncertain effect. By contrast,
-`prepared`, `dispatching`, and the public Action projection `reconciling` remain ineligible and keep
-the Thread blocked.
+`prepared`, `dispatching`, unrecognized durable statuses, and the public Action projection
+`reconciling` remain ineligible and keep the Thread blocked. Unrecognized rows are reported in a
+separate counter so the status totals remain self-explaining.
 
 Current stable ineligibility reason codes are:
 
@@ -140,6 +148,7 @@ An eligible dry-run returns a sanitized plan like:
     },
     "current_run_status": "running",
     "current_quarantine_code": "thread_checkpoint_conflict_reconciliation_pending",
+    "cancel_requested": false,
     "checkpoint_base_revision": 1,
     "observed_checkpoint_revision": 2,
     "external_actions": {
@@ -148,7 +157,8 @@ An eligible dry-run returns a sanitized plan like:
       "dispatching": 0,
       "succeeded": 1,
       "failed": 0,
-      "outcome_unknown": 0
+      "outcome_unknown": 0,
+      "unrecognized": 0
     },
     "workflow_reconciliation_required": false,
     "planned_run_transition": "running -> failed",
@@ -171,7 +181,9 @@ used only inside the composite hash input; no individual field hash or raw value
 The plan and audit event never contain checkpoint JSON, Run state, tool arguments, provider result
 bodies, lease or dispatch tokens, caller/provider idempotency keys, credentials, provider identity,
 or raw exception chains. The plan ID is a stale-state detector, not an authority token; every apply
-request is authenticated and authorized again.
+request is authenticated and authorized again. `cancel_requested` is exposed on the plan because a
+pending cancellation is reachable while quarantined; applying still records the narrower terminal
+cause `thread_checkpoint_conflict` rather than silently representing it as cancellation.
 
 ## Dry-run is zero-write
 
@@ -215,9 +227,10 @@ workflow, tool, action, and event tables:
 8. append `run.failed`;
 9. commit atomically.
 
-Any plan drift returns `409 quarantine_resolution_plan_stale` and writes nothing. Event-append
-failure rolls back the Run transition and any earlier event in the transaction. No provider, LLM,
-Runtime execution, network call, or wait occurs in the transaction.
+Any plan drift returns `409 quarantine_resolution_plan_stale`, includes the newly derived sanitized
+plan under `error.details.current_plan`, and writes nothing. Event-append failure rolls back the Run
+transition and any earlier event in the transaction. No provider, LLM, Runtime execution, network
+call, or wait occurs in the transaction.
 
 The audit event records the resolution kind, plan ID, source quarantine code, base/current
 checkpoint revisions, preserved dispositions, provider call count `0`, non-secret operator subject
@@ -238,7 +251,9 @@ plan ID detects the one committed audit event and returns:
 ```
 
 Replay does not append another event or terminalize again. A different plan ID fails closed; merely
-finding a terminal Run is never treated as proof of replay.
+finding a terminal Run is never treated as proof of replay. A same-Thread successor may already have
+advanced the checkpoint before a delayed replay arrives. That expected progress does not invalidate
+the stored resolution identity.
 
 Before either `applied` or `reused` is returned, the service rereads durable state and requires:
 
@@ -246,7 +261,9 @@ Before either `applied` or `reused` is returned, the service rereads durable sta
 Run.status == failed
 Run.error_code == thread_checkpoint_conflict
 all lease fields cleared
-checkpoint revision and content unchanged
+checkpoint revision has not regressed
+checkpoint fingerprint unchanged if the revision is still the planned revision
+later revisions accepted as legal successor CAS progress
 workflow/tool/action evidence fingerprint unchanged
 exactly one matching resolution event
 exactly one matching run.failed event
@@ -255,7 +272,9 @@ exactly one matching run.failed event
 If readback is incomplete, the API returns
 `500 quarantine_resolution_evidence_incomplete`. A fresh commit is not rolled back after this
 post-commit observation; the error tells the operator not to assume success and to inspect durable
-evidence.
+evidence. Transaction-time plan revalidation proves that the resolution itself did not write the
+checkpoint. Post-commit verification deliberately distinguishes that guarantee from later,
+legitimate successor writes.
 
 ## Incident SOP
 
@@ -267,8 +286,9 @@ evidence.
 5. Preserve the returned plan ID in the incident record.
 6. Apply that exact plan once. If it is stale, do not retry the old plan; inspect the new evidence
    and run dry-run again.
-7. Confirm `verified=true`, one audit event, the failed Run, unchanged checkpoint revision/content,
-   unchanged workflow/action evidence, and normal successor claimability.
+7. Confirm `verified=true`, one audit event, the failed Run, unchanged workflow/action evidence, and
+   normal successor claimability. The checkpoint must either remain at the planned revision with
+   the same fingerprint or have advanced monotonically through a successor CAS.
 8. Resume Thread submissions only after the durable readback is understood.
 
 Never edit Run/checkpoint/lease/action rows, delete events, cancel as an unquarantine shortcut,
@@ -285,6 +305,8 @@ does not provide:
 - terminalization of prepared/dispatching/reconciling actions;
 - arbitrary repair DSL, SQL, field patching, or an operator UI;
 - modification or deletion of workflow, tool, action, checkpoint, or prior event evidence;
+- recovery of a deregistered public agent version without temporarily restoring its registry entry;
+- persisted historical public/private visibility for retired agent versions;
 - a production incident-management platform.
 
 Executable coverage is in `tests/test_quarantine_resolution.py`,

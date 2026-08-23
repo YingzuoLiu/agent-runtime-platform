@@ -76,7 +76,6 @@ class _QuarantinePlanSnapshot:
     plan: QuarantineResolutionPlan
     workflow_evidence_fingerprint: str
     checkpoint_evidence_fingerprint: str
-    checkpoint_state_json: str | None
 
 
 class StateRegistry(Protocol):
@@ -1550,13 +1549,18 @@ class SQLiteRunStore:
                 stored_plan, stored_workflow_fingerprint, stored_checkpoint_fingerprint = (
                     existing_resolution
                 )
+                checkpoint_progress_is_valid = self._checkpoint_progress_is_valid(
+                    baseline_revision=stored_plan.observed_checkpoint_revision,
+                    baseline_fingerprint=stored_checkpoint_fingerprint,
+                    observed_revision=current.plan.observed_checkpoint_revision,
+                    observed_fingerprint=current.checkpoint_evidence_fingerprint,
+                )
                 if (
                     stored_plan.target != target
                     or stored_plan.resolution != resolution
                     or stored_workflow_fingerprint
                     != current.workflow_evidence_fingerprint
-                    or stored_checkpoint_fingerprint
-                    != current.checkpoint_evidence_fingerprint
+                    or not checkpoint_progress_is_valid
                 ):
                     raise QuarantineResolutionEvidenceIncompleteError(
                         "Committed quarantine resolution evidence is inconsistent"
@@ -1567,7 +1571,6 @@ class SQLiteRunStore:
                     reused=True,
                     workflow_evidence_fingerprint=stored_workflow_fingerprint,
                     checkpoint_evidence_fingerprint=stored_checkpoint_fingerprint,
-                    checkpoint_state_json=current.checkpoint_state_json,
                 )
 
             plan = current.plan
@@ -1647,7 +1650,6 @@ class SQLiteRunStore:
             reused=False,
             workflow_evidence_fingerprint=current.workflow_evidence_fingerprint,
             checkpoint_evidence_fingerprint=current.checkpoint_evidence_fingerprint,
-            checkpoint_state_json=current.checkpoint_state_json,
         )
 
     def verify_quarantine_resolution(
@@ -1702,6 +1704,12 @@ class SQLiteRunStore:
             observed_revision,
             checkpoint_state_json,
         )
+        checkpoint_progress_is_valid = self._checkpoint_progress_is_valid(
+            baseline_revision=plan.observed_checkpoint_revision,
+            baseline_fingerprint=commit.checkpoint_evidence_fingerprint,
+            observed_revision=observed_revision,
+            observed_fingerprint=checkpoint_fingerprint,
+        )
         lease_cleared = all(
             run[field] is None
             for field in (
@@ -1715,9 +1723,7 @@ class SQLiteRunStore:
             run["status"] == RunStatus.FAILED.value
             and run["error_code"] == THREAD_CHECKPOINT_CONFLICT_CODE
             and lease_cleared
-            and observed_revision == plan.observed_checkpoint_revision
-            and checkpoint_state_json == commit.checkpoint_state_json
-            and checkpoint_fingerprint == commit.checkpoint_evidence_fingerprint
+            and checkpoint_progress_is_valid
             and workflow_fingerprint == commit.workflow_evidence_fingerprint
             and len(resolution_events) == 1
             and len(failed_events) == 1
@@ -1807,14 +1813,21 @@ class SQLiteRunStore:
             "succeeded": 0,
             "failed": 0,
             "outcome_unknown": 0,
+            "unrecognized": 0,
         }
-        unknown_status = False
         for action in action_rows:
             action_status = str(action["status"])
-            if action_status in counts:
+            if action_status in {
+                "prepared",
+                "dispatching",
+                "succeeded",
+                "failed",
+                "outcome_unknown",
+            }:
                 counts[action_status] += 1
             else:
-                unknown_status = True
+                counts["unrecognized"] += 1
+        unknown_status = counts["unrecognized"] > 0
         action_summary = ExternalActionStatusSummary(
             total=len(action_rows),
             **counts,
@@ -1939,6 +1952,7 @@ class SQLiteRunStore:
             thread=thread,
             current_run_status=RunStatus(run["status"]),
             current_quarantine_code=run["error_code"],
+            cancel_requested=bool(run["cancel_requested"]),
             checkpoint_base_revision=normalized_base_revision,
             observed_checkpoint_revision=observed_revision,
             external_actions=action_summary,
@@ -1962,7 +1976,6 @@ class SQLiteRunStore:
             plan=plan,
             workflow_evidence_fingerprint=workflow_fingerprint,
             checkpoint_evidence_fingerprint=checkpoint_fingerprint,
-            checkpoint_state_json=checkpoint_state_json,
         )
 
     @staticmethod
@@ -2148,6 +2161,22 @@ class SQLiteRunStore:
                 "state_fingerprint": state_fingerprint,
             }
         )
+
+    @staticmethod
+    def _checkpoint_progress_is_valid(
+        *,
+        baseline_revision: int,
+        baseline_fingerprint: str,
+        observed_revision: int,
+        observed_fingerprint: str,
+    ) -> bool:
+        """Accept legal successor CAS while detecting regression or same-revision drift."""
+
+        if observed_revision < baseline_revision:
+            return False
+        if observed_revision == baseline_revision:
+            return observed_fingerprint == baseline_fingerprint
+        return True
 
     @staticmethod
     def _canonical_resolution_hash(payload: dict[str, Any]) -> str:

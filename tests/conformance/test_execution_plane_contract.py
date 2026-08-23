@@ -492,7 +492,6 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
         operator_subject_id="conformance-operator",
         operator_credential_id="conformance-credential",
     )
-    run_store.verify_quarantine_resolution(commit)
 
     persisted = store_backend.open_run_store().get_run_internal(run_id)
     durable_checkpoint = store_backend.open_run_store().load_thread_state_snapshot(
@@ -515,6 +514,29 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
     assert events[-2].payload["plan_id"] == plan.plan_id
     assert events[-2].payload["provider_calls"] == 0
 
+    successor = claim_run(store_backend.open_run_store(), "released-successor-owner")
+    assert successor is not None
+    assert successor.run.run_id == successor_id
+    assert (
+        complete_with_budget(
+            store_backend.open_run_store(),
+            successor,
+            budget=7_000,
+        )
+        == RunCommitOutcome.COMMITTED
+    )
+    advanced_checkpoint = store_backend.open_run_store().load_thread_state_snapshot(
+        thread_id,
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert advanced_checkpoint.revision == before_checkpoint.revision + 1
+
+    # The released successor may legally win the post-commit readback race.
+    # Forward checkpoint progress must not turn a committed resolution into 500.
+    run_store.verify_quarantine_resolution(commit)
+
     replay = store_backend.open_run_store().apply_quarantine_resolution(
         run_id,
         tenant_id=TENANT_ID,
@@ -528,9 +550,6 @@ def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
     assert replay.reused
     assert len(store_backend.open_run_store().list_events(run_id)) == len(events)
 
-    successor = claim_run(store_backend.open_run_store(), "released-successor-owner")
-    assert successor is not None
-    assert successor.run.run_id == successor_id
     later_successor = store_backend.open_run_store().get_run_internal(
         later_successor_id
     )

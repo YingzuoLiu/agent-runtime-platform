@@ -199,6 +199,7 @@ class ActionApiErrorBody(BaseModel):
 
     code: str
     message: str
+    details: dict[str, Any] | None = None
 
 
 class ActionApiErrorEnvelope(BaseModel):

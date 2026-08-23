@@ -75,9 +75,10 @@ and tools and read run state, events/SSE, and thread checkpoints. Operators rece
 permissions plus run creation/replay, cancellation, tool execution, and the synchronous
 compatibility endpoint. Operators also receive `external-actions:execute`; an external-write
 Planner decision requires both ordinary tool-execution and external-action permission from the
-authority snapshot persisted with the run. The separate `quarantine:resolve` permission gates the
-deterministic dry-run/apply operator command; it is not part of asynchronous Run execution
-authority. Same-tenant permission failures return `403` at the
+authority snapshot persisted with the run. The deterministic dry-run/apply command is gated by the
+separately typed `quarantine:resolve` permission, which the current two-role mapping grants to every
+Operator; it is not part of asynchronous Run execution authority. Same-tenant permission failures
+return `403` at the
 API boundary or a stable policy-denial code inside an already submitted run; provider mutation is
 not attempted.
 
