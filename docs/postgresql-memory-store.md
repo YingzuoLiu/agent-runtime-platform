@@ -109,7 +109,7 @@ requires the targeted semantic assertion to fail with pytest exit code 1:
 | MM01 | Governed Memory lease-token predicate | stale/replaced attempt rejection |
 | MM02 | Persisted Run subject identity check | wrong-subject snapshot/mutation rejection |
 | MM03 | Active-key unique index | direct database backstop proof |
-| MM04 | Existing sealed snapshot reuse | non-empty/empty sealing contract |
+| MM04 | Recompute and overwrite an existing sealed snapshot | non-empty/empty sealing contract |
 | MM05 | Memory mutation transaction | injected supersession/event rollback contract |
 
 The runner restores every touched source file byte-for-byte. CI follows it with

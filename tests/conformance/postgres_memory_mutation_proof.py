@@ -131,7 +131,7 @@ def main() -> int:
         ),
         Mutant(
             4,
-            "ignore an existing sealed Run Memory snapshot",
+            "recompute and overwrite an existing sealed Run Memory snapshot",
             f"{MEMORY_CONTRACT}::test_nonempty_and_empty_run_snapshots_remain_sealed",
             (
                 Replacement(
@@ -140,6 +140,23 @@ def main() -> int:
                     "                    return self._row_to_snapshot(",
                     "if False and existing is not None:\n"
                     "                    return self._row_to_snapshot(",
+                ),
+                Replacement(
+                    POSTGRES_MEMORY_STORE,
+                    "                    INSERT INTO run_memory_snapshots (\n"
+                    "                        run_id, tenant_id, subject_id, "
+                    "domain_id, memories_json, created_at\n"
+                    "                    ) VALUES (%s, %s, %s, %s, %s, %s)\n",
+                    "                    INSERT INTO run_memory_snapshots (\n"
+                    "                        run_id, tenant_id, subject_id, "
+                    "domain_id, memories_json, created_at\n"
+                    "                    ) VALUES (%s, %s, %s, %s, %s, %s)\n"
+                    "                    ON CONFLICT (run_id) DO UPDATE SET\n"
+                    "                        tenant_id = EXCLUDED.tenant_id,\n"
+                    "                        subject_id = EXCLUDED.subject_id,\n"
+                    "                        domain_id = EXCLUDED.domain_id,\n"
+                    "                        memories_json = EXCLUDED.memories_json,\n"
+                    "                        created_at = EXCLUDED.created_at\n",
                 ),
             ),
         ),
