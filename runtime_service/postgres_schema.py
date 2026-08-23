@@ -6,12 +6,21 @@ from typing import Iterator
 
 import psycopg
 from psycopg import sql
-from psycopg.rows import dict_row
 from psycopg.connection import Connection
+from psycopg.rows import dict_row
 
 
 POSTGRES_SCHEMA_VERSION = 1
 _SCHEMA_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_CORE_TABLES = (
+    "runs",
+    "run_events",
+    "thread_states",
+    "workflow_executions",
+    "tool_calls",
+    "external_actions",
+    "workflow_events",
+)
 
 
 class PostgresSchemaError(RuntimeError):
@@ -27,9 +36,7 @@ def validate_postgres_schema_name(schema: str) -> str:
     """
 
     if not _SCHEMA_NAME.fullmatch(schema):
-        raise ValueError(
-            "PostgreSQL schema must match ^[a-z][a-z0-9_]{0,62}$"
-        )
+        raise ValueError("PostgreSQL schema must match ^[a-z][a-z0-9_]{0,62}$")
     return schema
 
 
@@ -109,7 +116,6 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
     """
 
     validate_postgres_schema_name(schema)
-    # The schema itself has to exist before search_path can target it.
     try:
         bootstrap = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
     except psycopg.Error as exc:
@@ -124,13 +130,21 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
     with postgres_connection(dsn, schema=schema) as connection:
         try:
             with connection.transaction():
-                # Serialize bootstrap for the same schema without introducing a
-                # process lock. hashtextextended is server-local and used only
-                # for short DDL initialization, never for runtime ownership.
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (f"agent-runtime-postgres-schema:{schema}",),
                 )
+                existing_rows = connection.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                        AND table_name = ANY(%s)
+                    """,
+                    (list(_CORE_TABLES),),
+                ).fetchall()
+                existing_core_tables = {str(row["table_name"]) for row in existing_rows}
+
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS runtime_store_schema (
@@ -143,6 +157,10 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
                     "SELECT version FROM runtime_store_schema WHERE component = %s",
                     ("execution-plane",),
                 ).fetchone()
+                if metadata is None and existing_core_tables:
+                    raise PostgresSchemaError(
+                        "PostgreSQL execution-plane schema is unversioned and cannot be adopted"
+                    )
                 if metadata is not None and int(metadata["version"]) != POSTGRES_SCHEMA_VERSION:
                     raise PostgresSchemaError(
                         "PostgreSQL execution-plane schema version is incompatible"
@@ -318,10 +336,6 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
                     """
                 )
 
-                # A v1 metadata marker is written only after every table/index
-                # statement above succeeds in this transaction. Reopening an
-                # incompatible manually-created table therefore fails before a
-                # schema can be marked compatible.
                 if metadata is None:
                     connection.execute(
                         """
