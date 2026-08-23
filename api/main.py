@@ -252,8 +252,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Application composition intentionally remains SQLite in this phase.
-        # Run/Workflow PostgreSQL portability is proven below the composition
-        # root; Memory still requires same-database Run lease validation.
+        # PostgreSQL Run/Workflow/Memory portability is proven below the
+        # composition root; coherent selection and startup authority are later work.
         store = SQLiteRunStore(resolved_database_path)
         memory_store = SQLiteMemoryStore(resolved_database_path)
         governed_memory = GovernedMemory(memory_store, store)

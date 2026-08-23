@@ -9,8 +9,11 @@ deliberately separate from thread checkpoints:
 - a run memory snapshot seals exactly what a run retrieved, so restart and replay do not observe
   a later preference update.
 
-SQLite is the only storage dependency. Phase 6A does not add embeddings, vector search,
-conversation-history replay, inferred profile facts, summarization, or an external memory service.
+The default application composition uses SQLite. A later storage-portability phase adds
+`PostgresMemoryStore` and runs the same Memory semantic contract against SQLite and PostgreSQL,
+without changing this domain behavior or wiring a backend selector into `create_app()`. Phase 6A
+does not add embeddings, vector search, conversation-history replay, inferred profile facts,
+summarization, or an external memory service.
 
 `travel-agent:1.2.0` inherits this same Phase 6A boundary: the same explicit preference parser,
 subject scoping, precedence, sealed per-run snapshot, audit evidence, and forgetting semantics.
@@ -64,7 +67,9 @@ flowchart TD
 `memory_records` stores versioned records with `active`, `superseded`, or `deleted` status. A
 partial unique index allows only one active version for a logical
 `(tenant_id, subject_id, domain_id, kind, key)` identity. Updating a value supersedes the prior
-row and creates the next integer version in one `BEGIN IMMEDIATE` transaction.
+row and creates the next integer version in one transaction. SQLite uses `BEGIN IMMEDIATE`;
+PostgreSQL combines a scoped transaction advisory lock, row locks, and the same partial unique
+index so concurrent first writes also receive a serialized version order.
 
 `memory_events` is append-only mutation evidence. It records `memory.created`,
 `memory.superseded`, and `memory.deleted` without copying the preference value into event payloads.
@@ -153,3 +158,8 @@ The full memory-focused coverage proves:
 - `travel-agent:1.2.0` reuses the `1.1.0` explicit parser and sealed retrieval semantics while
   keeping its action request and action evidence separate from memory records;
 - `travel-agent:1.0.0` remains memory-free for pinned Phase 5A behavior.
+
+The backend-independent portion of this boundary lives in
+`tests/conformance/test_memory_store_contract.py` and runs unchanged against SQLite and PostgreSQL.
+PostgreSQL component lifecycle, server-time lease expiry, database uniqueness, and representative
+mutation proof are documented in [`postgresql-memory-store.md`](postgresql-memory-store.md).

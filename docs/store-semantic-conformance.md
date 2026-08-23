@@ -7,12 +7,14 @@ locking syntax, or query plans.
 The suite now has two implementations:
 
 - SQLite, the default single-host application backend;
-- PostgreSQL, an execution-plane Run/Workflow backend exercised in CI against PostgreSQL 16.
+- PostgreSQL, Run/Workflow and governed-Memory semantic backends exercised in CI against
+  PostgreSQL 16.
 
 The portability claim is deliberately narrow. Both backends are required to preserve the same Run
 ownership, fencing, Thread serialization, checkpoint CAS, external-action recovery, and quarantine
-semantics. The default API composition remains SQLite because this phase does not add a PostgreSQL
-Memory Store or an application backend selector.
+semantics. The Memory contract additionally preserves same-authority Run lease fencing, versioned
+scoped records, sealed snapshots, and retry-safe audit mirroring. The default API composition
+remains SQLite because this phase does not add an application backend selector.
 
 ## Contract layers
 
@@ -58,6 +60,18 @@ whose content changes without a revision advance is detected during post-commit 
 scenarios use test-only out-of-band evidence writers in both backend adapters; production consumers
 do not receive those mutation hooks.
 
+### 5. Memory Store Contract
+
+`tests/conformance/test_memory_store_contract.py` drives both `SQLiteMemoryStore` and
+`PostgresMemoryStore` through one scenario layer. It covers scoping, monotonic versioning,
+supersession/tombstoning, value-free audit, sealed empty/non-empty snapshots, current/stale/exactly
+expired lease fencing, persisted Run identity, concurrent first writes, transaction rollback, and
+valid-successor repair of the Memory-audit/public-Run-event handoff.
+
+PostgreSQL-specific component lifecycle and database mechanics remain in
+`test_postgres_memory_backend.py`. The complete invariant and mutation mapping is documented in
+[`postgresql-memory-store.md`](postgresql-memory-store.md).
+
 ## Backend selection
 
 The shared fixture is selected explicitly:
@@ -76,9 +90,10 @@ TEST_POSTGRES_DSN=postgresql://...
 If PostgreSQL is requested without a DSN, collection fails as a configuration error. The suite does
 not convert a missing PostgreSQL environment into a skip and then claim portability.
 
-GitHub Actions runs the same four shared files once with SQLite and once with PostgreSQL on Python
+GitHub Actions runs the same five shared files once with SQLite and once with PostgreSQL on Python
 3.11 and 3.12. PostgreSQL-specific schema and connection mechanics remain in
-`tests/conformance/test_postgres_backend.py`; they are not mixed into the shared semantic scenarios.
+`tests/conformance/test_postgres_backend.py` and `test_postgres_memory_backend.py`; they are not
+mixed into the shared semantic scenarios.
 
 ## Invariant matrix
 
@@ -200,7 +215,8 @@ be generalized into cross-backend assertions:
 
 ## Mutation gate
 
-`tests/conformance/postgres_mutation_proof.py` makes the portability evidence mutation-sensitive.
+`tests/conformance/postgres_mutation_proof.py` and `postgres_memory_mutation_proof.py` make the
+portability evidence mutation-sensitive.
 After the PostgreSQL 3.11 and 3.12 conformance jobs pass, a PostgreSQL 16 / Python 3.12 CI job
 applies twelve temporary source mutations and runs the targeted semantic assertion for each. Every
 mutation is restored byte-for-byte, and CI finishes the job with `git diff --exit-code`.
@@ -215,8 +231,9 @@ status before the checkpoint/event transaction; M08 moves `run.completed` outsid
 The existing I6 three-way failure-injection assertion kills both by observing the resulting partial
 durable state.
 
-The exact mutant-to-test mapping is documented in
-[`postgresql-store-backend.md`](postgresql-store-backend.md).
+The exact mutant-to-test mappings are documented in
+[`postgresql-store-backend.md`](postgresql-store-backend.md) and
+[`postgresql-memory-store.md`](postgresql-memory-store.md).
 
 ## Application boundary and non-goals
 
@@ -225,13 +242,13 @@ The default service still composes `SQLiteRunStore`, `SQLiteWorkflowStore`, and
 `requirements.txt` does not install Psycopg; PostgreSQL users install `requirements-postgres.txt`,
 while `requirements-dev.txt` includes it for conformance testing.
 
-This is intentional. Governed memory checks current Run/lease authority in the same storage
-transaction as memory mutation. Combining PostgreSQL Run/Workflow storage with `SQLiteMemoryStore`
-would split that authority check across databases and weaken the existing fencing property.
+This is intentional. `PostgresMemoryStore` now preserves governed Memory's same-database
+Run/lease transaction when explicitly used with the PostgreSQL Run store. Combining PostgreSQL
+Run/Workflow storage with `SQLiteMemoryStore` would still split that authority and remains
+prohibited; coherent application selection is separate work.
 
 Accordingly, this portability phase does **not** add:
 
-- a PostgreSQL Memory Store;
 - an application backend selector or `RUNTIME_DATABASE_URL`;
 - connection pooling or a migration framework;
 - a distributed queue/wake mechanism;
@@ -239,5 +256,5 @@ Accordingly, this portability phase does **not** add:
 - JSONB normalization or checkpoint-schema changes;
 - Redis or another new coordination backend.
 
-The demonstrated result is storage-semantic portability for the Run/Workflow execution plane, not a
-claim that the complete application has already migrated from SQLite to PostgreSQL.
+The demonstrated result is storage-semantic portability for Run/Workflow and governed Memory, not
+a claim that the complete application has already migrated from SQLite to PostgreSQL.
