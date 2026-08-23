@@ -65,7 +65,7 @@ an explicit execution boundary. It is also a runnable reference for discussions 
 durability, recovery, memory isolation, validation, and external side effects.
 
 It is not a Travel product. Travel keeps the behavior concrete enough to run and inspect without
-requiring live inventory, payment, Redis, PostgreSQL, Kubernetes, or an LLM key.
+requiring live inventory, payment, Redis, a running PostgreSQL server, Kubernetes, or an LLM key.
 
 ## See it work
 
@@ -163,11 +163,11 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | --- | --- | --- |
 | Planning | Strict `CALL_TOOL`, `REQUEST_CLARIFICATION`, and `FINISH` decisions | [`runtime_service/dynamic_loop.py`](runtime_service/dynamic_loop.py) |
 | Policy | Fixed step-limit, allowlist, permission, and argument-schema checks before execution | [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md) |
-| Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
+| Durability | Default application storage is SQLite; PostgreSQL Run/Workflow execution-plane stores implement the same tested durable semantics | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/postgres_store.py`](runtime_service/postgres_store.py), [`docs/postgresql-store-backend.md`](docs/postgresql-store-backend.md) |
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
 | Checkpoint state boundary | Full per-Run final state plus a same-type Thread projection with `execution_trace=[]`, committed atomically | [`docs/state-boundaries.md`](docs/state-boundaries.md), [`tests/test_checkpoint_projection.py`](tests/test_checkpoint_projection.py) |
-| Store conformance | Adapter-driven SQLite reference contracts for ownership, fencing, checkpoint CAS, recovery, and quarantine | [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md), [`tests/conformance`](tests/conformance) |
+| Store conformance | The same I1-I9 ownership, fencing, checkpoint, recovery, and quarantine scenarios run against SQLite and PostgreSQL 16 | [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md), [`tests/conformance`](tests/conformance) |
 | Quarantine resolution | Operator-authorized dry-run/apply command that atomically fails an unchanged eligible quarantine while preserving checkpoint and external evidence | [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md), [`tests/test_quarantine_resolution.py`](tests/test_quarantine_resolution.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
@@ -177,7 +177,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Domains | Five Travel versions, two release-validation versions, and an opt-in trusted extension seam | [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md) |
 | Evidence | Workflow-first projection for Planner, policy, tool, action, and loop-outcome evidence; manager recovery events remain direct | [`runtime_service/evidence.py`](runtime_service/evidence.py), [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
 | Product surface | Local Runtime Console over the same authenticated Run and Event APIs | [`api/demo_assets`](api/demo_assets), [`tests/test_demo_console.py`](tests/test_demo_console.py) |
-| Verification | Full suite; CI on Python 3.11 and 3.12 | [CI workflow](.github/workflows/ci.yml) |
+| Verification | Full suite on Python 3.11/3.12 plus PostgreSQL 16 semantic conformance on both versions | [CI workflow](.github/workflows/ci.yml) |
 
 ## API development setup
 
@@ -747,6 +747,8 @@ input signatures still match; the source run is never mutated.
 | [`runtime_service/external_actions.py`](runtime_service/external_actions.py) | Provider contracts, registry, and sanitized dispatch boundary |
 | [`runtime_service/http_external_action.py`](runtime_service/http_external_action.py) | Optional server-configured JSON-over-HTTP provider adapter |
 | [`runtime_service/manager.py`](runtime_service/manager.py) | Durable Run polling, lease heartbeat/takeover, cancellation, and fenced finalization |
+| [`runtime_service/postgres_store.py`](runtime_service/postgres_store.py) | PostgreSQL Run ownership, checkpoint CAS, atomic completion, and quarantine semantics |
+| [`runtime_service/postgres_workflow_store.py`](runtime_service/postgres_workflow_store.py) | PostgreSQL workflow/tool/external-action durability and fencing |
 | [`runtime_service/quarantine_resolution.py`](runtime_service/quarantine_resolution.py) | Deterministic target visibility, plan/apply orchestration, and post-commit verification |
 | [`runtime_service/auth.py`](runtime_service/auth.py) | Principal derivation, typed permissions, and default-deny authorization |
 | [`runtime_service/memory.py`](runtime_service/memory.py) | Versioned records, audit events, sealed snapshots, and run evidence |
@@ -773,8 +775,10 @@ input signatures still match; the source run is never mutated.
   tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
 - [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md): controlled
   quarantine eligibility, dry-run/apply, stale plans, exact replay, evidence preservation, and SOP;
-- [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): three-layer
+- [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): shared SQLite/PostgreSQL
   executable store contracts and the invariant-to-test matrix;
+- [`docs/postgresql-store-backend.md`](docs/postgresql-store-backend.md): PostgreSQL schema,
+  transaction/lease model, conformance boundary, application-composition limit, and non-goals;
 - [`docs/state-boundaries.md`](docs/state-boundaries.md): persisted state ownership,
   cross-turn dependencies, governed-memory authority, and checkpoint-growth characterization;
 - [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
@@ -841,42 +845,51 @@ one active Run per tenant-qualified thread, recovery-before-successor ordering, 
 parallel execution, monotonic checkpoint revisions, conflict terminalization, and managed
 compatibility-path execution.
 
-GitHub Actions runs compile checks, Ruff, scoped Mypy, and pytest on Python 3.11 and 3.12. After
-both matrix legs pass, one Python 3.12 job runs the Docker Action-recovery proof and uploads only its
-sanitized artifact.
+GitHub Actions runs compile checks, Ruff, scoped Mypy, pytest, `git diff --check`, and Compose
+configuration on Python 3.11 and 3.12. Separate PostgreSQL 16 jobs run the same shared Run,
+Workflow, and composite execution-plane conformance scenarios against SQLite and PostgreSQL on both
+Python versions, followed by PostgreSQL-specific mechanics. After the normal test matrix passes,
+one Python 3.12 job runs the Docker Action-recovery proof and uploads only its sanitized artifact.
 
 ## Deployment boundary
 
-Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest are included.
-SQLite plus durable polling and an in-process wake signal keep the project self-contained. Multiple
-Managers sharing one local database are fenced, but this is not a multi-host or horizontally
-scalable deployment claim.
+Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest are included. The
+default application composition remains SQLite plus durable polling and an in-process wake signal,
+which keeps the local demo self-contained. Multiple Managers sharing one local SQLite database are
+fenced, but this is not a multi-host or horizontally scalable deployment claim.
 
-Durable workflow consumers target the structural `WorkflowStore` contract, while the service
-composition root still supplies the repository's only implementation, `SQLiteWorkflowStore`.
-This separates runtime typing from SQLite without claiming that another backend already preserves
-the required cross-ledger transactions, fencing, ordering, and restart-recovery semantics.
+Durable Run consumers target the structural `RunStore` contract, and workflow consumers target the
+structural `WorkflowStore` contract. SQLite and PostgreSQL now both implement the Run/Workflow
+execution-plane semantics exercised by the conformance suite. The service composition root still
+supplies `SQLiteRunStore`, `SQLiteWorkflowStore`, and `SQLiteMemoryStore`.
 
-The first lease-aware deployment requires a stop-the-old-runtime boundary: stop and verify every
-pre-leasing process, run the additive migration, and then start only lease-aware binaries. Mixed
-old/new execution and mixed-version rollback are unsupported because the old Manager ignores lease
-columns. See [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md#persisted-model).
+That composition boundary is deliberate. Governed memory validates current Run/lease authority in
+the same storage transaction as a memory mutation. This phase does not add a PostgreSQL Memory
+Store, so wiring PostgreSQL Run/Workflow stores together with `SQLiteMemoryStore` would weaken that
+same-database fencing property. There is therefore no application backend selector in this PR.
 
-The thread-serialization migration adds a stricter drain boundary. Before the first deployment,
-the old binary must finish or cancel every queued/running Run. A running legacy Run has no durable
-record of the checkpoint revision it originally read, so the new Runtime refuses to guess and
-fails startup closed. Mixed old/new binaries and direct rollback remain unsupported: old
+The first lease-aware SQLite deployment requires a stop-the-old-runtime boundary: stop and verify
+every pre-leasing process, run the additive migration, and then start only lease-aware binaries.
+Mixed old/new execution and mixed-version rollback are unsupported because the old Manager ignores
+lease columns. See [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md#persisted-model).
+
+The thread-serialization SQLite migration adds a stricter drain boundary. Before the first
+deployment, the old binary must finish or cancel every queued/running Run. A running legacy Run has
+no durable record of the checkpoint revision it originally read, so the new Runtime refuses to
+guess and fails startup closed. Mixed old/new binaries and direct rollback remain unsupported: old
 state-only writes do not increment the revision and cannot be detected by the new CAS.
 
-Before increasing replicas, the architecture would need:
+Before increasing replicas or switching the full application to PostgreSQL, the architecture would
+still need:
 
 ```text
-PostgreSQL runs/checkpoints/events/memories/external_actions
-+ Redis, Pub/Sub, or another distributed queue
-+ a PostgreSQL implementation of the existing lease and fencing contract
+PostgreSQL governed memory with same-database Run/lease fencing
++ Redis, Pub/Sub, or another distributed queue/wake mechanism
++ production connection pooling and schema migration operations
 + provider-specific reconciliation and compensation
 + OpenTelemetry traces and metrics
 + container-backed sandbox workers
++ deployment validation for multi-replica and HA behavior
 ```
 
 The default Docker Compose path is the loopback-only local demo described above. Running the image
@@ -889,9 +902,12 @@ Kubernetes manifest expects `RUNTIME_API_KEYS_JSON` in Secret `travel-agent-runt
 This is a completed portfolio/reference milestone, not a claim of a complete production Agent
 platform.
 
-- SQLite rather than PostgreSQL, with durable polling plus a local wake signal rather than a
-  distributed worker queue;
-- Run leases and fencing are a single-host SQLite reference, not a distributed multi-host lease;
+- the default application still uses SQLite; PostgreSQL Run/Workflow semantics are conformance-
+  proven but there is no PostgreSQL Memory Store or runtime backend selector yet;
+- PostgreSQL lease/fencing behavior is tested with independent server connections, but the
+  repository still makes no multi-host Runtime, horizontal-scaling, or HA deployment claim;
+- durable polling plus a local wake signal remains the application scheduling mechanism rather than
+  a distributed worker queue;
 - no quota, token accounting, key rotation, or external secret manager;
 - only two static roles, with no custom or per-Agent/per-tool grants;
 - process isolation rather than a container, gVisor, or microVM sandbox;
@@ -916,12 +932,13 @@ platform.
   reconciliation for unknown external-action outcomes.
 
 Phase 7D remains the Agent-integration milestone. The subsequent durable execution-plane work
-hardens ownership and thread consistency without expanding the public Action surface. The project
-still does not add MCP, OpenClaw, Letta, or other framework-specific adapters, arbitrary webhooks,
-human approval, or active provider queries for a terminal unknown outcome. Those boundaries,
-semantic memory retrieval, bounded parallel read-only calls, a live read-only Travel adapter,
-multi-model fallback, and durable multi-Agent delegation remain possible follow-up slices rather
-than prerequisites for the runtime demonstrated here.
+hardens ownership, thread consistency, checkpoint integrity, and Run/Workflow storage portability
+without expanding the public Action surface. The project still does not add MCP, OpenClaw, Letta,
+or other framework-specific adapters, arbitrary webhooks, human approval, or active provider queries
+for a terminal unknown outcome. Those boundaries, semantic memory retrieval, bounded parallel
+read-only calls, a live read-only Travel adapter, multi-model fallback, and durable multi-Agent
+delegation remain possible follow-up slices rather than prerequisites for the runtime demonstrated
+here.
 
 ## License
 
