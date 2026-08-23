@@ -179,9 +179,14 @@ def main() -> int:
         ),
         Mutant(
             7,
-            "commit terminal Run status before the checkpoint/event transaction",
+            "remove the completion transaction boundary",
             atomic_target,
             (
+                Replacement(
+                    POSTGRES_STORE,
+                    "import json\n",
+                    "import contextlib\nimport json\n",
+                ),
                 Replacement(
                     POSTGRES_STORE,
                     "        cas_changed = False\n"
@@ -193,11 +198,7 @@ def main() -> int:
                     "        connection = self._lease_connect()\n"
                     "        try:\n"
                     "            try:\n"
-                    "                connection.execute(\n"
-                    "                    \"UPDATE runs SET status = %s WHERE run_id = %s\",\n"
-                    "                    (RunStatus.COMPLETED.value, run.run_id),\n"
-                    "                )\n"
-                    "                with connection.transaction():",
+                    "                with contextlib.nullcontext():",
                 ),
             ),
         ),
