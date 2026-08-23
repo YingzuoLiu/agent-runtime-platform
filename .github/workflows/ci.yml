@@ -25,6 +25,40 @@ jobs:
       - run: pytest -q
       - run: docker compose config --quiet
 
+  postgres-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: conformance-only
+          POSTGRES_DB: runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d runtime_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      STORE_CONFORMANCE_BACKENDS: postgres
+      TEST_POSTGRES_DSN: postgresql://postgres:conformance-only@127.0.0.1:5432/runtime_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -c "import psycopg; print('psycopg driver import: ok')"
+      - run: pytest -q tests/conformance
+
   action-recovery-proof:
     needs: test
     runs-on: ubuntu-latest
