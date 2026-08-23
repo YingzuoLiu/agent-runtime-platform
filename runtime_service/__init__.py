@@ -63,6 +63,20 @@ from .planner import (
     RequestClarificationDecision,
     ToolObservation,
 )
+from .quarantine import (
+    ExternalActionStatusSummary,
+    QuarantineResolutionCommand,
+    QuarantineResolutionEvidenceIncompleteError,
+    QuarantineResolutionKind,
+    QuarantineResolutionPlan,
+    QuarantineResolutionResponse,
+    QuarantineResolutionStalePlanError,
+    QuarantineResolutionTarget,
+    QuarantineTargetKind,
+    QuarantineTargetNotFoundError,
+    QuarantineThreadReference,
+)
+from .quarantine_resolution import QuarantineResolutionService
 from .registry import AgentRegistry, build_default_registry
 from .sandbox import (
     ToolEffect,
@@ -128,6 +142,18 @@ __all__ = [
     "PlannerContext",
     "PlannerProviderError",
     "Principal",
+    "QuarantineResolutionCommand",
+    "QuarantineResolutionEvidenceIncompleteError",
+    "QuarantineResolutionKind",
+    "QuarantineResolutionPlan",
+    "QuarantineResolutionResponse",
+    "QuarantineResolutionService",
+    "QuarantineResolutionStalePlanError",
+    "QuarantineResolutionTarget",
+    "QuarantineTargetKind",
+    "QuarantineTargetNotFoundError",
+    "QuarantineThreadReference",
+    "ExternalActionStatusSummary",
     "ReferencedRunNotFoundError",
     "RunCreateRequest",
     "RunCommitOutcome",

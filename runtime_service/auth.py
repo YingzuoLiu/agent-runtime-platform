@@ -35,6 +35,7 @@ class RuntimePermission(str, Enum):
     RUNS_READ = "runs:read"
     RUNS_CANCEL = "runs:cancel"
     RUN_EVENTS_READ = "run-events:read"
+    QUARANTINE_RESOLVE = "quarantine:resolve"
     THREAD_STATE_READ = "thread-state:read"
     MEMORY_READ = "memory:read"
     MEMORY_WRITE = "memory:write"
@@ -117,6 +118,7 @@ class RoleAuthorizer:
             RuntimePermission.AGENT_MESSAGE_EXECUTE,
             RuntimePermission.RUNS_CREATE,
             RuntimePermission.RUNS_CANCEL,
+            RuntimePermission.QUARANTINE_RESOLVE,
             RuntimePermission.MEMORY_WRITE,
             RuntimePermission.MEMORY_DELETE,
         }

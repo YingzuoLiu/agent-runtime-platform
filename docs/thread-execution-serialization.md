@@ -475,8 +475,8 @@ effects produced before completion.
 The Manager therefore writes durable conflict evidence, keeps the Run `running`, clears its lease,
 and excludes that quarantine code from automatic takeover. The same-thread successor remains
 blocked. This state requires controlled operator repair; the runtime neither guesses a checkpoint
-base nor hides an unresolved provider outcome behind an ordinary terminal conflict. This milestone
-only creates and preserves the quarantine. It does not add an automatic retry or repair primitive.
+base nor hides an unresolved provider outcome behind an ordinary terminal conflict. Automatic
+execution only creates and preserves the quarantine. It never retries, resumes, or releases it.
 
 ### Quarantine operations: detect and contain
 
@@ -515,13 +515,19 @@ Operational handling is containment only:
    this lease-free running row.
 5. Do not repeat the operation under a new Run or thread. External-action idempotency is Run-scoped,
    so a replacement may receive a different provider key and duplicate the effect.
-6. Leave the row quarantined and escalate to a release with an audited repair primitive or a
-   provider-specific incident procedure that can prove the external outcome.
+6. If every external action has consistent durable terminal evidence, use
+   `POST /operator/quarantine-resolutions` in dry-run mode. Apply only the unchanged eligible plan.
+   If any action remains prepared, dispatching, or reconciling, leave the row quarantined and follow
+   a provider-specific incident procedure that can prove or terminalize the external outcome.
 
-This release has no supported unquarantine or force-terminalization operation. A future repair
-primitive must compare-and-set the exact quarantine state, require resolved Action evidence, avoid
-Runtime/provider invocation and checkpoint rewrites, preserve every ledger, append operator identity
-and reason, and atomically terminalize the Run before releasing its thread slot.
+The only supported release operation is
+`terminalize_failed_preserving_checkpoint`. It compares the exact quarantine, checkpoint, Run,
+workflow, tool, action, and event preconditions in one SQLite transaction; changes the Run to
+`failed` with `thread_checkpoint_conflict`; preserves the current checkpoint and every external
+ledger; and atomically appends operator audit plus `run.failed` evidence. It does not continue the
+old Run or alter the external outcome. See
+[`operator-quarantine-resolution.md`](operator-quarantine-resolution.md) for eligibility, plan
+staleness, exact replay, private Action targeting, and the incident SOP.
 
 Run heartbeat renewal does not update checkpoint revision and does not create thread events.
 

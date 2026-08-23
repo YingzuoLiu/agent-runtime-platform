@@ -237,6 +237,22 @@ The ordinary `/runs` API also rejects Action-owned `action-request:` client-requ
 reserved_client_request_namespace`. Provider failures discovered asynchronously remain terminal
 Action representations rather than being converted into GET errors.
 
+### Quarantined private Actions
+
+If checkpoint drift places an Action-owned Run in
+`thread_checkpoint_conflict_reconciliation_pending`, the private Run remains hidden from generic
+Run routes. An Operator may target the public `action_id` through
+`POST /operator/quarantine-resolutions`. The shared resolution service returns an Action-facing
+target and Action reference; it does not expose the private Thread ID, Run route, input,
+idempotency keys, provider binding, arguments, result body, or execution tokens.
+
+Only terminal and internally consistent `succeeded`, `failed`, or `outcome_unknown` action evidence
+can make the plan eligible. Prepared, dispatching, or reconciling Actions remain quarantined. The
+resolution never calls the provider and does not change the public provider outcome: for example,
+a durably succeeded Action remains publicly `succeeded` even though its stale-checkpoint Run is
+terminalized as failed. See
+[`operator-quarantine-resolution.md`](operator-quarantine-resolution.md).
+
 ## Recovery and limits
 
 The private domain owns one durable `dispatch` step and reuses the existing external-action ledger.

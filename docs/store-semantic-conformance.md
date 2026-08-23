@@ -43,7 +43,9 @@ reopen stores, inject a store clock, synchronize races, and inject backend-speci
 `tests/conformance/test_execution_plane_contract.py` retains semantics that genuinely cross the Run
 store, Workflow store, `RuntimeManager`, and external-action recovery coordinator. It proves that an
 ambiguous unsafe effect is reconciled before same-Thread successor work and that checkpoint drift
-during external-action reconciliation enters an inspectable, nonterminal quarantine.
+during external-action reconciliation enters an inspectable, nonterminal quarantine. I9 adds the
+narrow operator path across the same Run/checkpoint/workflow/action tables: only an unchanged plan
+with terminal external evidence may atomically fail the Run and release its Thread.
 
 ## Invariant matrix
 
@@ -60,6 +62,7 @@ Every test below executes through the reference-adapter fixture. Its only curren
 | **I6 Terminal Run + checkpoint + required events preserve atomic semantics** | A currently leased Run returns a typed checkpoint state. A second scenario starts from an existing checkpoint before failure and cancellation. | The backend fails the `run.completed` event append after the completion transaction has started; failure and cancellation then execute normally. | The injected failure leaves Run running, lease current, checkpoint absent, and no partial terminal events. A later commit persists Run + revision + `checkpoint.saved` + `run.completed`. Failed/cancelled Runs do not advance the prior revision. | `tests/conformance/test_run_store_contract.py::test_i6_completion_checkpoint_and_required_events_commit_atomically[sqlite]`; `...::test_failure_and_cancellation_preserve_checkpoint_revision[sqlite]` |
 | **I7 Recovery never guesses an ambiguous external effect** | An unsafe provider is entered once; terminal evidence write fails, leaving a durable `dispatching` action and reconciliation-pending Run; a same-Thread successor is queued. | Store and coordinator instances are recreated after exact lease expiry; recovery executes with a provider that fails the test if called. | Recovery claims the predecessor first, never calls the provider again, finalizes `outcome_unknown` with dispatch count 1, and only then permits the successor claim. The outcome and sanitized error code survive another reopen. | `tests/conformance/test_execution_plane_contract.py::test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect[sqlite]` |
 | **I8 Detected semantic conflict fails closed into inspectable quarantine** | A reconciliation-pending predecessor owns a dispatched action at checkpoint base 1; a same-Thread successor waits; the adapter injects checkpoint revision 2. | A recreated `RuntimeManager` recovers the expired predecessor. An explicit event observes quarantine; the test then recreates the store, requests cancellation, and attempts takeover. | Runtime construction never occurs. The predecessor remains nonterminal `running`, has no lease, carries `thread_checkpoint_conflict_reconciliation_pending`, and appends `checkpoint.conflict` with expected/observed revisions and quarantine disposition. Restart/takeover/cancellation do not terminalize it; the successor stays queued while another Thread remains claimable. | `tests/conformance/test_execution_plane_contract.py::test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine[sqlite]` |
+| **I9 Quarantine release requires an unchanged eligible plan and preserves authoritative evidence** | A predecessor has checkpoint base 1, a durable terminal external action, quarantine at current revision 2, and a queued same-Thread successor. | Dry-run derives an opaque plan without writes; apply rederives it in one transaction, fails the Run, appends resolution/terminal events, then an exact replay and store reopen observe the result. | Dry-run leaves Run/checkpoint/workflow/action/events unchanged. Apply produces `failed/thread_checkpoint_conflict`, preserves revision 2 and identical checkpoint/workflow/action evidence, performs zero provider calls, writes one resolution plus one `run.failed`, releases the successor, remains restart-visible, and reuses the exact plan without duplicate events. | `tests/conformance/test_execution_plane_contract.py::test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence[sqlite]` |
 
 ## Additional Workflow Store scenarios
 
@@ -114,7 +117,8 @@ Adding a future backend means:
 
 ## Explicit non-goals
 
-This suite does not add PostgreSQL, Redis, a queue, multi-host coordination, operator repair, a new
-production store interface, a checkpoint schema change, or new leasing/fencing/quarantine behavior.
-It records the existing SQLite single-host semantics in executable reference contracts prepared for
-reuse when a real second backend exists.
+This suite does not add PostgreSQL, Redis, a queue, multi-host coordination, arbitrary operator
+repair, a generic production store interface, a checkpoint schema change, automatic unquarantine,
+or Runtime/provider retry. It records the SQLite single-host semantics, including the one narrow
+operator resolution, in executable reference contracts prepared for reuse when a real second
+backend exists.

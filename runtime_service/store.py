@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -17,6 +18,17 @@ from .models import (
     RunLeaseRecoveryReason,
     RunRecord,
     RunStatus,
+)
+from .quarantine import (
+    ExternalActionStatusSummary,
+    QuarantineResolutionCommit,
+    QuarantineResolutionEvidenceIncompleteError,
+    QuarantineResolutionKind,
+    QuarantineResolutionPlan,
+    QuarantineResolutionStalePlanError,
+    QuarantineResolutionTarget,
+    QuarantineTargetKind,
+    QuarantineThreadReference,
 )
 
 
@@ -57,6 +69,14 @@ class ThreadStateSnapshot:
 
     state: BaseRuntimeState | None
     revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class _QuarantinePlanSnapshot:
+    plan: QuarantineResolutionPlan
+    workflow_evidence_fingerprint: str
+    checkpoint_evidence_fingerprint: str
+    checkpoint_state_json: str | None
 
 
 class StateRegistry(Protocol):
@@ -1475,6 +1495,763 @@ class SQLiteRunStore:
         run.lease_heartbeat_at = None
         run.lease_expires_at = None
         return RunCommitOutcome.COMMITTED
+
+    def plan_quarantine_resolution(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        target: QuarantineResolutionTarget,
+        resolution: QuarantineResolutionKind,
+    ) -> QuarantineResolutionPlan:
+        """Derive one read-only sanitized plan from a consistent snapshot."""
+
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            snapshot = self._derive_quarantine_plan_with_connection(
+                connection,
+                run_id,
+                tenant_id=tenant_id,
+                target=target,
+                resolution=resolution,
+            )
+            connection.commit()
+        return snapshot.plan
+
+    def apply_quarantine_resolution(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str,
+        target: QuarantineResolutionTarget,
+        resolution: QuarantineResolutionKind,
+        expected_plan_id: str,
+        operator_subject_id: str,
+        operator_credential_id: str,
+    ) -> QuarantineResolutionCommit:
+        """Revalidate and terminalize one eligible quarantine atomically."""
+
+        completed_at = utc_now()
+        with self._lease_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_resolution = self._find_resolution_event_with_connection(
+                connection,
+                run_id,
+                expected_plan_id=expected_plan_id,
+            )
+            current = self._derive_quarantine_plan_with_connection(
+                connection,
+                run_id,
+                tenant_id=tenant_id,
+                target=target,
+                resolution=resolution,
+            )
+            if existing_resolution is not None:
+                stored_plan, stored_workflow_fingerprint, stored_checkpoint_fingerprint = (
+                    existing_resolution
+                )
+                if (
+                    stored_plan.target != target
+                    or stored_plan.resolution != resolution
+                    or stored_workflow_fingerprint
+                    != current.workflow_evidence_fingerprint
+                    or stored_checkpoint_fingerprint
+                    != current.checkpoint_evidence_fingerprint
+                ):
+                    raise QuarantineResolutionEvidenceIncompleteError(
+                        "Committed quarantine resolution evidence is inconsistent"
+                    )
+                connection.commit()
+                return QuarantineResolutionCommit(
+                    plan=stored_plan,
+                    reused=True,
+                    workflow_evidence_fingerprint=stored_workflow_fingerprint,
+                    checkpoint_evidence_fingerprint=stored_checkpoint_fingerprint,
+                    checkpoint_state_json=current.checkpoint_state_json,
+                )
+
+            plan = current.plan
+            if not plan.eligible or plan.plan_id != expected_plan_id:
+                raise QuarantineResolutionStalePlanError(plan)
+
+            error = (
+                "An operator terminalized an eligible quarantined Run while "
+                "preserving the authoritative checkpoint and external-action evidence."
+            )
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    status = ?, error_code = ?, error = ?, completed_at = ?,
+                    updated_at = ?, lease_owner_id = NULL, lease_token = NULL,
+                    lease_heartbeat_at = NULL, lease_expires_at = NULL
+                WHERE run_id = ? AND tenant_id = ? AND status = ?
+                    AND error_code = ? AND lease_owner_id IS NULL
+                    AND lease_token IS NULL AND lease_heartbeat_at IS NULL
+                    AND lease_expires_at IS NULL
+                """,
+                (
+                    RunStatus.FAILED.value,
+                    THREAD_CHECKPOINT_CONFLICT_CODE,
+                    error,
+                    completed_at,
+                    completed_at,
+                    run_id,
+                    tenant_id,
+                    RunStatus.RUNNING.value,
+                    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise QuarantineResolutionStalePlanError(plan)
+
+            audit_payload = {
+                "resolution": resolution.value,
+                "plan_id": expected_plan_id,
+                "target_kind": target.kind.value,
+                "source_quarantine_code": plan.current_quarantine_code,
+                "checkpoint_base_revision": plan.checkpoint_base_revision,
+                "observed_checkpoint_revision": plan.observed_checkpoint_revision,
+                "checkpoint_disposition": plan.checkpoint_disposition,
+                "external_evidence_disposition": plan.external_evidence_disposition,
+                "provider_calls": plan.provider_calls,
+                "operator_subject_id": operator_subject_id,
+                "operator_credential_id": operator_credential_id,
+                "workflow_evidence_fingerprint": (
+                    current.workflow_evidence_fingerprint
+                ),
+                "checkpoint_evidence_fingerprint": (
+                    current.checkpoint_evidence_fingerprint
+                ),
+                "plan": plan.model_dump(mode="json"),
+            }
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "quarantine.resolution_applied",
+                audit_payload,
+            )
+            self._append_event_with_connection(
+                connection,
+                run_id,
+                "run.failed",
+                {
+                    "error_code": THREAD_CHECKPOINT_CONFLICT_CODE,
+                    "error": error,
+                    "resolution": resolution.value,
+                    "plan_id": expected_plan_id,
+                },
+            )
+
+        return QuarantineResolutionCommit(
+            plan=plan,
+            reused=False,
+            workflow_evidence_fingerprint=current.workflow_evidence_fingerprint,
+            checkpoint_evidence_fingerprint=current.checkpoint_evidence_fingerprint,
+            checkpoint_state_json=current.checkpoint_state_json,
+        )
+
+    def verify_quarantine_resolution(
+        self,
+        commit: QuarantineResolutionCommit,
+    ) -> None:
+        """Read back the durable outcome before reporting operator success."""
+
+        plan = commit.plan
+        plan_id = plan.plan_id
+        if plan_id is None:
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Committed quarantine resolution lost its plan ID"
+            )
+        run_id = plan.target.identifier
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            run = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+                (run_id, plan.thread.tenant_id),
+            ).fetchone()
+            if run is None:
+                raise QuarantineResolutionEvidenceIncompleteError(
+                    "Resolved Run is not durably visible"
+                )
+            checkpoint = connection.execute(
+                """
+                SELECT revision, state_json FROM thread_states
+                WHERE tenant_id = ? AND thread_id = ?
+                """,
+                (run["tenant_id"], run["thread_id"]),
+            ).fetchone()
+            workflow_fingerprint = self._workflow_evidence_fingerprint(
+                connection,
+                run_id,
+            )
+            resolution_events = self._matching_resolution_events(
+                connection,
+                run_id,
+                plan_id=plan_id,
+            )
+            failed_events = self._matching_resolution_failed_events(
+                connection,
+                run_id,
+                plan_id=plan_id,
+            )
+            connection.commit()
+
+        observed_revision = int(checkpoint["revision"]) if checkpoint else 0
+        checkpoint_state_json = checkpoint["state_json"] if checkpoint else None
+        checkpoint_fingerprint = self._checkpoint_evidence_fingerprint(
+            observed_revision,
+            checkpoint_state_json,
+        )
+        lease_cleared = all(
+            run[field] is None
+            for field in (
+                "lease_owner_id",
+                "lease_token",
+                "lease_heartbeat_at",
+                "lease_expires_at",
+            )
+        )
+        verified = bool(
+            run["status"] == RunStatus.FAILED.value
+            and run["error_code"] == THREAD_CHECKPOINT_CONFLICT_CODE
+            and lease_cleared
+            and observed_revision == plan.observed_checkpoint_revision
+            and checkpoint_state_json == commit.checkpoint_state_json
+            and checkpoint_fingerprint == commit.checkpoint_evidence_fingerprint
+            and workflow_fingerprint == commit.workflow_evidence_fingerprint
+            and len(resolution_events) == 1
+            and len(failed_events) == 1
+        )
+        if not verified:
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Quarantine resolution durable evidence is incomplete"
+            )
+
+    def _derive_quarantine_plan_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        tenant_id: str,
+        target: QuarantineResolutionTarget,
+        resolution: QuarantineResolutionKind,
+    ) -> _QuarantinePlanSnapshot:
+        if target.identifier != run_id:
+            raise ValueError("Quarantine target identity does not match run_id")
+        run = connection.execute(
+            "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?",
+            (run_id, tenant_id),
+        ).fetchone()
+        if run is None:
+            raise KeyError(f"Run not found: {run_id}")
+
+        checkpoint = connection.execute(
+            """
+            SELECT revision, state_json FROM thread_states
+            WHERE tenant_id = ? AND thread_id = ?
+            """,
+            (tenant_id, run["thread_id"]),
+        ).fetchone()
+        observed_revision = int(checkpoint["revision"]) if checkpoint else 0
+        checkpoint_state_json = checkpoint["state_json"] if checkpoint else None
+        checkpoint_fingerprint = self._checkpoint_evidence_fingerprint(
+            observed_revision,
+            checkpoint_state_json,
+        )
+
+        run_events = connection.execute(
+            """
+            SELECT sequence, event_type, payload_json, created_at
+            FROM run_events WHERE run_id = ? ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        conflict_event: sqlite3.Row | None = None
+        conflict_payload: dict[str, Any] | None = None
+        for event in run_events:
+            if event["event_type"] != "checkpoint.conflict":
+                continue
+            payload = self._decode_json_object(event["payload_json"])
+            if payload is None:
+                continue
+            if payload.get("disposition") == "external_action_reconciliation_quarantined":
+                conflict_event = event
+                conflict_payload = payload
+
+        action_rows = connection.execute(
+            "SELECT * FROM external_actions WHERE run_id = ? ORDER BY created_at, action_id",
+            (run_id,),
+        ).fetchall()
+        step_rows = connection.execute(
+            "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY created_at, call_id",
+            (run_id,),
+        ).fetchall()
+        workflow_events = connection.execute(
+            "SELECT * FROM workflow_events WHERE run_id = ? ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        execution = connection.execute(
+            "SELECT * FROM workflow_executions WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        workflow_fingerprint = self._workflow_evidence_fingerprint_from_rows(
+            execution,
+            step_rows,
+            action_rows,
+            workflow_events,
+        )
+
+        counts = {
+            "prepared": 0,
+            "dispatching": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "outcome_unknown": 0,
+        }
+        unknown_status = False
+        for action in action_rows:
+            action_status = str(action["status"])
+            if action_status in counts:
+                counts[action_status] += 1
+            else:
+                unknown_status = True
+        action_summary = ExternalActionStatusSummary(
+            total=len(action_rows),
+            **counts,
+        )
+
+        reasons: list[str] = []
+
+        def add_reason(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        if run["status"] != RunStatus.RUNNING.value or (
+            run["error_code"] != THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
+        ):
+            add_reason("run_not_quarantined")
+        if any(
+            run[field] is not None
+            for field in (
+                "lease_owner_id",
+                "lease_token",
+                "lease_heartbeat_at",
+                "lease_expires_at",
+            )
+        ):
+            add_reason("execution_authority_present")
+
+        base_revision = run["checkpoint_base_revision"]
+        normalized_base_revision = (
+            int(base_revision) if base_revision is not None else None
+        )
+        if conflict_event is None or conflict_payload is None:
+            add_reason("checkpoint_conflict_event_missing")
+        else:
+            if (
+                conflict_payload.get("expected_revision") != normalized_base_revision
+                or conflict_payload.get("observed_revision") != observed_revision
+            ):
+                add_reason("checkpoint_conflict_event_mismatch")
+        if normalized_base_revision == observed_revision:
+            add_reason("checkpoint_revision_not_drifted")
+        if execution is None:
+            add_reason("workflow_execution_missing")
+        if not action_rows:
+            add_reason("external_action_evidence_missing")
+        if counts["prepared"] or counts["dispatching"] or unknown_status:
+            add_reason("external_action_nonterminal")
+        if action_rows and not self._terminal_external_action_evidence_is_consistent(
+            action_rows,
+            step_rows,
+            workflow_events,
+            execution=execution,
+            tenant_id=tenant_id,
+        ):
+            add_reason("external_action_evidence_inconsistent")
+
+        eligible = not reasons
+        thread = QuarantineThreadReference(
+            tenant_id=tenant_id,
+            reference_kind=(
+                "thread_id"
+                if target.kind == QuarantineTargetKind.RUN
+                else "action_id"
+            ),
+            reference=(
+                str(run["thread_id"])
+                if target.kind == QuarantineTargetKind.RUN
+                else target.identifier
+            ),
+        )
+        safe_conflict = (
+            {
+                "sequence": int(conflict_event["sequence"]),
+                "created_at": conflict_event["created_at"],
+                "phase": conflict_payload.get("phase"),
+                "expected_revision": conflict_payload.get("expected_revision"),
+                "observed_revision": conflict_payload.get("observed_revision"),
+                "disposition": conflict_payload.get("disposition"),
+            }
+            if conflict_event is not None and conflict_payload is not None
+            else None
+        )
+        plan_material = {
+            "contract": "quarantine-resolution-plan-v1",
+            "tenant_id": tenant_id,
+            "target": target.model_dump(mode="json"),
+            "resolution": resolution.value,
+            "run": {
+                "status": run["status"],
+                "error_code": run["error_code"],
+                "attempt": int(run["attempt"]),
+                "cancel_requested": bool(run["cancel_requested"]),
+                "checkpoint_base_revision": normalized_base_revision,
+                "updated_at": run["updated_at"],
+                "lease_cleared": not any(
+                    run[field] is not None
+                    for field in (
+                        "lease_owner_id",
+                        "lease_token",
+                        "lease_heartbeat_at",
+                        "lease_expires_at",
+                    )
+                ),
+            },
+            "checkpoint": {
+                "revision": observed_revision,
+                "evidence_fingerprint": checkpoint_fingerprint,
+            },
+            "checkpoint_conflict": safe_conflict,
+            "workflow_evidence_fingerprint": workflow_fingerprint,
+            "external_action_status_summary": action_summary.model_dump(mode="json"),
+        }
+        plan_id = (
+            "qrp_" + self._canonical_resolution_hash(plan_material)
+            if eligible
+            else None
+        )
+        plan = QuarantineResolutionPlan(
+            target=target,
+            resolution=resolution,
+            eligible=eligible,
+            plan_id=plan_id,
+            thread=thread,
+            current_run_status=RunStatus(run["status"]),
+            current_quarantine_code=run["error_code"],
+            checkpoint_base_revision=normalized_base_revision,
+            observed_checkpoint_revision=observed_revision,
+            external_actions=action_summary,
+            workflow_reconciliation_required=bool(
+                counts["prepared"] or counts["dispatching"] or unknown_status
+            ),
+            planned_run_transition=(
+                "running -> failed" if eligible else "no change"
+            ),
+            new_audit_events=(
+                ("quarantine.resolution_applied", "run.failed")
+                if eligible
+                else ()
+            ),
+            thread_disposition=(
+                "released_after_atomic_commit" if eligible else "remains_blocked"
+            ),
+            ineligibility_reasons=tuple(reasons),
+        )
+        return _QuarantinePlanSnapshot(
+            plan=plan,
+            workflow_evidence_fingerprint=workflow_fingerprint,
+            checkpoint_evidence_fingerprint=checkpoint_fingerprint,
+            checkpoint_state_json=checkpoint_state_json,
+        )
+
+    @staticmethod
+    def _terminal_external_action_evidence_is_consistent(
+        action_rows: list[sqlite3.Row],
+        step_rows: list[sqlite3.Row],
+        workflow_events: list[sqlite3.Row],
+        *,
+        execution: sqlite3.Row | None,
+        tenant_id: str,
+    ) -> bool:
+        if execution is None:
+            return False
+        steps = {(row["run_id"], row["step_id"]): row for row in step_rows}
+        decoded_events: list[tuple[str, dict[str, Any]]] = []
+        for event in workflow_events:
+            payload = SQLiteRunStore._decode_json_object(event["payload_json"])
+            if payload is None:
+                return False
+            decoded_events.append((event["event_type"], payload))
+        for action in action_rows:
+            status = action["status"]
+            if status not in {"succeeded", "failed", "outcome_unknown"}:
+                return False
+            if (
+                action["tenant_id"] != tenant_id
+                or action["workflow_type"] != execution["workflow_type"]
+                or not action["provider_name"]
+                or not action["provider_identity"]
+                or not action["idempotency_key"]
+                or SQLiteRunStore._decode_json_object(action["arguments_json"])
+                is None
+            ):
+                return False
+            if int(action["dispatch_count"]) < 1 or action["dispatch_token"] is None:
+                return False
+            step = steps.get((action["run_id"], action["step_id"]))
+            if step is None or (
+                step["tool_name"] != action["tool_name"]
+                or step["input_hash"] != action["input_hash"]
+            ):
+                return False
+            if status == "succeeded":
+                row_consistent = bool(
+                    action["provider_reference"]
+                    and action["result_json"] is not None
+                    and SQLiteRunStore._decode_json_object(action["result_json"])
+                    is not None
+                    and action["error_code"] is None
+                    and step["status"] == "completed"
+                    and step["result_json"] == action["result_json"]
+                    and step["error_code"] is None
+                )
+            else:
+                row_consistent = bool(
+                    action["result_json"] is None
+                    and action["error_code"]
+                    and step["status"] == "failed"
+                    and step["result_json"] is None
+                    and step["error_code"] == action["error_code"]
+                )
+            if not row_consistent:
+                return False
+            expected_event_type = f"external_action.{status}"
+            terminal_events = [
+                (event_type, payload)
+                for event_type, payload in decoded_events
+                if event_type
+                in {
+                    "external_action.succeeded",
+                    "external_action.failed",
+                    "external_action.outcome_unknown",
+                }
+                and payload.get("action_id") == action["action_id"]
+            ]
+            if len(terminal_events) != 1:
+                return False
+            event_type, event_payload = terminal_events[0]
+            if not (
+                event_type == expected_event_type
+                and event_payload.get("step_id") == action["step_id"]
+                and event_payload.get("tool_name") == action["tool_name"]
+                and event_payload.get("provider_name") == action["provider_name"]
+                and event_payload.get("status") == status
+                and event_payload.get("dispatch_count")
+                == int(action["dispatch_count"])
+                and event_payload.get("provider_reference")
+                == action["provider_reference"]
+                and event_payload.get("error_code") == action["error_code"]
+            ):
+                return False
+            expected_step_event_type = (
+                "step.completed" if status == "succeeded" else "step.failed"
+            )
+            step_events = [
+                (event_type, payload)
+                for event_type, payload in decoded_events
+                if event_type in {"step.completed", "step.failed"}
+                and payload.get("step_id") == action["step_id"]
+            ]
+            if len(step_events) != 1:
+                return False
+            step_event_type, step_payload = step_events[0]
+            if not (
+                step_event_type == expected_step_event_type
+                and step_payload.get("tool_name") == step["tool_name"]
+                and step_payload.get("attempt_count") == int(step["attempt_count"])
+                and step_payload.get("error_code") == step["error_code"]
+                and step_payload.get("outcome")
+                == ("completed" if status == "succeeded" else "failed")
+            ):
+                return False
+        return True
+
+    def _workflow_evidence_fingerprint(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> str:
+        execution = connection.execute(
+            "SELECT * FROM workflow_executions WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        steps = connection.execute(
+            "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY created_at, call_id",
+            (run_id,),
+        ).fetchall()
+        actions = connection.execute(
+            "SELECT * FROM external_actions WHERE run_id = ? ORDER BY created_at, action_id",
+            (run_id,),
+        ).fetchall()
+        events = connection.execute(
+            "SELECT * FROM workflow_events WHERE run_id = ? ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        return self._workflow_evidence_fingerprint_from_rows(
+            execution,
+            steps,
+            actions,
+            events,
+        )
+
+    @classmethod
+    def _workflow_evidence_fingerprint_from_rows(
+        cls,
+        execution: sqlite3.Row | None,
+        steps: list[sqlite3.Row],
+        actions: list[sqlite3.Row],
+        events: list[sqlite3.Row],
+    ) -> str:
+        material = {
+            "execution": (
+                cls._resolution_row_material(execution)
+                if execution is not None
+                else None
+            ),
+            "steps": [cls._resolution_row_material(row) for row in steps],
+            "actions": [cls._resolution_row_material(row) for row in actions],
+            "events": [cls._resolution_row_material(row) for row in events],
+        }
+        return cls._canonical_resolution_hash(material)
+
+    @staticmethod
+    def _resolution_row_material(row: sqlite3.Row) -> dict[str, Any]:
+        """Keep complete evidence inside the hash input without returning raw values."""
+
+        return {str(column): row[column] for column in row.keys()}
+
+    @classmethod
+    def _checkpoint_evidence_fingerprint(
+        cls,
+        revision: int,
+        state_json: str | None,
+    ) -> str:
+        state_fingerprint = (
+            sha256(state_json.encode("utf-8")).hexdigest()
+            if state_json is not None
+            else None
+        )
+        return cls._canonical_resolution_hash(
+            {
+                "revision": revision,
+                "state_fingerprint": state_fingerprint,
+            }
+        )
+
+    @staticmethod
+    def _canonical_resolution_hash(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _decode_json_object(encoded: str) -> dict[str, Any] | None:
+        try:
+            decoded = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    def _find_resolution_event_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        expected_plan_id: str,
+    ) -> tuple[QuarantineResolutionPlan, str, str] | None:
+        matching = self._matching_resolution_events(
+            connection,
+            run_id,
+            plan_id=expected_plan_id,
+        )
+        if not matching:
+            return None
+        if len(matching) != 1:
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Duplicate quarantine resolution audit evidence"
+            )
+        payload = self._decode_json_object(matching[0]["payload_json"])
+        if payload is None:
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Quarantine resolution audit evidence is invalid"
+            )
+        try:
+            plan = QuarantineResolutionPlan.model_validate(payload["plan"])
+            workflow_fingerprint = str(payload["workflow_evidence_fingerprint"])
+            checkpoint_fingerprint = str(payload["checkpoint_evidence_fingerprint"])
+        except (KeyError, TypeError, ValueError):
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Quarantine resolution audit evidence is invalid"
+            ) from None
+        if (
+            payload.get("resolution") != plan.resolution.value
+            or payload.get("target_kind") != plan.target.kind.value
+            or plan.plan_id != expected_plan_id
+        ):
+            raise QuarantineResolutionEvidenceIncompleteError(
+                "Quarantine resolution audit identity is inconsistent"
+            )
+        return plan, workflow_fingerprint, checkpoint_fingerprint
+
+    @staticmethod
+    def _matching_resolution_events(
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        plan_id: str,
+    ) -> list[sqlite3.Row]:
+        rows = connection.execute(
+            """
+            SELECT * FROM run_events
+            WHERE run_id = ? AND event_type = 'quarantine.resolution_applied'
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        matching: list[sqlite3.Row] = []
+        for row in rows:
+            payload = SQLiteRunStore._decode_json_object(row["payload_json"])
+            if payload is not None and payload.get("plan_id") == plan_id:
+                matching.append(row)
+        return matching
+
+    @staticmethod
+    def _matching_resolution_failed_events(
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        plan_id: str,
+    ) -> list[sqlite3.Row]:
+        rows = connection.execute(
+            """
+            SELECT * FROM run_events
+            WHERE run_id = ? AND event_type = 'run.failed'
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        matching: list[sqlite3.Row] = []
+        for row in rows:
+            payload = SQLiteRunStore._decode_json_object(row["payload_json"])
+            if payload is not None and payload.get("plan_id") == plan_id:
+                matching.append(row)
+        return matching
 
     def _fail_checkpoint_conflict_with_connection(
         self,
