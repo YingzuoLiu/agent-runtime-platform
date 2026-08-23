@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from runtime_service.postgres_schema import (
     PostgresSchemaError,
@@ -47,6 +48,26 @@ def test_postgres_incompatible_schema_version_fails_closed(store_backend) -> Non
     finally:
         connection.close()
     with pytest.raises(PostgresSchemaError, match="incompatible"):
+        initialize_postgres_schema(backend.dsn, schema=backend.schema)
+
+
+def test_postgres_unversioned_execution_schema_fails_closed(store_backend) -> None:
+    backend = _postgres_backend(store_backend)
+    connection = psycopg.connect(backend.dsn, autocommit=True)
+    try:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(backend.schema)
+            )
+        )
+        connection.execute(
+            sql.SQL("CREATE TABLE {}.runs (run_id TEXT PRIMARY KEY)").format(
+                sql.Identifier(backend.schema)
+            )
+        )
+    finally:
+        connection.close()
+    with pytest.raises(PostgresSchemaError, match="unversioned"):
         initialize_postgres_schema(backend.dsn, schema=backend.schema)
 
 
