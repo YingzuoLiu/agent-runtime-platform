@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 import time
 import traceback
@@ -17,7 +16,8 @@ from .auth import TenantContext
 from .external_actions import ExternalActionReconciliationPendingError
 from .models import RunCommitOutcome, RunCreateRequest, RunLeaseClaim, RunRecord, RunStatus
 from .registry import AgentRegistry, RuntimeRegistration
-from .store import SQLiteRunStore, ThreadCheckpointRevisionConflictError
+from .run_store import RunStore, is_run_store_integrity_error, is_run_store_retryable_error
+from .store import ThreadCheckpointRevisionConflictError
 
 
 class ReferencedRunNotFoundError(KeyError):
@@ -29,7 +29,7 @@ class RuntimeManager:
 
     def __init__(
         self,
-        store: SQLiteRunStore,
+        store: RunStore,
         registry: AgentRegistry,
         *,
         worker_count: int = 1,
@@ -217,7 +217,9 @@ class RuntimeManager:
                         "client_request_id": run.client_request_id,
                     },
                 )
-            except sqlite3.IntegrityError:
+            except Exception as exc:
+                if not is_run_store_integrity_error(exc):
+                    raise
                 if not request.client_request_id:
                     raise
                 existing = self.store.get_run_by_client_request_id(
@@ -280,7 +282,9 @@ class RuntimeManager:
                             ExternalActionReconciliationPendingError.CODE
                         ),
                     )
-            except sqlite3.Error:
+            except Exception as exc:
+                if not is_run_store_retryable_error(exc):
+                    raise
                 self._wake.wait(self.poll_interval_seconds)
                 self._wake.clear()
                 continue
