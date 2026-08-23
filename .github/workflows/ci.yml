@@ -23,6 +23,7 @@ jobs:
       - run: ruff check agent api demo_provider runtime_service tests domains examples
       - run: mypy
       - run: pytest -q
+      - run: git diff --check
       - run: docker compose config --quiet
 
   postgres-conformance:
@@ -46,7 +47,6 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      STORE_CONFORMANCE_BACKENDS: postgres
       TEST_POSTGRES_DSN: postgresql://postgres:conformance-only@127.0.0.1:5432/runtime_test
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,26 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements-dev.txt
       - run: python -c "import psycopg; print('psycopg driver import: ok')"
-      - run: pytest -q tests/conformance
+      - name: SQLite shared conformance
+        env:
+          STORE_CONFORMANCE_BACKENDS: sqlite
+        run: >-
+          pytest -q
+          tests/conformance/test_run_store_contract.py
+          tests/conformance/test_workflow_store_contract.py
+          tests/conformance/test_execution_plane_contract.py
+      - name: PostgreSQL shared conformance
+        env:
+          STORE_CONFORMANCE_BACKENDS: postgres
+        run: >-
+          pytest -q
+          tests/conformance/test_run_store_contract.py
+          tests/conformance/test_workflow_store_contract.py
+          tests/conformance/test_execution_plane_contract.py
+      - name: PostgreSQL backend mechanics
+        env:
+          STORE_CONFORMANCE_BACKENDS: postgres
+        run: pytest -q tests/conformance/test_postgres_backend.py
 
   action-recovery-proof:
     needs: test
