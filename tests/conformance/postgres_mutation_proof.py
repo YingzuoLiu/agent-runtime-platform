@@ -76,6 +76,9 @@ def _run_mutant(mutant: Mutant) -> None:
         for path, content in originals.items():
             path.write_bytes(content)
 
+    # Pytest exit 1 means the selected semantic assertion failed. Collection,
+    # command-line, and internal errors use different codes and are not accepted
+    # as mutation evidence.
     if result.returncode != 1:
         print(result.stdout)
         raise RuntimeError(
@@ -114,8 +117,8 @@ def main() -> int:
                     "WHERE run_id = %s AND status = %s AND lease_token = %s\n"
                     "                AND lease_expires_at > %s\n"
                     "            FOR UPDATE",
-                    "WHERE run_id = %s AND status = %s AND %s IS NOT NULL\n"
-                    "                AND lease_expires_at > %s\n"
+                    "WHERE run_id = %s AND status = %s AND lease_token = lease_token\n"
+                    "                AND %s::text IS NOT NULL AND lease_expires_at > %s\n"
                     "            FOR UPDATE",
                 ),
             ),
@@ -135,7 +138,7 @@ def main() -> int:
         Mutant(
             3,
             "remove one-running-Run-per-Thread uniqueness",
-            f"{RUN_CONTRACT}::test_i3_one_running_run_per_tenant_qualified_thread",
+            f"{POSTGRES_MECHANICS}::test_postgres_expected_unique_and_fk_constraints_are_enforced",
             (
                 Replacement(
                     POSTGRES_SCHEMA,
@@ -245,8 +248,14 @@ def main() -> int:
         ),
     )
 
+    failures: list[str] = []
     for mutant in mutants:
-        _run_mutant(mutant)
+        try:
+            _run_mutant(mutant)
+        except Exception as exc:
+            message = f"M{mutant.number:02d} SURVIVED/INVALID | {exc}"
+            failures.append(message)
+            print(message)
 
     # I6 already contains directed transactional fault injection. These two
     # counterfactuals prove the transaction cannot be split around checkpoint
@@ -256,16 +265,28 @@ def main() -> int:
     atomic_target = (
         f"{RUN_CONTRACT}::test_i6_completion_checkpoint_and_required_events_commit_atomically"
     )
-    _run_counterfactual(
-        7,
-        "split Run/checkpoint/events transaction (checkpoint-write failure injection)",
-        atomic_target,
-    )
-    _run_counterfactual(
-        8,
-        "append terminal event outside transaction (terminal-event failure injection)",
-        atomic_target,
-    )
+    for number, description in (
+        (
+            7,
+            "split Run/checkpoint/events transaction (checkpoint-write failure injection)",
+        ),
+        (
+            8,
+            "append terminal event outside transaction (terminal-event failure injection)",
+        ),
+    ):
+        try:
+            _run_counterfactual(number, description, atomic_target)
+        except Exception as exc:
+            message = f"M{number:02d} COUNTERFACTUAL FAILED | {exc}"
+            failures.append(message)
+            print(message)
+
+    if failures:
+        print("POSTGRES STORE MUTATION PROOF: FAILED")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
 
     print("POSTGRES STORE MUTATION PROOF: 12/12 KILLED OR COUNTERFACTUALLY PROVED")
     return 0
