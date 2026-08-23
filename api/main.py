@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -71,6 +70,7 @@ from runtime_service import (
     RunEvent,
     RunRecord,
     RunStatus,
+    RunStore,
     RuntimeManager,
     RuntimeExtension,
     RuntimeExtensionContext,
@@ -93,6 +93,7 @@ from runtime_service.external_actions import (
     ExternalActionProvider,
     ExternalActionProviderRegistry,
 )
+from runtime_service.run_store import is_run_store_contention_error, is_run_store_error
 from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
 from runtime_service.action_gateway import (
     ACTION_AGENT_ID,
@@ -250,6 +251,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Application composition intentionally remains SQLite in this phase.
+        # Run/Workflow PostgreSQL portability is proven below the composition
+        # root; Memory still requires same-database Run lease validation.
         store = SQLiteRunStore(resolved_database_path)
         memory_store = SQLiteMemoryStore(resolved_database_path)
         governed_memory = GovernedMemory(memory_store, store)
@@ -584,7 +588,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> ToolExecutionResult:
-        store: SQLiteRunStore = request.app.state.run_store
+        store: RunStore = request.app.state.run_store
         if (
             payload.run_id is not None
             and public_run_or_none(
@@ -660,14 +664,11 @@ def create_app(
             # Submission already committed. Database contention or an over-budget
             # observation must end compatibility waiting, not fail or cancel the Run.
             return None
-        except sqlite3.OperationalError as exc:
-            sqlite_error_code = getattr(exc, "sqlite_errorcode", None)
-            if (
-                sqlite_error_code is not None
-                and sqlite_error_code & 0xFF
-                in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-            ):
+        except Exception as exc:
+            if is_run_store_contention_error(exc):
                 return None
+            if not is_run_store_error(exc):
+                raise
             raise HTTPException(
                 status_code=500,
                 detail="Managed Run evidence is incomplete",
@@ -751,7 +752,7 @@ def create_app(
         """Bounded-wait Travel adapter backed by the managed Run lifecycle."""
         require_permission(principal, RuntimePermission.AGENT_MESSAGE_EXECUTE)
         wait_seconds = validate_agent_message_wait(request, wait)
-        store: SQLiteRunStore = request.app.state.run_store
+        store: RunStore = request.app.state.run_store
         if payload.state is not None and payload.state.thread_id != payload.thread_id:
             raise HTTPException(
                 status_code=422,
@@ -924,10 +925,13 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> RunRecord:
-        run = public_run_or_none(request, get_manager(request).get_run(
-            run_id,
-            tenant_context=principal.tenant_context,
-        ))
+        run = public_run_or_none(
+            request,
+            get_manager(request).get_run(
+                run_id,
+                tenant_context=principal.tenant_context,
+            ),
+        )
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         require_permission(principal, RuntimePermission.RUNS_READ)
