@@ -122,7 +122,7 @@ shared assertions.
 | One ordered Thread writer | tenant-qualified running-Run uniqueness and claim arbitration | partial unique `(tenant_id, thread_id) WHERE status='running'` plus claim arbitration | I3, I4 |
 | Correct predecessor | captured `checkpoint_base_revision` and revision CAS | captured `checkpoint_base_revision` and revision-qualified upsert | I5, I6 |
 | Full result versus resumable projection | `project_thread_checkpoint_state()` inside terminal transaction | same typed projection inside PostgreSQL terminal transaction | I6; checkpoint-projection tests |
-| One atomic observable completion | one SQLite transaction covers Run/checkpoint/events/lease clear | one PostgreSQL transaction covers the same durable effects | I6 injected failures |
+| One atomic observable completion | one SQLite transaction covers Run/checkpoint/events/lease clear | one PostgreSQL transaction covers the same durable effects | I6 injected failures and M07/M08 source mutants |
 | Truthful projection evidence | persisted Run count versus projected checkpoint count | same event payload semantics | I6; state-boundary characterization |
 | Recovery interpretation | reconciliation precedence and nonterminal quarantine on drift | same shared recovery/quarantine outcomes | I7, I8 |
 | Controlled repair | plan rederivation, evidence checks, atomic resolution/failure | same logical evidence rederivation within one PostgreSQL schema/transaction domain | I9 plus quarantine evidence integrity contract |
@@ -198,18 +198,22 @@ be generalized into cross-backend assertions:
 - a stale checkpoint revision cannot satisfy the PostgreSQL upsert CAS predicate;
 - generated test schemas do not leak data.
 
-## Mutation and counterfactual gate
+## Mutation gate
 
 `tests/conformance/postgres_mutation_proof.py` makes the portability evidence mutation-sensitive.
 After the PostgreSQL 3.11 and 3.12 conformance jobs pass, a PostgreSQL 16 / Python 3.12 CI job
-applies ten temporary source mutations and runs the targeted assertion for each. Two transaction
-boundary counterfactuals use the existing directed I6 failure injection. Every source mutation is
-restored byte-for-byte, and CI finishes the job with `git diff --exit-code`.
+applies twelve temporary source mutations and runs the targeted semantic assertion for each. Every
+mutation is restored byte-for-byte, and CI finishes the job with `git diff --exit-code`.
 
-The twelve required counterfactuals cover lease-token fencing, exact expiry, Thread uniqueness and
-tenant qualification, checkpoint CAS, checkpoint trace projection, atomic completion, terminal-event
-atomicity, unsafe-provider no-retry, quarantine plan rederivation, same-revision evidence drift, and
-legal later successor checkpoint progress.
+The mutation set is sampled rather than exhaustive: it removes representative lease fencing,
+exact-expiry, Thread uniqueness/tenant qualification, checkpoint CAS/projection, transaction
+atomicity, unsafe-provider recovery, and quarantine evidence properties. In particular M01 samples
+one lease-token predicate; it is not a claim that every lease predicate was independently mutated.
+
+M07 and M08 are real source mutations rather than relabeled baseline tests. M07 commits terminal Run
+status before the checkpoint/event transaction; M08 moves `run.completed` outside the transaction.
+The existing I6 three-way failure-injection assertion kills both by observing the resulting partial
+durable state.
 
 The exact mutant-to-test mapping is documented in
 [`postgresql-store-backend.md`](postgresql-store-backend.md).
@@ -217,7 +221,9 @@ The exact mutant-to-test mapping is documented in
 ## Application boundary and non-goals
 
 The default service still composes `SQLiteRunStore`, `SQLiteWorkflowStore`, and
-`SQLiteMemoryStore`. PostgreSQL is not wired into the application root in this phase.
+`SQLiteMemoryStore`. PostgreSQL is not wired into the application root in this phase. The default
+`requirements.txt` does not install Psycopg; PostgreSQL users install `requirements-postgres.txt`,
+while `requirements-dev.txt` includes it for conformance testing.
 
 This is intentional. Governed memory checks current Run/lease authority in the same storage
 transaction as memory mutation. Combining PostgreSQL Run/Workflow storage with `SQLiteMemoryStore`
