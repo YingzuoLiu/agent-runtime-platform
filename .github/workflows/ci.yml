@@ -111,6 +111,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python tests/conformance/postgres_mutation_proof.py
       - name: Prove mutation runner restored source
+        if: always()
         run: git diff --exit-code
 
   action-recovery-proof:
