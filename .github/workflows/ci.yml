@@ -85,6 +85,7 @@ jobs:
           pytest -q
           tests/conformance/test_postgres_backend.py
           tests/conformance/test_postgres_memory_backend.py
+          tests/conformance/test_postgres_application_composition.py
 
   postgres-mutation-proof:
     needs: postgres-conformance
