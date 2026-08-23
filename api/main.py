@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -59,6 +59,12 @@ from runtime_service import (
     MemoryRecord,
     Planner,
     Principal,
+    QuarantineResolutionCommand,
+    QuarantineResolutionEvidenceIncompleteError,
+    QuarantineResolutionResponse,
+    QuarantineResolutionService,
+    QuarantineResolutionStalePlanError,
+    QuarantineTargetNotFoundError,
     ReferencedRunNotFoundError,
     RoleAuthorizer,
     RunCreateRequest,
@@ -121,12 +127,14 @@ class ActionRouteError(Exception):
         message: str,
         *,
         headers: Mapping[str, str] | None = None,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.headers = dict(headers or {})
+        self.details = dict(details) if details is not None else None
 
 
 class NoStoreStaticFiles(StaticFiles):
@@ -385,6 +393,10 @@ def create_app(
             workflow_store=workflow_store,
             provider_registry=action_provider_registry,
         )
+        quarantine_resolution_service = QuarantineResolutionService(
+            store=store,
+            registry=registry,
+        )
         manager.start()
         app.state.run_store = store
         app.state.memory_store = memory_store
@@ -399,6 +411,7 @@ def create_app(
         app.state.travel_action_provider = resolved_action_provider
         app.state.action_provider_registry = action_provider_registry
         app.state.action_gateway = action_gateway
+        app.state.quarantine_resolution_service = quarantine_resolution_service
         app.state.authenticator = resolved_authenticator
         app.state.authorizer = resolved_authorizer
         yield
@@ -495,11 +508,15 @@ def create_app(
         exc: ActionRouteError,
     ) -> JSONResponse:
         envelope = ActionApiErrorEnvelope(
-            error=ActionApiErrorBody(code=exc.code, message=exc.message)
+            error=ActionApiErrorBody(
+                code=exc.code,
+                message=exc.message,
+                details=exc.details,
+            )
         )
         return JSONResponse(
             status_code=exc.status_code,
-            content=envelope.model_dump(mode="json"),
+            content=envelope.model_dump(mode="json", exclude_none=True),
             headers=exc.headers,
         )
 
@@ -854,6 +871,52 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/operator/quarantine-resolutions",
+        response_model=QuarantineResolutionResponse,
+    )
+    def resolve_quarantine(
+        payload: QuarantineResolutionCommand,
+        request: Request,
+        principal: Principal = Depends(require_action_principal),
+    ) -> QuarantineResolutionResponse:
+        service: QuarantineResolutionService = (
+            request.app.state.quarantine_resolution_service
+        )
+        if not service.target_is_visible(payload, tenant_id=principal.tenant_id):
+            raise ActionRouteError(
+                status.HTTP_404_NOT_FOUND,
+                "quarantine_target_not_found",
+                "Quarantine target not found.",
+            )
+        require_action_permission(
+            principal,
+            RuntimePermission.QUARANTINE_RESOLVE,
+        )
+        try:
+            return service.execute(payload, principal=principal)
+        except QuarantineTargetNotFoundError:
+            raise ActionRouteError(
+                status.HTTP_404_NOT_FOUND,
+                "quarantine_target_not_found",
+                "Quarantine target not found.",
+            ) from None
+        except QuarantineResolutionStalePlanError as exc:
+            raise ActionRouteError(
+                status.HTTP_409_CONFLICT,
+                "quarantine_resolution_plan_stale",
+                "The quarantine resolution plan is stale; run dry-run again.",
+                details={
+                    "current_plan": exc.current_plan.model_dump(mode="json"),
+                },
+            ) from None
+        except QuarantineResolutionEvidenceIncompleteError:
+            raise ActionRouteError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "quarantine_resolution_evidence_incomplete",
+                "The quarantine resolution's durable evidence is incomplete.",
+            ) from None
 
     @app.get("/runs/{run_id}", response_model=RunRecord)
     def get_run(

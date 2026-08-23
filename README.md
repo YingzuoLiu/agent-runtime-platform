@@ -167,6 +167,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
 | Store conformance | Adapter-driven SQLite reference contracts for ownership, fencing, checkpoint CAS, recovery, and quarantine | [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md), [`tests/conformance`](tests/conformance) |
+| Quarantine resolution | Operator-authorized dry-run/apply command that atomically fails an unchanged eligible quarantine while preserving checkpoint and external evidence | [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md), [`tests/test_quarantine_resolution.py`](tests/test_quarantine_resolution.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
 | External actions | Prepared intent, provider dispatch fencing, bounded idempotent recovery, and explicit unknown outcomes | [`runtime_service/external_action_coordinator.py`](runtime_service/external_action_coordinator.py), [`docs/durable-external-actions.md`](docs/durable-external-actions.md) |
 | Action gateway | `webhook.send` façade over a private single-step domain and the existing Run lifecycle | [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md), [`examples/external_agent.py`](examples/external_agent.py) |
@@ -555,7 +556,10 @@ contract, PowerShell walkthrough, API payload, versioning rules, and Guardian re
 - fail-closed post-dispatch reconciliation for identity, provider, capability, permission, and
   schema drift;
 - crash-equivalent recovery when uncertain-outcome terminalization itself cannot be committed;
-- stable `external_action_evidence_incomplete` reporting without undoing a succeeded action.
+- stable `external_action_evidence_incomplete` reporting without undoing a succeeded action;
+- lease-free quarantine when checkpoint drift intersects external-action recovery precedence;
+- deterministic operator dry-run/apply with stale-plan detection, exact replay, atomic audit events,
+  and preservation of the current checkpoint and terminal external-action evidence.
 
 The external-action claim is intentionally narrow. The bundled write is a deterministic
 provider-side SQLite test double, not a live booking, payment, or inventory integration. Phase 7A
@@ -601,6 +605,7 @@ and it does not create a private mount namespace, so it is not a general untrust
 | `POST /runs` | Create or selectively replay a run | no | yes |
 | `POST /actions` | Submit one allowlisted durable side effect with optional bounded wait | no | yes |
 | `POST /runs/{id}/cancel` | Request cooperative cancellation | no | yes |
+| `POST /operator/quarantine-resolutions` | Dry-run or apply the one evidence-preserving quarantine resolution | no | yes |
 | `POST /tools/{tool}/execute` | Execute a registered read-only tool directly; external writes return `409` | no | yes |
 | `POST /agent/message` | Call the bounded-wait Travel adapter through the managed Run lifecycle | no | yes |
 | `DELETE /memories/{id}` | Forget one logical memory key for future runs | no | yes |
@@ -740,6 +745,7 @@ input signatures still match; the source run is never mutated.
 | [`runtime_service/external_actions.py`](runtime_service/external_actions.py) | Provider contracts, registry, and sanitized dispatch boundary |
 | [`runtime_service/http_external_action.py`](runtime_service/http_external_action.py) | Optional server-configured JSON-over-HTTP provider adapter |
 | [`runtime_service/manager.py`](runtime_service/manager.py) | Durable Run polling, lease heartbeat/takeover, cancellation, and fenced finalization |
+| [`runtime_service/quarantine_resolution.py`](runtime_service/quarantine_resolution.py) | Deterministic target visibility, plan/apply orchestration, and post-commit verification |
 | [`runtime_service/auth.py`](runtime_service/auth.py) | Principal derivation, typed permissions, and default-deny authorization |
 | [`runtime_service/memory.py`](runtime_service/memory.py) | Versioned records, audit events, sealed snapshots, and run evidence |
 | [`domains/travel/dynamic_runtime.py`](domains/travel/dynamic_runtime.py) | Reference adapter and domain-owned final validation |
@@ -763,6 +769,8 @@ input signatures still match; the source run is never mutated.
   exact-expiry takeover, fencing tokens, and deployment migration boundary;
 - [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md):
   tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
+- [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md): controlled
+  quarantine eligibility, dry-run/apply, stale plans, exact replay, evidence preservation, and SOP;
 - [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): three-layer
   executable store contracts and the invariant-to-test matrix;
 - [`docs/state-boundaries.md`](docs/state-boundaries.md): persisted state ownership,

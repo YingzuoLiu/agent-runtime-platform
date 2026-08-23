@@ -18,9 +18,16 @@ from runtime_service.external_actions import (
 )
 from runtime_service.manager import RuntimeManager
 from runtime_service.models import RunCommitOutcome, RunStatus
+from runtime_service.quarantine import (
+    QuarantineResolutionKind,
+    QuarantineResolutionTarget,
+)
 from runtime_service.registry import AgentRegistry
 from runtime_service.sandbox import ToolEffect, ToolPolicy, ToolRetryMode, ToolSpec
-from runtime_service.store import THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
+from runtime_service.store import (
+    THREAD_CHECKPOINT_CONFLICT_CODE,
+    THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE,
+)
 from runtime_service.workflow_store import ExternalActionStatus, ToolCallStatus, WorkflowStore
 
 from .backends import InjectedConformanceFailure, SQLiteConformanceBackend
@@ -32,6 +39,7 @@ from .scenarios import (
     WORKFLOW_TYPE,
     claim_run,
     complete_with_budget,
+    create_action_quarantine,
     create_queued_run,
 )
 
@@ -411,3 +419,140 @@ def test_i8_checkpoint_conflict_is_inspectable_nonterminal_quarantine(
     independent = claim_run(restarted, "independent-owner")
     assert independent is not None
     assert independent.run.run_id == "run-outside-quarantine"
+
+
+def test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence(
+    store_backend: SQLiteConformanceBackend,
+) -> None:
+    run_id = "run-controlled-quarantine-resolution"
+    thread_id = "controlled-quarantine-thread"
+    run_store, workflow_store, successor_id = create_action_quarantine(
+        store_backend,
+        run_id=run_id,
+        thread_id=thread_id,
+    )
+    later_successor_id = f"{run_id}-later-successor"
+    create_queued_run(
+        run_store,
+        later_successor_id,
+        thread_id=thread_id,
+        order=4,
+    )
+    target = QuarantineResolutionTarget(run_id=run_id)
+    resolution = (
+        QuarantineResolutionKind.TERMINALIZE_FAILED_PRESERVING_CHECKPOINT
+    )
+    before_run = run_store.get_run_internal(run_id)
+    before_run_events = run_store.list_events(run_id)
+    before_checkpoint = run_store.load_thread_state_snapshot(
+        thread_id,
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    before_workflow = workflow_store.read_run_snapshot(run_id)
+
+    plan = run_store.plan_quarantine_resolution(
+        run_id,
+        tenant_id=TENANT_ID,
+        target=target,
+        resolution=resolution,
+    )
+
+    assert plan.eligible
+    assert plan.plan_id is not None
+    assert plan.current_run_status == RunStatus.RUNNING
+    assert plan.current_quarantine_code == THREAD_CHECKPOINT_RECONCILIATION_BLOCKED_CODE
+    assert plan.checkpoint_base_revision == 1
+    assert plan.observed_checkpoint_revision == 2
+    assert plan.external_actions.succeeded == 1
+    assert not plan.workflow_reconciliation_required
+    assert plan.provider_calls == 0
+    assert plan.checkpoint_disposition == "preserved"
+    assert plan.external_evidence_disposition == "preserved"
+    assert run_store.get_run_internal(run_id) == before_run
+    assert run_store.list_events(run_id) == before_run_events
+    assert (
+        run_store.load_thread_state_snapshot(
+            thread_id,
+            tenant_id=TENANT_ID,
+            domain_id="travel",
+            schema_version="1",
+        )
+        == before_checkpoint
+    )
+    assert workflow_store.read_run_snapshot(run_id) == before_workflow
+
+    commit = run_store.apply_quarantine_resolution(
+        run_id,
+        tenant_id=TENANT_ID,
+        target=target,
+        resolution=resolution,
+        expected_plan_id=plan.plan_id,
+        operator_subject_id="conformance-operator",
+        operator_credential_id="conformance-credential",
+    )
+
+    persisted = store_backend.open_run_store().get_run_internal(run_id)
+    durable_checkpoint = store_backend.open_run_store().load_thread_state_snapshot(
+        thread_id,
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert persisted is not None
+    assert persisted.status == RunStatus.FAILED
+    assert persisted.error_code == THREAD_CHECKPOINT_CONFLICT_CODE
+    assert persisted.lease_token is None
+    assert durable_checkpoint == before_checkpoint
+    assert workflow_store.read_run_snapshot(run_id) == before_workflow
+    events = store_backend.open_run_store().list_events(run_id)
+    assert [event.event_type for event in events[-2:]] == [
+        "quarantine.resolution_applied",
+        "run.failed",
+    ]
+    assert events[-2].payload["plan_id"] == plan.plan_id
+    assert events[-2].payload["provider_calls"] == 0
+
+    successor = claim_run(store_backend.open_run_store(), "released-successor-owner")
+    assert successor is not None
+    assert successor.run.run_id == successor_id
+    assert (
+        complete_with_budget(
+            store_backend.open_run_store(),
+            successor,
+            budget=7_000,
+        )
+        == RunCommitOutcome.COMMITTED
+    )
+    advanced_checkpoint = store_backend.open_run_store().load_thread_state_snapshot(
+        thread_id,
+        tenant_id=TENANT_ID,
+        domain_id="travel",
+        schema_version="1",
+    )
+    assert advanced_checkpoint.revision == before_checkpoint.revision + 1
+
+    # The released successor may legally win the post-commit readback race.
+    # Forward checkpoint progress must not turn a committed resolution into 500.
+    run_store.verify_quarantine_resolution(commit)
+
+    replay = store_backend.open_run_store().apply_quarantine_resolution(
+        run_id,
+        tenant_id=TENANT_ID,
+        target=target,
+        resolution=resolution,
+        expected_plan_id=plan.plan_id,
+        operator_subject_id="conformance-operator",
+        operator_credential_id="conformance-credential",
+    )
+    store_backend.open_run_store().verify_quarantine_resolution(replay)
+    assert replay.reused
+    assert len(store_backend.open_run_store().list_events(run_id)) == len(events)
+
+    later_successor = store_backend.open_run_store().get_run_internal(
+        later_successor_id
+    )
+    assert later_successor is not None
+    assert later_successor.status == RunStatus.QUEUED
+    assert later_successor.attempt == 0

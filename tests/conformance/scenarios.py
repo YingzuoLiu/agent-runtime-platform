@@ -10,6 +10,7 @@ from runtime_service.store import SQLiteRunStore
 from runtime_service.workflow_store import (
     ExternalActionPrepareResult,
     ExternalActionRetryMode,
+    ExternalActionStatus,
     WorkflowStore,
 )
 
@@ -175,3 +176,127 @@ def prepare_external_action(
         idempotency_key=idempotency_key or f"idempotency-{run_id}",
         lease_token=lease_token,
     )
+
+
+def create_action_quarantine(
+    backend: SQLiteConformanceBackend,
+    *,
+    run_id: str,
+    thread_id: str,
+    terminal_status: ExternalActionStatus | None = ExternalActionStatus.SUCCEEDED,
+):
+    run_store = backend.open_run_store()
+    workflow_store = backend.open_workflow_store()
+    create_queued_run(
+        run_store,
+        f"{run_id}-seed",
+        thread_id=thread_id,
+        order=1,
+    )
+    seed = claim_run(run_store, f"{run_id}-seed-owner")
+    assert seed is not None
+    assert complete_with_budget(run_store, seed, budget=6_000) == RunCommitOutcome.COMMITTED
+
+    create_queued_run(run_store, run_id, thread_id=thread_id, order=2)
+    predecessor = claim_run(run_store, f"{run_id}-first-owner")
+    assert predecessor is not None
+    workflow_store.create_or_get_execution(
+        run_id,
+        WORKFLOW_TYPE,
+        INPUT_HASH,
+        lease_token=predecessor.lease_token,
+    )
+    workflow_store.mark_running(run_id, lease_token=predecessor.lease_token)
+    step = workflow_store.claim_step(
+        run_id,
+        "call-0001",
+        TOOL_NAME,
+        INPUT_HASH,
+        max_attempts=2,
+        lease_token=predecessor.lease_token,
+    )
+    assert step.attempt_token is not None
+    prepared = prepare_external_action(
+        workflow_store,
+        predecessor.lease_token,
+        run_id=run_id,
+        tool_attempt_token=step.attempt_token,
+        retry_mode=ExternalActionRetryMode.PROVIDER_IDEMPOTENT,
+    )
+    assert prepared.action is not None
+    dispatch = workflow_store.begin_external_action_dispatch(
+        run_id,
+        "call-0001",
+        tool_attempt_token=step.attempt_token,
+        lease_token=predecessor.lease_token,
+    )
+    assert dispatch.dispatch_token is not None
+    if terminal_status == ExternalActionStatus.SUCCEEDED:
+        workflow_store.finalize_external_action_succeeded(
+            run_id,
+            "call-0001",
+            dispatch_token=dispatch.dispatch_token,
+            tool_attempt_token=step.attempt_token,
+            result_json='{"created":true,"provider_reference":"conformance-ref"}',
+            provider_reference="conformance-ref",
+        )
+    elif terminal_status == ExternalActionStatus.FAILED:
+        workflow_store.finalize_external_action_failed(
+            run_id,
+            "call-0001",
+            dispatch_token=dispatch.dispatch_token,
+            tool_attempt_token=step.attempt_token,
+            error_code="external_action_failed",
+        )
+    elif terminal_status == ExternalActionStatus.OUTCOME_UNKNOWN:
+        workflow_store.finalize_external_action_outcome_unknown(
+            run_id,
+            "call-0001",
+            dispatch_token=dispatch.dispatch_token,
+            tool_attempt_token=step.attempt_token,
+            error_code="external_action_outcome_unknown",
+        )
+    elif terminal_status is not None:
+        raise ValueError("terminal_status must be a terminal external action status")
+
+    assert (
+        run_store.commit_reconciliation_pending(
+            run_id,
+            tenant_id=TENANT_ID,
+            lease_token=predecessor.lease_token,
+            error_code="external_action_reconciliation_pending",
+            error="ExternalActionReconciliationPendingError: recovery required",
+        )
+        == RunCommitOutcome.COMMITTED
+    )
+    successor_id = f"{run_id}-successor"
+    create_queued_run(
+        run_store,
+        successor_id,
+        thread_id=thread_id,
+        order=3,
+    )
+    backend.replace_checkpoint_out_of_band(
+        tenant_id=TENANT_ID,
+        thread_id=thread_id,
+        state=AgentState(
+            thread_id=thread_id,
+            destination="Tokyo",
+            budget=7_777,
+        ),
+        expected_revision=1,
+    )
+    assert predecessor.run.lease_expires_at is not None
+    backend.clock.advance(predecessor.run.lease_expires_at - backend.clock())
+    recovery_store = backend.open_run_store()
+    recovered = claim_run(recovery_store, f"{run_id}-recovery-owner")
+    assert recovered is not None and recovered.run.run_id == run_id
+    assert (
+        recovery_store.quarantine_checkpoint_conflict_for_reconciliation(
+            recovered.run,
+            lease_token=recovered.lease_token,
+            phase="load",
+        )
+        == RunCommitOutcome.COMMITTED
+    )
+    return recovery_store, workflow_store, successor_id
