@@ -76,7 +76,7 @@ def _run_mutant(mutant: Mutant) -> None:
         for path, content in originals.items():
             path.write_bytes(content)
 
-    # Pytest exit 1 means the selected semantic assertion failed. Collection,
+    # Pytest exit 1 means the selected semantic test failed. Collection,
     # command-line, and internal errors use different codes and are not accepted
     # as mutation evidence.
     if result.returncode != 1:
@@ -91,25 +91,17 @@ def _run_mutant(mutant: Mutant) -> None:
     )
 
 
-def _run_counterfactual(number: int, description: str, target: str) -> None:
-    result = _pytest(target)
-    if result.returncode != 0:
-        print(result.stdout)
-        raise RuntimeError(
-            f"counterfactual proof {number} failed its injected-failure target; "
-            f"observed exit {result.returncode}"
-        )
-    print(f"M{number:02d} PROVED | {description} | {target}")
-
-
 def main() -> int:
     if not os.environ.get("TEST_POSTGRES_DSN"):
         raise RuntimeError("TEST_POSTGRES_DSN is required for PostgreSQL mutation proof")
 
+    atomic_target = (
+        f"{RUN_CONTRACT}::test_i6_completion_checkpoint_and_required_events_commit_atomically"
+    )
     mutants = (
         Mutant(
             1,
-            "remove Run lease-token predicate",
+            "remove sampled Run lease-token predicate",
             f"{RUN_CONTRACT}::test_i1_i2_one_live_owner_and_stale_run_attempt_is_fenced",
             (
                 Replacement(
@@ -176,12 +168,63 @@ def main() -> int:
         Mutant(
             6,
             "persist full execution trace into Thread checkpoint",
-            f"{RUN_CONTRACT}::test_i6_completion_checkpoint_and_required_events_commit_atomically",
+            atomic_target,
             (
                 Replacement(
                     POSTGRES_STORE,
                     "checkpoint_state = project_thread_checkpoint_state(run.state)",
                     "checkpoint_state = run.state.model_copy(deep=True)",
+                ),
+            ),
+        ),
+        Mutant(
+            7,
+            "commit terminal Run status before the checkpoint/event transaction",
+            atomic_target,
+            (
+                Replacement(
+                    POSTGRES_STORE,
+                    "        cas_changed = False\n"
+                    "        connection = self._lease_connect()\n"
+                    "        try:\n"
+                    "            try:\n"
+                    "                with connection.transaction():",
+                    "        cas_changed = False\n"
+                    "        connection = self._lease_connect()\n"
+                    "        try:\n"
+                    "            try:\n"
+                    "                connection.execute(\n"
+                    "                    \"UPDATE runs SET status = %s WHERE run_id = %s\",\n"
+                    "                    (RunStatus.COMPLETED.value, run.run_id),\n"
+                    "                )\n"
+                    "                with connection.transaction():",
+                ),
+            ),
+        ),
+        Mutant(
+            8,
+            "append run.completed outside the completion transaction",
+            atomic_target,
+            (
+                Replacement(
+                    POSTGRES_STORE,
+                    "                    self._append_event_with_connection(\n"
+                    "                        connection,\n"
+                    "                        run.run_id,\n"
+                    "                        \"run.completed\",\n"
+                    "                        {\"validation_errors\": run.validation_errors},\n"
+                    "                    )\n"
+                    "            except _CheckpointCASChanged:\n"
+                    "                cas_changed = True",
+                    "            except _CheckpointCASChanged:\n"
+                    "                cas_changed = True\n"
+                    "            if not cas_changed:\n"
+                    "                self._append_event_with_connection(\n"
+                    "                    connection,\n"
+                    "                    run.run_id,\n"
+                    "                    \"run.completed\",\n"
+                    "                    {\"validation_errors\": run.validation_errors},\n"
+                    "                )",
                 ),
             ),
         ),
@@ -257,38 +300,13 @@ def main() -> int:
             failures.append(message)
             print(message)
 
-    # I6 already contains directed transactional fault injection. These two
-    # counterfactuals prove the transaction cannot be split around checkpoint
-    # persistence or terminal event append without leaving observable partial
-    # state. The handover explicitly permits equivalent targeted fault injection
-    # in place of a source-text mutant for these transaction boundaries.
-    atomic_target = (
-        f"{RUN_CONTRACT}::test_i6_completion_checkpoint_and_required_events_commit_atomically"
-    )
-    for number, description in (
-        (
-            7,
-            "split Run/checkpoint/events transaction (checkpoint-write failure injection)",
-        ),
-        (
-            8,
-            "append terminal event outside transaction (terminal-event failure injection)",
-        ),
-    ):
-        try:
-            _run_counterfactual(number, description, atomic_target)
-        except Exception as exc:
-            message = f"M{number:02d} COUNTERFACTUAL FAILED | {exc}"
-            failures.append(message)
-            print(message)
-
     if failures:
         print("POSTGRES STORE MUTATION PROOF: FAILED")
         for failure in failures:
             print(f"- {failure}")
         return 1
 
-    print("POSTGRES STORE MUTATION PROOF: 12/12 KILLED OR COUNTERFACTUALLY PROVED")
+    print("POSTGRES STORE MUTATION PROOF: 12/12 KILLED")
     return 0
 
 
