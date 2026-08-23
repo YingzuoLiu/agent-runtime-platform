@@ -166,6 +166,7 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Durability | SQLite-backed runs, events, checkpoints, Planner decisions, tool calls, and attempts | [`runtime_service/store.py`](runtime_service/store.py), [`runtime_service/workflow_store.py`](runtime_service/workflow_store.py) |
 | Execution ownership | Store-time Run leases, heartbeats, exact-expiry takeover, and cross-ledger fencing tokens | [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md), [`tests/test_run_leasing.py`](tests/test_run_leasing.py) |
 | Thread consistency | One leased Run per tenant-qualified thread plus monotonic checkpoint revision CAS | [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md), [`tests/test_thread_serialization.py`](tests/test_thread_serialization.py) |
+| Checkpoint state boundary | Full per-Run final state plus a same-type Thread projection with `execution_trace=[]`, committed atomically | [`docs/state-boundaries.md`](docs/state-boundaries.md), [`tests/test_checkpoint_projection.py`](tests/test_checkpoint_projection.py) |
 | Store conformance | Adapter-driven SQLite reference contracts for ownership, fencing, checkpoint CAS, recovery, and quarantine | [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md), [`tests/conformance`](tests/conformance) |
 | Quarantine resolution | Operator-authorized dry-run/apply command that atomically fails an unchanged eligible quarantine while preserving checkpoint and external evidence | [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md), [`tests/test_quarantine_resolution.py`](tests/test_quarantine_resolution.py) |
 | Recovery | Decision replay, completed-result reuse, interrupted-step recovery, and pinned execution authority | [`tests/test_dynamic_tool_loop.py`](tests/test_dynamic_tool_loop.py) |
@@ -537,6 +538,7 @@ contract, PowerShell walkthrough, API payload, versioning rules, and Guardian re
 - automatic takeover of expired running work without stealing a live attempt;
 - tenant-qualified thread serialization with recovery-before-successor ordering;
 - revision-qualified checkpoint loads and atomic checkpoint compare-and-swap completion;
+- full completed-Run trace evidence with store-enforced empty-trace Thread checkpoint projection;
 - fenced Run, checkpoint, workflow, memory, and new external-dispatch mutations;
 - startup preflight that preserves recoverable work when a pinned Agent version or state schema is
   not registered;

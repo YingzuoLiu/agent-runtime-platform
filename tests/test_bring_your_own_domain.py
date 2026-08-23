@@ -175,7 +175,18 @@ def test_extension_is_opt_in_and_runs_through_the_existing_durable_api(tmp_path)
             params={"domain_id": "incident-triage", "schema_version": "1"},
         )
         assert checkpoint.status_code == 200
-        assert checkpoint.json() == result["state"]
+        checkpoint_state = checkpoint.json()
+        assert result["state"]["execution_trace"]
+        assert checkpoint_state["execution_trace"] == []
+        assert {
+            key: value
+            for key, value in checkpoint_state.items()
+            if key != "execution_trace"
+        } == {
+            key: value
+            for key, value in result["state"].items()
+            if key != "execution_trace"
+        }
 
     workflow_store = SQLiteWorkflowStore(database_path)
     execution = workflow_store.get_execution(run_id)

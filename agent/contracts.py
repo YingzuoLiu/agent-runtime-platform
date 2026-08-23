@@ -55,6 +55,23 @@ StateT = TypeVar("StateT", bound=BaseRuntimeState)
 InputT = TypeVar("InputT", bound=BaseModel, contravariant=True)
 
 
+def project_thread_checkpoint_state(state: StateT) -> StateT:
+    """Return the resumable Thread projection of a validated Runtime state.
+
+    A completed Run keeps its full final state, including its run-scoped
+    execution trace. The next Run only needs the domain state required to
+    continue the Thread, so its checkpoint resets that trace instead of
+    copying accumulated observation history forward.
+
+    Re-validating a dumped payload preserves the concrete state type and
+    creates independent nested values without mutating the caller's state.
+    """
+
+    payload = state.model_dump(mode="python")
+    payload["execution_trace"] = []
+    return state.__class__.model_validate(payload)
+
+
 class RuntimeResponse(BaseModel, Generic[StateT]):
     """What a runtime step returns: a message, the resulting state, and any
     validation errors surfaced along the way.

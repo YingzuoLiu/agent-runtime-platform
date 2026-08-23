@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
-from agent.contracts import BaseRuntimeState, utc_now
+from agent.contracts import (
+    BaseRuntimeState,
+    project_thread_checkpoint_state,
+    utc_now,
+)
 from .models import (
     LEGACY_TENANT_ID,
     RunCommitOutcome,
@@ -1221,7 +1225,9 @@ class SQLiteRunStore:
                     "the persisted Run"
                 )
             self._remember_state_model(run.state)
-            state_json = run.state.model_dump_json()
+            run_state_json = run.state.model_dump_json()
+            checkpoint_state = project_thread_checkpoint_state(run.state)
+            checkpoint_state_json = checkpoint_state.model_dump_json()
             self._assert_thread_schema_available(
                 connection,
                 run.tenant_id,
@@ -1243,7 +1249,7 @@ class SQLiteRunStore:
                 """,
                 (
                     RunStatus.COMPLETED.value,
-                    state_json,
+                    run_state_json,
                     run.output_message,
                     validation_errors_json,
                     completed_at,
@@ -1284,7 +1290,7 @@ class SQLiteRunStore:
                     persisted["thread_id"],
                     persisted["domain_id"],
                     persisted["schema_version"],
-                    state_json,
+                    checkpoint_state_json,
                     completed_at,
                     observed_revision,
                 ),
@@ -1294,14 +1300,15 @@ class SQLiteRunStore:
                     "Thread checkpoint CAS changed inside its write transaction"
                 )
 
-            trace_events = len(run.state.execution_trace)
             self._append_event_with_connection(
                 connection,
                 run.run_id,
                 "checkpoint.saved",
                 {
                     "thread_id": persisted["thread_id"],
-                    "trace_events": trace_events,
+                    "trace_events": len(checkpoint_state.execution_trace),
+                    "run_trace_events": len(run.state.execution_trace),
+                    "projection": "execution_trace_reset",
                     "base_revision": observed_revision,
                     "revision": checkpoint_revision,
                 },

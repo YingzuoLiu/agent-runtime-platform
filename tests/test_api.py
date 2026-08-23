@@ -748,16 +748,26 @@ def test_async_run_api_and_event_history(tmp_path):
         # first observation of the terminal status.
         assert body["status"] == "completed"
         assert body["agent_version"] == "0.3.0"
+        assert body["state"]["execution_trace"]
         events = client.get(f"/runs/{run_id}/events").json()
         event_types = [event["event_type"] for event in events]
         assert event_types[0] == "run.queued"
         assert "checkpoint.saved" in event_types
         assert event_types[-2] == "checkpoint.saved"
         assert event_types[-1] == "run.completed"
+        checkpoint_event = next(
+            event for event in events if event["event_type"] == "checkpoint.saved"
+        )
+        assert checkpoint_event["payload"]["trace_events"] == 0
+        assert checkpoint_event["payload"]["run_trace_events"] == len(
+            body["state"]["execution_trace"]
+        )
+        assert checkpoint_event["payload"]["projection"] == "execution_trace_reset"
         state = client.get("/threads/api-run-thread/state")
         assert state.status_code == 200
         assert state.json()["destination"] == "Tokyo"
         assert state.json()["budget"] == body["state"]["budget"]
+        assert state.json()["execution_trace"] == []
 
 
 def test_async_run_can_opt_into_evidence_review_agent_version(tmp_path):

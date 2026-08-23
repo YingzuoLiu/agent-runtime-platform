@@ -11,7 +11,7 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_state_boundary_report_preserves_evidence_invariants(report: dict) -> None:
-    assert report["report_schema"] == "state-boundary-characterization-v1"
+    assert report["report_schema"] == "state-boundary-characterization-v2"
     assert report["deterministic_boundary"] == {
         "planner": "ScriptedTravelPlanner",
         "tools": "offline synthetic Travel handlers via direct eval adapter",
@@ -22,13 +22,14 @@ def test_state_boundary_report_preserves_evidence_invariants(report: dict) -> No
 
     growth = report["checkpoint_growth"]
     summary = growth["summary"]
-    assert summary["strictly_monotonic_total"] is True
-    assert summary["strictly_monotonic_execution_trace"] is True
-    assert summary["total_net_growth_bytes"] > 0
-    assert summary["execution_trace_net_growth_bytes"] / summary["total_net_growth_bytes"] > 0.95
+    assert summary["checkpoint_execution_trace_empty_all"] is True
+    assert summary["checkpoint_execution_trace_size_stable"] is True
+    assert summary["checkpoint_execution_trace_net_growth_bytes"] == 0
+    assert summary["run_result_execution_trace_nonempty_all"] is True
+    assert summary["checkpoint_event_counts_truthful"] is True
     assert all(
         item["total_checkpoint_bytes"]
-        == item["execution_trace_value_bytes"]
+        == item["checkpoint_execution_trace_value_bytes"]
         + item["tool_outputs_value_bytes"]
         + item["other_state_and_json_structure_bytes"]
         for item in growth["turns"]
@@ -93,20 +94,29 @@ def test_confirm_plan_reads_current_plan_evidence_from_checkpoint(report: dict) 
         "evidence_issues": [],
     }
     assert confirmation["confirmation_turn"]["validation_errors"] == []
+    assert confirmation["previous_turn"]["checkpoint_execution_trace_events"] == 0
+    assert confirmation["previous_turn"]["run_result_execution_trace_events"] > 0
+    assert confirmation["confirmation_turn"]["checkpoint_execution_trace_events"] == 0
+    assert confirmation["confirmation_turn"]["run_result_execution_trace_events"] > 0
 
 
 def test_checkpoint_growth_is_observational_not_threshold_gated(report: dict) -> None:
     growth = report["checkpoint_growth"]
     turns = growth["turns"]
-    assert growth["summary"]["strictly_monotonic_total"] is True
-    assert growth["summary"]["strictly_monotonic_execution_trace"] is True
+    assert growth["summary"]["checkpoint_execution_trace_empty_all"] is True
+    assert growth["summary"]["checkpoint_execution_trace_size_stable"] is True
+    assert growth["summary"]["run_result_execution_trace_nonempty_all"] is True
+    assert growth["summary"]["checkpoint_event_counts_truthful"] is True
     assert all(
         item["total_checkpoint_bytes"]
-        == item["execution_trace_value_bytes"]
+        == item["checkpoint_execution_trace_value_bytes"]
         + item["tool_outputs_value_bytes"]
         + item["other_state_and_json_structure_bytes"]
         for item in turns
     )
+    assert all(item["checkpoint_execution_trace_value_bytes"] == 2 for item in turns)
+    assert all(item["checkpoint_execution_trace_events"] == 0 for item in turns)
+    assert all(item["run_result_execution_trace_events"] > 0 for item in turns)
     assert len({item["tool_outputs_value_bytes"] for item in turns}) == 1
     assert "maximum_bytes" not in growth
 

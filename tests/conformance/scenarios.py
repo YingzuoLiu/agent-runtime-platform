@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from agent.contracts import RuntimeExecutionAuthority
+from agent.contracts import RuntimeExecutionAuthority, TraceEvent
 from domains.travel.state import AgentState
 from runtime_service.models import RunCommitOutcome, RunRecord, RunStatus
 from runtime_service.store import SQLiteRunStore
@@ -283,6 +283,14 @@ def create_action_quarantine(
             thread_id=thread_id,
             destination="Tokyo",
             budget=7_777,
+            execution_trace=[
+                TraceEvent(
+                    event="legacy.conflict_marker",
+                    reason="checkpoint preserved through quarantine repair",
+                    payload={"marker": "quarantine-checkpoint"},
+                    timestamp="2026-08-23T00:00:00+00:00",
+                )
+            ],
         ),
         expected_revision=1,
     )
