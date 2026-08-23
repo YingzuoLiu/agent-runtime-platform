@@ -16,6 +16,7 @@ from runtime_service import (
     ApiKeyCredential,
     RunRecord,
     RunStatus,
+    RuntimePermission,
     RuntimeRole,
     StaticApiKeyAuthenticator,
 )
@@ -294,7 +295,7 @@ def test_postgres_application_processes_restarts_and_administers_memory(
         execution_authority=RuntimeExecutionAuthority(
             tenant_id=TENANT_ID,
             subject_id=SUBJECT_ID,
-            permissions=(),
+            permissions=(RuntimePermission.TOOLS_EXECUTE.value,),
         ),
     )
     recovery_store.create_run_with_event(recoverable, event_type="run.queued")
