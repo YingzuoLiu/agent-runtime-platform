@@ -54,6 +54,7 @@ from runtime_service import (
     DynamicToolLoop,
     GovernedMemory,
     HttpExternalActionProvider,
+    MemoryAdminStore,
     MemoryKind,
     MemoryRecord,
     Planner,
@@ -75,8 +76,6 @@ from runtime_service import (
     RuntimeExtension,
     RuntimeExtensionContext,
     RuntimePermission,
-    SQLiteMemoryStore,
-    SQLiteRunStore,
     StaticApiKeyAuthenticator,
     TenantContext,
     ThreadStateConflictError,
@@ -94,7 +93,10 @@ from runtime_service.external_actions import (
     ExternalActionProviderRegistry,
 )
 from runtime_service.run_store import is_run_store_contention_error, is_run_store_error
-from runtime_service.workflow_store import SQLiteWorkflowStore, WorkflowStore
+from runtime_service.storage import (
+    build_runtime_store_bundle,
+    resolve_runtime_storage_config,
+)
 from runtime_service.action_gateway import (
     ACTION_AGENT_ID,
     ACTION_AGENT_VERSION,
@@ -177,6 +179,13 @@ class AgentMessagePendingResponse(BaseModel):
 def create_app(
     *,
     database_path: str | Path | None = None,
+    store_backend: str | None = None,
+    postgres_dsn: str | None = None,
+    postgres_schema: str | None = None,
+    postgres_connect_timeout_seconds: float | None = None,
+    postgres_statement_timeout_seconds: float | None = None,
+    postgres_lock_timeout_seconds: float | None = None,
+    postgres_lease_operation_timeout_seconds: float | None = None,
     worker_count: int | None = None,
     authenticator: Authenticator | None = None,
     authorizer: Authorizer | None = None,
@@ -189,10 +198,19 @@ def create_app(
     demo_api_key: str | None = None,
     runtime_extensions: Sequence[RuntimeExtension] = (),
 ) -> FastAPI:
-    database_value = database_path
-    if database_value is None:
-        database_value = os.getenv("RUNTIME_DB_PATH") or "runtime_data/runtime.db"
-    resolved_database_path = Path(database_value)
+    storage_config = resolve_runtime_storage_config(
+        backend=store_backend,
+        database_path=database_path,
+        postgres_dsn=postgres_dsn,
+        postgres_schema=postgres_schema,
+        postgres_connect_timeout_seconds=postgres_connect_timeout_seconds,
+        postgres_statement_timeout_seconds=postgres_statement_timeout_seconds,
+        postgres_lock_timeout_seconds=postgres_lock_timeout_seconds,
+        postgres_lease_operation_timeout_seconds=(
+            postgres_lease_operation_timeout_seconds
+        ),
+    )
+    resolved_database_path = storage_config.sqlite_path
     resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
     resolved_action_waiter_limit = (
         int(os.getenv("RUNTIME_ACTION_WAITER_LIMIT", "16"))
@@ -251,13 +269,11 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Application composition intentionally remains SQLite in this phase.
-        # PostgreSQL Run/Workflow/Memory portability is proven below the
-        # composition root; coherent selection and startup authority are later work.
-        store = SQLiteRunStore(resolved_database_path)
-        memory_store = SQLiteMemoryStore(resolved_database_path)
+        stores = build_runtime_store_bundle(storage_config)
+        store = stores.run_store
+        memory_store = stores.memory_store
         governed_memory = GovernedMemory(memory_store, store)
-        workflow_store: WorkflowStore = SQLiteWorkflowStore(resolved_database_path)
+        workflow_store = stores.workflow_store
         release_workflow = ReleaseValidationWorkflow(
             workflow_store,
             ToolSandbox(build_release_validation_tool_registry()),
@@ -296,6 +312,12 @@ def create_app(
                 ),
             )
         else:
+            if resolved_database_path is None:
+                raise ValueError(
+                    "PostgreSQL application composition requires an injected or "
+                    "HTTP travel external-action provider; the SQLite provider "
+                    "cannot be selected implicitly"
+                )
             resolved_action_provider = SQLiteTripHoldProvider(
                 resolved_database_path.with_name(
                     f"{resolved_database_path.name}.trip-hold-provider"
@@ -404,6 +426,7 @@ def create_app(
         manager.start()
         app.state.run_store = store
         app.state.memory_store = memory_store
+        app.state.storage_metadata = stores.metadata
         app.state.runtime_manager = manager
         app.state.agent_registry = registry
         # Preserve the published direct-sandbox catalog: external writes are
@@ -529,11 +552,14 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/ready")
-    def ready(request: Request) -> dict[str, str]:
+    def ready(request: Request) -> dict[str, object]:
         request.app.state.run_store.ping()
         request.app.state.memory_store.ping()
         request.app.state.workflow_store.ping()
-        return {"status": "ready"}
+        return {
+            "status": "ready",
+            "storage": request.app.state.storage_metadata.public_dict(),
+        }
 
     if demo_session is not None:
         assets_path = demo_assets_path()
@@ -1330,7 +1356,8 @@ def create_app(
         include_inactive: bool = Query(default=False),
     ) -> list[MemoryRecord]:
         require_permission(principal, RuntimePermission.MEMORY_READ)
-        return request.app.state.memory_store.list_memories(
+        memory_store: MemoryAdminStore = request.app.state.memory_store
+        return memory_store.list_memories(
             tenant_id=principal.tenant_id,
             subject_id=principal.subject_id,
             domain_id=domain_id,
@@ -1344,7 +1371,7 @@ def create_app(
         request: Request,
         principal: Principal = Depends(require_principal),
     ) -> MemoryRecord:
-        memory_store: SQLiteMemoryStore = request.app.state.memory_store
+        memory_store: MemoryAdminStore = request.app.state.memory_store
         if (
             memory_store.get_memory_for_subject(
                 memory_id,

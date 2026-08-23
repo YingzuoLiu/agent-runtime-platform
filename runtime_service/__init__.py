@@ -33,6 +33,7 @@ from .http_external_action import HttpExternalActionProvider
 from .manager import ReferencedRunNotFoundError, RuntimeManager
 from .memory import (
     GovernedMemory,
+    MemoryAdminStore,
     MemoryEvent,
     MemoryKind,
     MemoryMutationAction,
@@ -43,6 +44,7 @@ from .memory import (
     MemoryStore,
     MemoryWrite,
     RetrievedMemory,
+    RuntimeMemoryStore,
     SQLiteMemoryStore,
 )
 from .models import (
@@ -154,6 +156,7 @@ __all__ = [
     "GovernedMemory",
     "HttpExternalActionProvider",
     "MemoryEvent",
+    "MemoryAdminStore",
     "MemoryKind",
     "MemoryMutationAction",
     "MemoryMutationResult",
@@ -191,6 +194,7 @@ __all__ = [
     "RunStatus",
     "RunStore",
     "RetrievedMemory",
+    "RuntimeMemoryStore",
     "RuntimeManager",
     "RuntimeExtension",
     "RuntimeExtensionContext",

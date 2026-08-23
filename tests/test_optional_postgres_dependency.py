@@ -21,7 +21,9 @@ class BlockPsycopg(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockPsycopg())
 import runtime_service
+import api.main
 assert runtime_service.SQLiteRunStore.__name__ == "SQLiteRunStore"
+assert api.main.app.title == "Agent Runtime Reliability Platform"
 assert "psycopg" not in sys.modules
 '''
     completed = subprocess.run(

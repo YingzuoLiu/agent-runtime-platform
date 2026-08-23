@@ -1216,7 +1216,15 @@ def test_health_and_readiness_remain_public(tmp_path):
         ready = client.get("/ready")
 
     assert health.json() == {"status": "ok"}
-    assert ready.json() == {"status": "ready"}
+    assert ready.json() == {
+        "status": "ready",
+        "storage": {
+            "backend": "sqlite",
+            "schema": None,
+            "schema_versions": {},
+            "connection_policy": {"mode": "short-lived-per-operation"},
+        },
+    }
 
 
 @pytest.mark.parametrize(

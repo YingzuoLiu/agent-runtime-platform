@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator
 
 import psycopg
@@ -31,6 +32,23 @@ _MEMORY_TABLES = (
 
 class PostgresSchemaError(RuntimeError):
     """Raised when an execution-plane schema cannot be used safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresApplicationSchemaStatus:
+    """Value-free catalog view used by dry-run and startup validation."""
+
+    schema: str
+    schema_exists: bool
+    metadata_exists: bool
+    components: dict[str, int]
+
+    @property
+    def compatible(self) -> bool:
+        return (
+            self.components.get("execution-plane") == POSTGRES_SCHEMA_VERSION
+            and self.components.get("memory") == POSTGRES_MEMORY_SCHEMA_VERSION
+        )
 
 
 def validate_postgres_schema_name(schema: str) -> str:
@@ -112,7 +130,14 @@ def postgres_connection(
         connection.close()
 
 
-def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
+def initialize_postgres_schema(
+    dsn: str,
+    *,
+    schema: str,
+    connect_timeout_seconds: float = 30,
+    statement_timeout_seconds: float | None = None,
+    lock_timeout_seconds: float | None = None,
+) -> None:
     """Create or validate the explicit v1 PostgreSQL execution-plane schema.
 
     The first version intentionally uses one reviewable bootstrap instead of a
@@ -122,18 +147,44 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
     """
 
     validate_postgres_schema_name(schema)
+    timeout = max(1, int(connect_timeout_seconds + 0.999))
     try:
-        bootstrap = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+        bootstrap = psycopg.connect(
+            dsn,
+            autocommit=True,
+            row_factory=dict_row,
+            connect_timeout=timeout,
+        )
     except psycopg.Error as exc:
         raise PostgresSchemaError("PostgreSQL bootstrap connection failed") from exc
     try:
+        if statement_timeout_seconds is not None:
+            milliseconds = max(1, int(statement_timeout_seconds * 1000))
+            bootstrap.execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (f"{milliseconds}ms",),
+            )
+        if lock_timeout_seconds is not None:
+            milliseconds = max(1, int(lock_timeout_seconds * 1000))
+            bootstrap.execute(
+                "SELECT set_config('lock_timeout', %s, false)",
+                (f"{milliseconds}ms",),
+            )
         bootstrap.execute(
             sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
         )
+    except psycopg.Error as exc:
+        raise PostgresSchemaError("PostgreSQL schema bootstrap failed") from exc
     finally:
         bootstrap.close()
 
-    with postgres_connection(dsn, schema=schema) as connection:
+    with postgres_connection(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    ) as connection:
         try:
             with connection.transaction():
                 connection.execute(
@@ -369,7 +420,14 @@ def initialize_postgres_schema(dsn: str, *, schema: str) -> None:
             ) from exc
 
 
-def initialize_postgres_memory_schema(dsn: str, *, schema: str) -> None:
+def initialize_postgres_memory_schema(
+    dsn: str,
+    *,
+    schema: str,
+    connect_timeout_seconds: float = 30,
+    statement_timeout_seconds: float | None = None,
+    lock_timeout_seconds: float | None = None,
+) -> None:
     """Install or validate the versioned Memory component beside schema v1.
 
     Memory is an explicit component rather than a silent redefinition of the
@@ -379,8 +437,20 @@ def initialize_postgres_memory_schema(dsn: str, *, schema: str) -> None:
     """
 
     validate_postgres_schema_name(schema)
-    initialize_postgres_schema(dsn, schema=schema)
-    with postgres_connection(dsn, schema=schema) as connection:
+    initialize_postgres_schema(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+    with postgres_connection(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    ) as connection:
         try:
             with connection.transaction():
                 connection.execute(
@@ -521,6 +591,169 @@ def initialize_postgres_memory_schema(dsn: str, *, schema: str) -> None:
             raise PostgresSchemaError(
                 "PostgreSQL Memory schema initialization failed"
             ) from exc
+
+
+def inspect_postgres_application_schema(
+    dsn: str,
+    *,
+    schema: str,
+    connect_timeout_seconds: float = 30,
+) -> PostgresApplicationSchemaStatus:
+    """Inspect catalog metadata without creating or modifying schema objects."""
+
+    validate_postgres_schema_name(schema)
+    timeout = max(1, int(connect_timeout_seconds + 0.999))
+    try:
+        connection = psycopg.connect(
+            dsn,
+            autocommit=True,
+            row_factory=dict_row,
+            connect_timeout=timeout,
+        )
+    except psycopg.Error as exc:
+        raise PostgresSchemaError("PostgreSQL schema inspection connection failed") from exc
+    try:
+        schema_row = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = %s) "
+            "AS present",
+            (schema,),
+        ).fetchone()
+        schema_exists = bool(schema_row and schema_row["present"])
+        if not schema_exists:
+            return PostgresApplicationSchemaStatus(
+                schema=schema,
+                schema_exists=False,
+                metadata_exists=False,
+                components={},
+            )
+
+        metadata_row = connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = 'runtime_store_schema'
+            ) AS present
+            """,
+            (schema,),
+        ).fetchone()
+        metadata_exists = bool(metadata_row and metadata_row["present"])
+        if not metadata_exists:
+            return PostgresApplicationSchemaStatus(
+                schema=schema,
+                schema_exists=True,
+                metadata_exists=False,
+                components={},
+            )
+
+        rows = connection.execute(
+            sql.SQL("SELECT component, version FROM {}.runtime_store_schema").format(
+                sql.Identifier(schema)
+            )
+        ).fetchall()
+        return PostgresApplicationSchemaStatus(
+            schema=schema,
+            schema_exists=True,
+            metadata_exists=True,
+            components={str(row["component"]): int(row["version"]) for row in rows},
+        )
+    except psycopg.Error as exc:
+        raise PostgresSchemaError("PostgreSQL schema inspection failed") from exc
+    finally:
+        connection.close()
+
+
+def validate_postgres_application_schema(
+    dsn: str,
+    *,
+    schema: str,
+    connect_timeout_seconds: float = 30,
+    statement_timeout_seconds: float | None = None,
+    lock_timeout_seconds: float | None = None,
+) -> dict[str, int]:
+    """Validate the complete application schema without mutating it."""
+
+    status = inspect_postgres_application_schema(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+    )
+    if not status.schema_exists or not status.metadata_exists:
+        raise PostgresSchemaError(
+            "PostgreSQL application schema is not initialized; run the bootstrap command"
+        )
+
+    with postgres_connection(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    ) as connection:
+        try:
+            with connection.transaction():
+                connection.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                current = connection.execute(
+                    "SELECT current_schema() AS schema"
+                ).fetchone()
+                if current is None or current["schema"] != schema:
+                    raise PostgresSchemaError(
+                        "PostgreSQL application schema is not initialized; "
+                        "run the bootstrap command"
+                    )
+                rows = connection.execute(
+                    "SELECT component, version FROM runtime_store_schema"
+                ).fetchall()
+                components = {
+                    str(row["component"]): int(row["version"]) for row in rows
+                }
+                if components.get("execution-plane") != POSTGRES_SCHEMA_VERSION:
+                    raise PostgresSchemaError(
+                        "PostgreSQL execution-plane schema version is incompatible"
+                    )
+                if components.get("memory") != POSTGRES_MEMORY_SCHEMA_VERSION:
+                    raise PostgresSchemaError(
+                        "PostgreSQL Memory schema version is incompatible"
+                    )
+                _assert_v1_schema_shape(connection)
+                _assert_memory_v1_schema_shape(connection)
+        except PostgresSchemaError:
+            raise
+        except psycopg.Error as exc:
+            raise PostgresSchemaError(
+                "PostgreSQL application schema validation failed"
+            ) from exc
+    return {
+        "execution-plane": int(components["execution-plane"]),
+        "memory": int(components["memory"]),
+    }
+
+
+def bootstrap_postgres_application_schema(
+    dsn: str,
+    *,
+    schema: str,
+    connect_timeout_seconds: float = 30,
+    statement_timeout_seconds: float | None = None,
+    lock_timeout_seconds: float | None = None,
+) -> dict[str, int]:
+    """Apply the bounded v1 components and reread their authoritative shape."""
+
+    initialize_postgres_memory_schema(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+    return validate_postgres_application_schema(
+        dsn,
+        schema=schema,
+        connect_timeout_seconds=connect_timeout_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
 
 
 def _assert_v1_schema_shape(connection: Connection[dict[str, object]]) -> None:

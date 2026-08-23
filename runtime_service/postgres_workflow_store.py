@@ -57,16 +57,36 @@ class PostgresWorkflowStore:
         *,
         schema: str = "agent_runtime",
         lease_clock_ms: Callable[[], int] | None = None,
+        connect_timeout_seconds: float = 30,
+        statement_timeout_seconds: float | None = None,
+        lock_timeout_seconds: float | None = None,
         initialize: bool = True,
     ) -> None:
+        if connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be positive")
         self._dsn = dsn
         self.schema = validate_postgres_schema_name(schema)
         self._lease_clock_ms = lease_clock_ms
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._statement_timeout_seconds = statement_timeout_seconds
+        self._lock_timeout_seconds = lock_timeout_seconds
         if initialize:
-            initialize_postgres_schema(dsn, schema=self.schema)
+            initialize_postgres_schema(
+                dsn,
+                schema=self.schema,
+                connect_timeout_seconds=connect_timeout_seconds,
+                statement_timeout_seconds=statement_timeout_seconds,
+                lock_timeout_seconds=lock_timeout_seconds,
+            )
 
     def _connect(self):
-        return open_postgres_connection(self._dsn, schema=self.schema)
+        return open_postgres_connection(
+            self._dsn,
+            schema=self.schema,
+            connect_timeout_seconds=self._connect_timeout_seconds,
+            statement_timeout_seconds=self._statement_timeout_seconds,
+            lock_timeout_seconds=self._lock_timeout_seconds,
+        )
 
     def ping(self) -> None:
         connection = self._connect()

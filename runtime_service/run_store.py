@@ -100,6 +100,14 @@ class RunStore(Protocol):
     ) -> RunEvent:
         ...
 
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> RunEvent:
+        ...
+
     def append_control_plane_event(
         self,
         run_id: str,
