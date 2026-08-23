@@ -194,17 +194,18 @@ collection, usage, and internal pytest errors do not count as kills.
 | M04 | Remove tenant qualification from running-Thread uniqueness | `test_i4_thread_scope_allows_independent_claims` |
 | M05 | Remove the checkpoint revision CAS predicate | `test_postgres_checkpoint_write_rejects_stale_revision` |
 | M06 | Persist the full Run trace into the Thread checkpoint | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
-| M07 | Commit terminal Run status before the checkpoint/event transaction | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
+| M07 | Remove the completion transaction boundary | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
 | M08 | Move `run.completed` append outside the completion transaction | `test_i6_completion_checkpoint_and_required_events_commit_atomically` |
 | M09 | Retry an unsafe provider after an ambiguous dispatch | `test_i7_reconciliation_precedes_successor_and_never_retries_unsafe_effect` |
 | M10 | Ignore the re-derived quarantine plan identity | `test_i9_workflow_evidence_change_after_plan_makes_plan_stale` |
 | M11 | Accept same-revision checkpoint evidence drift | `test_i9_same_revision_checkpoint_evidence_drift_is_detected_after_commit` |
 | M12 | Reject legal later successor checkpoint progress | `test_i9_unchanged_eligible_plan_releases_quarantine_preserving_evidence` |
 
-M07 and M08 are now real source mutations. M07 creates an observable split by committing terminal Run
-status before the transaction that should contain Run/checkpoint/events together. M08 keeps the
-normal completion transaction but moves `run.completed` outside it. The existing three-way I6 fault
-injection then kills both mutants by observing partial durable state.
+M07 and M08 are real source mutations aimed directly at the completion atomicity boundary. M07
+replaces the completion transaction context with a no-op context while leaving the normal control
+flow and status guard intact, so the completion writes become independently committed on the
+autocommit connection. M08 keeps the normal completion transaction but moves `run.completed`
+outside it. The existing three-way I6 fault injection kills both by observing partial durable state.
 
 ## Application composition boundary
 
