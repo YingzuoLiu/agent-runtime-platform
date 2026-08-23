@@ -106,6 +106,10 @@ def __getattr__(name: str):
         from .postgres_store import PostgresRunStore
 
         return PostgresRunStore
+    if name == "PostgresMemoryStore":
+        from .postgres_memory_store import PostgresMemoryStore
+
+        return PostgresMemoryStore
     if name == "PostgresWorkflowStore":
         from .postgres_workflow_store import PostgresWorkflowStore
 
@@ -161,6 +165,7 @@ __all__ = [
     "Planner",
     "PlannerContext",
     "PlannerProviderError",
+    "PostgresMemoryStore",
     "PostgresRunStore",
     "PostgresWorkflowStore",
     "Principal",
