@@ -1,8 +1,9 @@
 # PostgreSQL Store Backend
 
-This repository includes a PostgreSQL execution-plane backend for the durable Run and Workflow
-storage semantics. It exists to prove that the storage contract is not accidentally tied to
-SQLite syntax or process-local locking.
+This repository includes PostgreSQL semantic backends for durable Run, Workflow, and governed
+Memory storage. They prove that the storage contracts are not accidentally tied to SQLite syntax
+or process-local locking. This document focuses on Run/Workflow; the Memory transaction and schema
+component are documented in [`postgresql-memory-store.md`](postgresql-memory-store.md).
 
 The implementation is intentionally narrower than a production database migration. The default
 application composition remains SQLite, and PostgreSQL is exercised through the store semantic
@@ -16,6 +17,8 @@ The PostgreSQL backend provides:
   quarantine resolution;
 - `PostgresWorkflowStore` for workflow executions, tool calls, external actions, and workflow
   events;
+- `PostgresMemoryStore` for versioned scoped records, mutation audit, sealed Run snapshots, and
+  same-transaction Run identity/lease fencing;
 - one execution-plane schema containing the Run, checkpoint, workflow, tool, action, and event
   tables required by the shared recovery and quarantine transactions;
 - a consumer-driven structural `RunStore` protocol so Runtime consumers do not depend on
@@ -225,15 +228,15 @@ A PostgreSQL Run/Workflow backend must **not** be combined at the application co
 transaction as memory mutation. Splitting those stores across PostgreSQL and SQLite would weaken
 that fencing property.
 
-A future full PostgreSQL application composition therefore requires a PostgreSQL memory backend, or
-another design that preserves the same atomic authority check, before switching the default
-service composition.
+`PostgresMemoryStore` now provides the same-authority implementation required for a coherent future
+composition. This phase still does not select or wire that composition: backend configuration,
+startup compatibility checks, migration authority, and invalid mixed-backend rejection remain a
+separate bounded change.
 
 ## Explicit non-goals
 
 This phase does not add:
 
-- a PostgreSQL Memory Store;
 - a runtime backend-selection environment variable;
 - connection pooling;
 - multi-replica Runtime deployment;
