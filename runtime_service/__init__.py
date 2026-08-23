@@ -78,6 +78,7 @@ from .quarantine import (
 )
 from .quarantine_resolution import QuarantineResolutionService
 from .registry import AgentRegistry, build_default_registry
+from .run_store import RunStore
 from .sandbox import (
     ToolEffect,
     ToolDescriptor,
@@ -91,6 +92,8 @@ from .sandbox import (
     ToolSpec,
 )
 from .store import RunLeaseLostError, SQLiteRunStore, ThreadStateConflictError
+from .postgres_store import PostgresRunStore
+from .postgres_workflow_store import PostgresWorkflowStore
 
 
 def build_default_tool_registry() -> ToolRegistry:
@@ -141,6 +144,8 @@ __all__ = [
     "Planner",
     "PlannerContext",
     "PlannerProviderError",
+    "PostgresRunStore",
+    "PostgresWorkflowStore",
     "Principal",
     "QuarantineResolutionCommand",
     "QuarantineResolutionEvidenceIncompleteError",
@@ -162,6 +167,7 @@ __all__ = [
     "RunLeaseRecoveryReason",
     "RunRecord",
     "RunStatus",
+    "RunStore",
     "RetrievedMemory",
     "RuntimeManager",
     "RuntimeExtension",
