@@ -731,7 +731,12 @@ def _scenario_s3(controller: ProofController) -> dict[str, Any]:
     time.sleep(0.1)
     poll_started = time.monotonic()
     poll_run = controller.submit_basic("s3-durable-poll-control")
-    poll_terminal = controller.wait_terminal(poll_run.run_id)
+    try:
+        poll_terminal = controller.wait_terminal(poll_run.run_id)
+    except P5ProofFailure:
+        raise P5ProofFailure(
+            "S3 durable polling did not discover a cross-process submission"
+        ) from None
     poll_elapsed_ms = int((time.monotonic() - poll_started) * 1000)
     _require(
         poll_terminal.status == RunStatus.COMPLETED and poll_elapsed_ms < 5_000,
@@ -977,10 +982,31 @@ def _crash_action(
         run.run_id,
         expected_attempt=1,
     )
-    terminal = controller.wait_terminal(run.run_id)
+
+    def observe_terminal() -> RunRecord | None:
+        provider_state = controller.provider.snapshot(run.run_id)
+        if (
+            isinstance(provider_state, dict)
+            and provider_state.get("waiting_for_release") is True
+            and isinstance(provider_state.get("attempt_count"), int)
+            and provider_state["attempt_count"] > expected_attempts
+        ):
+            # Baseline unsafe recovery never enters this branch. If policy is
+            # mutated to replay it, release the injected second ambiguity so
+            # the proof reaches its exact effect/ledger assertions instead of
+            # timing out inside the fault provider.
+            controller.provider.release(run.run_id)
+        return controller.bundle.run_store.get_run_internal(run.run_id)
+
+    terminal = _wait_until(
+        observe_terminal,
+        lambda candidate: candidate.status in TERMINAL_STATUSES,
+        description=f"terminal Run {run.run_id}",
+        workers=controller.workers,
+    )
     provider_state = _wait_until(
         lambda: controller.provider.snapshot(run.run_id),
-        lambda state: state.get("attempt_count") == expected_attempts,
+        lambda state: state.get("attempt_count", 0) >= expected_attempts,
         description=f"{destination} provider terminal evidence",
     )
     snapshot = snapshot_run(controller.dsn, controller.schema, run.run_id)
