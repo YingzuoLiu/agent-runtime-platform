@@ -335,7 +335,8 @@ def is_run_store_retryable_error(exc: BaseException) -> bool:
             return True
         state = _sqlstate(current)
         if state is not None and (
-            state.startswith("08") or state in {"40001", "40P01", "55P03", "57014"}
+            state.startswith("08")
+            or state in {"40001", "40P01", "55P03", "57014", "57P01"}
         ):
             return True
         if _is_psycopg_error(current) and current.__class__.__name__ in {

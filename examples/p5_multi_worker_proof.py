@@ -1116,7 +1116,8 @@ def _scenario_s7(controller: ProofController) -> dict[str, Any]:
     worker_a.release("db.connection.open")
     failed = worker_a.wait_hook("db.connection.failed")
     _require(
-        failed.get("error_type") in {"OperationalError", "InterfaceError"},
+        failed.get("error_type")
+        in {"AdminShutdown", "OperationalError", "InterfaceError"},
         "S7 connection failure was not classified as a driver connectivity error",
     )
     worker_a.release("db.connection.failed")

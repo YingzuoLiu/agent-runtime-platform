@@ -14,6 +14,12 @@ class _BusyOperationalError(sqlite3.OperationalError):
     sqlite_errorcode = sqlite3.SQLITE_BUSY
 
 
+class _SqlstateError(RuntimeError):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__("sanitized PostgreSQL failure")
+        self.sqlstate = sqlstate
+
+
 def _raise_bug_with_implicit_context(context_error: BaseException) -> BaseException:
     try:
         raise context_error
@@ -68,3 +74,15 @@ def test_explicit_sqlite_causes_remain_classified() -> None:
     assert is_run_store_retryable_error(retryable)
     assert is_run_store_integrity_error(integrity)
     assert is_run_store_contention_error(contention)
+
+
+def test_admin_shutdown_is_retryable_only_in_side_effect_free_store_polling() -> None:
+    terminated_connection = _SqlstateError("57P01")
+
+    assert is_run_store_error(terminated_connection)
+    assert is_run_store_retryable_error(terminated_connection)
+    assert not is_run_store_contention_error(terminated_connection)
+
+
+def test_other_operator_intervention_is_not_broadly_made_retryable() -> None:
+    assert not is_run_store_retryable_error(_SqlstateError("57P02"))
