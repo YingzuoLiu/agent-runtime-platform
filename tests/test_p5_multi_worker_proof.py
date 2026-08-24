@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import multiprocessing
 import json
+import os
+import signal
 import threading
 from pathlib import Path
 
@@ -23,6 +25,10 @@ from tests.conformance.p5_mutation_proof import p5_mutants
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _pause_hook_in_child(hooks: P5ProofHooks) -> None:
+    hooks.pause_process("paused", {"point": "paused", "attempt": 1})
 
 
 def _valid_report() -> dict:
@@ -143,6 +149,28 @@ def test_process_pause_hook_is_inert_until_explicitly_armed() -> None:
 
     assert hooks.pause_process("paused", {"point": "paused"}) is False
     assert hooks.hooks["paused"].reached.is_set() is False
+
+
+def test_process_pause_hook_flushes_metadata_before_sigstop() -> None:
+    context = multiprocessing.get_context("spawn")
+    hooks = P5ProofHooks.create(context, ("paused",))
+    hooks.arm("paused")
+    process = context.Process(target=_pause_hook_in_child, args=(hooks,))
+    process.start()
+
+    try:
+        hook = hooks.hooks["paused"]
+        assert hook.reached.wait(5)
+        assert hook.metadata.get(timeout=1) == {"point": "paused", "attempt": 1}
+    finally:
+        if process.is_alive() and process.pid is not None:
+            os.kill(process.pid, signal.SIGCONT)
+            process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+    assert process.exitcode == 0
 
 
 def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:

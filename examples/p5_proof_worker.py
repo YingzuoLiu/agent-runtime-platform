@@ -128,6 +128,11 @@ class ProcessHook:
         if not self.consume():
             return False
         self.metadata.put(payload)
+        # multiprocessing.Queue publishes through a feeder thread. Flush this
+        # one-shot channel before SIGSTOP so the controller never observes the
+        # reached event before its matching payload is readable.
+        self.metadata.close()
+        self.metadata.join_thread()
         self.reached.set()
         os.kill(os.getpid(), signal.SIGSTOP)
         return True
