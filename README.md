@@ -111,6 +111,9 @@ provider has durably committed an effect:
 python examples/action_recovery_proof.py
 ```
 
+The true-PostgreSQL P5 two-process concurrency/recovery gate is documented in
+[`docs/p5-multi-worker-recovery-proof.md`](docs/p5-multi-worker-recovery-proof.md).
+
 The proof runs two deployment-owned destinations. `safe-retry` replays the same server-derived key
 after restart and recovers the provider's stored receipt. `unsafe-no-retry` makes no second provider
 call and terminates as `outcome_unknown`. Before either recovery, the proof verifies that a restarted

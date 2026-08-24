@@ -1,0 +1,86 @@
+{
+  "code": {
+    "head": "<tested-commit-sha>",
+    "tree": "<tested-tree-sha>"
+  },
+  "database_postconditions": {
+    "idle_in_transaction_sessions": 0,
+    "isolated_schema_cleaned_after_report": true
+  },
+  "environment": {
+    "postgres_version": "16.x",
+    "schema_versions": {
+      "execution-plane": 1,
+      "memory": 1
+    },
+    "worker_processes": 2
+  },
+  "generated_at": "<UTC timestamp>",
+  "proof": "p5-multi-worker-recovery:1",
+  "result": "passed",
+  "scenarios": [
+    {
+      "assertion": "one Run was claimed by exactly one process",
+      "id": "S1",
+      "invariants": {
+        "only_owner_executed": true,
+        "single_live_owner": true
+      },
+      "result": "passed"
+    },
+    {
+      "assertion": "same tenant/thread had at most one active Run",
+      "id": "S2",
+      "result": "passed"
+    },
+    {
+      "assertion": "different Threads overlapped and durable polling remained authoritative",
+      "id": "S3",
+      "result": "passed"
+    },
+    {
+      "assertion": "SIGKILL before commit produced one expiry takeover and one checkpoint",
+      "id": "S4",
+      "result": "passed"
+    },
+    {
+      "assertion": "resumed stale writer was fenced at every durable mutation",
+      "id": "S5",
+      "result": "passed"
+    },
+    {
+      "assertion": "provider ambiguity obeyed idempotent/unsafe policy with controls",
+      "id": "S6",
+      "result": "passed"
+    },
+    {
+      "assertion": "terminated connection retried safely; restart respected live lease",
+      "id": "S7",
+      "result": "passed"
+    },
+    {
+      "assertion": "repeated fixed release schedules reproduced the same winners",
+      "id": "S8",
+      "result": "passed",
+      "run_count": 4
+    }
+  ],
+  "schedule_coverage": {
+    "release_classes": [
+      "a-first",
+      "b-first"
+    ],
+    "run_count": 4
+  },
+  "summary": {
+    "failed": 0,
+    "passed": 8
+  },
+  "topology": {
+    "provider_independent_process": true,
+    "worker_ids": [
+      "p5-worker-a",
+      "p5-worker-b"
+    ]
+  }
+}
