@@ -14,7 +14,11 @@ from examples.p5_multi_worker_proof import (
     validate_report,
 )
 from examples.p5_postgres_probe import P5RunSnapshot
-from examples.p5_proof_worker import P5ProofHooks, P5WorkerConfig
+from examples.p5_proof_worker import (
+    P5ProofHooks,
+    P5WorkerConfig,
+    _TerminatedConnection,
+)
 from tests.conformance.p5_mutation_proof import p5_mutants
 
 
@@ -139,3 +143,47 @@ def test_process_pause_hook_is_inert_until_explicitly_armed() -> None:
 
     assert hooks.pause_process("paused", {"point": "paused"}) is False
     assert hooks.hooks["paused"].reached.is_set() is False
+
+
+def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:
+    class AdminShutdown(RuntimeError):
+        pass
+
+    class BrokenConnection:
+        def execute(self, _query, _params=None):
+            raise AdminShutdown("sanitized connection termination")
+
+    context = multiprocessing.get_context("spawn")
+    hooks = P5ProofHooks.create(
+        context,
+        ("db.connection.open", "db.connection.failed"),
+    )
+    open_hook = hooks.hooks["db.connection.open"]
+    failure_hook = hooks.hooks["db.connection.failed"]
+    open_hook.release.set()
+    failure_hook.enabled.set()
+    proxy = _TerminatedConnection(
+        BrokenConnection(),
+        open_hook,
+        failure_hook,
+        worker_id="p5-worker-a",
+        backend_pid=123,
+    )
+    observed = threading.Event()
+
+    def execute() -> None:
+        with pytest.raises(AdminShutdown):
+            proxy.execute("SELECT 1")
+        observed.set()
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    assert failure_hook.reached.wait(2)
+    assert failure_hook.metadata.get(timeout=1) == {
+        "point": "db.connection.failed",
+        "worker": "p5-worker-a",
+        "error_type": "AdminShutdown",
+    }
+    failure_hook.release.set()
+    thread.join(timeout=2)
+    assert observed.is_set()

@@ -172,12 +172,14 @@ class _TerminatedConnection:
         self,
         connection: Any,
         hook: ProcessHook,
+        failure_hook: ProcessHook | None,
         *,
         worker_id: str,
         backend_pid: int,
     ) -> None:
         self._connection = connection
         self._hook = hook
+        self._failure_hook = failure_hook
         self._worker_id = worker_id
         self._backend_pid = backend_pid
         self._first_execute = True
@@ -192,9 +194,20 @@ class _TerminatedConnection:
                     "backend_pid": self._backend_pid,
                 }
             )
-        if params is None:
-            return self._connection.execute(query)
-        return self._connection.execute(query, params)
+        try:
+            if params is None:
+                return self._connection.execute(query)
+            return self._connection.execute(query, params)
+        except Exception as exc:
+            if self._failure_hook is not None:
+                self._failure_hook.hit(
+                    {
+                        "point": "db.connection.failed",
+                        "worker": self._worker_id,
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            raise
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)
@@ -230,6 +243,7 @@ class P5ProofRunStore:
             return _TerminatedConnection(
                 connection,
                 hook,
+                self.hooks.hooks.get("db.connection.failed"),
                 worker_id=self.worker_id,
                 backend_pid=int(row["pid"]),
             )
