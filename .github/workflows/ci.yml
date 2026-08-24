@@ -256,7 +256,13 @@ jobs:
         run: python tests/conformance/p5_mutation_proof.py
       - name: Prove P5 mutation runner restored every source file
         if: always()
-        run: git diff --exit-code
+        run: |
+          git diff --exit-code
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "P5 mutation runner left the working tree dirty:"
+            git status --porcelain
+            exit 1
+          fi
       - name: Clean mutation-owned schemas after interrupted runs
         if: always()
         env:
