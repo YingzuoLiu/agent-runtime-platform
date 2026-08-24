@@ -131,3 +131,14 @@ def test_process_hook_is_one_shot_and_carries_only_controller_payload() -> None:
     hook.release.set()
     thread.join(timeout=2)
     assert completed.is_set()
+
+
+def test_released_hook_stays_released_while_worker_is_process_paused() -> None:
+    context = multiprocessing.get_context("spawn")
+    hooks = P5ProofHooks.create(context, ("paused",))
+    hooks.arm("paused")
+    hook = hooks.hooks["paused"]
+
+    hook.release.set()
+
+    assert hook.release.is_set()

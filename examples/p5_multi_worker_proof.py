@@ -819,6 +819,7 @@ def _scenario_s5(controller: ProofController) -> dict[str, Any]:
         hold_at="run.execution_entered",
     )
     worker_a.suspend()
+    worker_a.release("run.execution_entered")
     worker_b.arm("replacement.authoritative_progress")
     expired = expire_live_lease(
         controller.dsn,
