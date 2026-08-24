@@ -106,6 +106,8 @@ def test_idempotent_provider_persists_one_effect_and_replays_receipt_after_resta
     assert proof.status_code == 200
     assert proof.json()["attempt_count"] == 2
     assert proof.json()["effect_count"] == 1
+    assert proof.json()["request_identity_count"] == 1
+    assert proof.json()["idempotency_identity_count"] == 1
     assert proof.json()["waiting_for_release"] is False
     assert [event["event_type"] for event in proof.json()["events"]] == [
         "attempt.received",
@@ -168,6 +170,8 @@ def test_unsafe_provider_does_not_deduplicate_a_repeated_transport_request(tmp_p
     assert proof["scenario"] == "unsafe"
     assert proof["attempt_count"] == 2
     assert proof["effect_count"] == 2
+    assert proof["request_identity_count"] == 1
+    assert proof["idempotency_identity_count"] == 1
     assert "receipt.replayed" not in {event["event_type"] for event in proof["events"]}
 
 
@@ -186,3 +190,52 @@ def test_provider_rejects_header_mismatch_before_writing_ledger(tmp_path):
 
     assert response.status_code == 400
     assert proof.status_code == 404
+
+
+def test_known_success_and_failure_are_provider_controls(tmp_path):
+    app = create_demo_provider_app(tmp_path / "provider.db")
+    success = provider_request(run_id="run-known-success", key="success-key")
+    failure = provider_request(run_id="run-known-failure", key="failure-key")
+
+    with TestClient(app) as client:
+        success_response = client.post(
+            "/actions/known-success",
+            json=success.model_dump(mode="json"),
+            headers={"Idempotency-Key": success.idempotency_key},
+        )
+        failure_response = client.post(
+            "/actions/known-failure",
+            json=failure.model_dump(mode="json"),
+            headers={"Idempotency-Key": failure.idempotency_key},
+        )
+        success_proof = client.get("/proof/actions/run-known-success").json()
+        failure_proof = client.get("/proof/actions/run-known-failure").json()
+
+    assert success_response.status_code == 200
+    assert success_proof["scenario"] == "known_success"
+    assert success_proof["attempt_count"] == 1
+    assert success_proof["effect_count"] == 1
+    assert success_proof["request_identity_count"] == 1
+    assert success_proof["idempotency_identity_count"] == 1
+    assert success_proof["waiting_for_release"] is False
+    assert [event["event_type"] for event in success_proof["events"]] == [
+        "attempt.received",
+        "effect.committed",
+        "response.success",
+    ]
+
+    assert failure_response.status_code == 422
+    assert failure_response.json() == {
+        "error": {"code": "injected_definitive_failure"}
+    }
+    assert failure_proof["scenario"] == "known_failure"
+    assert failure_proof["attempt_count"] == 1
+    assert failure_proof["effect_count"] == 0
+    assert failure_proof["request_identity_count"] == 1
+    assert failure_proof["idempotency_identity_count"] == 1
+    assert failure_proof["provider_reference"] is None
+    assert failure_proof["waiting_for_release"] is False
+    assert [event["event_type"] for event in failure_proof["events"]] == [
+        "attempt.received",
+        "failure.definitive",
+    ]

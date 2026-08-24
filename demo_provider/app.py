@@ -19,8 +19,10 @@ from pydantic import BaseModel, ConfigDict
 from runtime_service.external_actions import ExternalActionProviderResult, ExternalActionRequest
 
 
-Scenario = Literal["idempotent", "unsafe"]
-_SCENARIOS: frozenset[str] = frozenset({"idempotent", "unsafe"})
+Scenario = Literal["idempotent", "unsafe", "known_success", "known_failure"]
+_SCENARIOS: frozenset[str] = frozenset(
+    {"idempotent", "unsafe", "known_success", "known_failure"}
+)
 
 
 class ProviderProofEvent(BaseModel):
@@ -39,6 +41,8 @@ class ProviderProofState(BaseModel):
     scenario: Scenario
     attempt_count: int
     effect_count: int
+    request_identity_count: int
+    idempotency_identity_count: int
     provider_reference: str | None
     waiting_for_release: bool
     events: list[ProviderProofEvent]
@@ -50,6 +54,7 @@ class DispatchDecision:
     provider_reference: str | None = None
     wait_for_release: bool = False
     key_conflict: bool = False
+    definitive_failure: bool = False
 
 
 class ProviderProofLedger:
@@ -100,6 +105,13 @@ class ProviderProofLedger:
                 CREATE UNIQUE INDEX IF NOT EXISTS provider_idempotent_effect
                     ON provider_effects (scenario, key_digest)
                     WHERE scenario = 'idempotent';
+
+                CREATE TABLE IF NOT EXISTS provider_attempts (
+                    attempt_sequence INTEGER PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    key_digest TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS held_attempts (
                     run_id TEXT NOT NULL,
@@ -163,6 +175,14 @@ class ProviderProofLedger:
                 scenario=scenario,
                 event_type="attempt.received",
             )
+            connection.execute(
+                """
+                INSERT INTO provider_attempts (
+                    attempt_sequence, run_id, request_digest, key_digest
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (attempt_sequence, run_id, request_digest, key_digest),
+            )
             if scenario == "idempotent":
                 existing = connection.execute(
                     """
@@ -197,6 +217,19 @@ class ProviderProofLedger:
                         provider_reference=str(existing["provider_reference"]),
                     )
 
+            if scenario == "known_failure":
+                self._record_event(
+                    connection,
+                    run_id=run_id,
+                    scenario=scenario,
+                    event_type="failure.definitive",
+                )
+                connection.commit()
+                return DispatchDecision(
+                    attempt_sequence=attempt_sequence,
+                    definitive_failure=True,
+                )
+
             provider_reference = f"delivery_{secrets.token_hex(8)}"
             connection.execute(
                 """
@@ -222,6 +255,18 @@ class ProviderProofLedger:
                 scenario=scenario,
                 event_type="effect.committed",
             )
+            if scenario == "known_success":
+                self._record_event(
+                    connection,
+                    run_id=run_id,
+                    scenario=scenario,
+                    event_type="response.success",
+                )
+                connection.commit()
+                return DispatchDecision(
+                    attempt_sequence=attempt_sequence,
+                    provider_reference=provider_reference,
+                )
             connection.execute(
                 """
                 INSERT INTO held_attempts (run_id, attempt_sequence, release_requested)
@@ -351,6 +396,16 @@ class ProviderProofLedger:
                 """,
                 (run_id,),
             ).fetchone()
+            identities = connection.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT request_digest) AS request_count,
+                    COUNT(DISTINCT key_digest) AS key_count
+                FROM provider_attempts
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
             effects = connection.execute(
                 """
                 SELECT COUNT(*) AS count, MIN(provider_reference) AS provider_reference
@@ -378,13 +433,17 @@ class ProviderProofLedger:
                 (run_id,),
             ).fetchall()
 
-        if attempts is None or effects is None:  # pragma: no cover - aggregate rows always exist
+        if (
+            attempts is None or effects is None or identities is None
+        ):  # pragma: no cover - aggregate rows always exist
             raise RuntimeError("provider proof aggregates are missing")
         return ProviderProofState(
             action_id=run_id,
             scenario=cast(Scenario, scenario),
             attempt_count=int(attempts["count"]),
             effect_count=int(effects["count"]),
+            request_identity_count=int(identities["request_count"]),
+            idempotency_identity_count=int(identities["key_count"]),
             provider_reference=(
                 str(effects["provider_reference"])
                 if effects["provider_reference"] is not None
@@ -446,6 +505,11 @@ def create_demo_provider_app(database_path: str | Path | None = None) -> FastAPI
                 status_code=409,
                 content={"error": {"code": "provider_idempotency_conflict"}},
             )
+        if decision.definitive_failure:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "injected_definitive_failure"}},
+            )
         if decision.wait_for_release:
             ledger.wait_for_release(
                 run_id=provider_request.run_id,
@@ -485,6 +549,32 @@ def create_demo_provider_app(database_path: str | Path | None = None) -> FastAPI
     ) -> JSONResponse:
         return dispatch(
             scenario="unsafe",
+            provider_request=provider_request,
+            header_key=idempotency_key,
+            request=request,
+        )
+
+    @provider_app.post("/actions/known-success")
+    def known_success_action(
+        provider_request: ExternalActionRequest,
+        request: Request,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> JSONResponse:
+        return dispatch(
+            scenario="known_success",
+            provider_request=provider_request,
+            header_key=idempotency_key,
+            request=request,
+        )
+
+    @provider_app.post("/actions/known-failure")
+    def known_failure_action(
+        provider_request: ExternalActionRequest,
+        request: Request,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> JSONResponse:
+        return dispatch(
+            scenario="known_failure",
             provider_request=provider_request,
             header_key=idempotency_key,
             request=request,
