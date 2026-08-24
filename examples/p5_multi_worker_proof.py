@@ -97,6 +97,7 @@ HOOK_NAMES = (
     "checkpoint.commit_pending",
     "run.commit_result",
     "stale.mutations",
+    "stale.process_paused",
     "replacement.authoritative_progress",
     "db.connection.open",
     "db.connection.failed",
@@ -816,10 +817,8 @@ def _scenario_s5(controller: ProofController) -> dict[str, Any]:
             "s5-stale-writer",
             scenario="stale_mutations",
         ),
-        hold_at="run.execution_entered",
+        hold_at="stale.process_paused",
     )
-    worker_a.suspend()
-    worker_a.release("run.execution_entered")
     worker_b.arm("replacement.authoritative_progress")
     expired = expire_live_lease(
         controller.dsn,

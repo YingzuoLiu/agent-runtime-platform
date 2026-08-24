@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -121,6 +122,16 @@ class ProcessHook:
         self.block_consumed(payload)
         return True
 
+    def pause_process(self, payload: dict[str, Any]) -> bool:
+        """Stop this proof process after publishing one bounded observation."""
+
+        if not self.consume():
+            return False
+        self.metadata.put(payload)
+        self.reached.set()
+        os.kill(os.getpid(), signal.SIGSTOP)
+        return True
+
 
 @dataclass
 class P5ProofHooks:
@@ -137,6 +148,10 @@ class P5ProofHooks:
     def hit(self, name: str, payload: dict[str, Any]) -> bool:
         hook = self.hooks.get(name)
         return hook.hit(payload) if hook is not None else False
+
+    def pause_process(self, name: str, payload: dict[str, Any]) -> bool:
+        hook = self.hooks.get(name)
+        return hook.pause_process(payload) if hook is not None else False
 
 
 @dataclass(frozen=True)
@@ -348,6 +363,16 @@ class P5ProofRuntime:
                 self._resolve_stale_mutation_fixture(context)
             else:
                 self._prepare_stale_mutation_fixture(context)
+                self.hooks.pause_process(
+                    "stale.process_paused",
+                    {
+                        "point": "stale.process_paused",
+                        "worker": self.worker_id,
+                        "run_id": context.run_id,
+                        "thread_id": context.thread_id,
+                        "attempt": run.attempt,
+                    },
+                )
 
         self.hooks.hit(
             "run.execution_entered",
