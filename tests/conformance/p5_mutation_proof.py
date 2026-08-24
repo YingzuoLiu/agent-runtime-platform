@@ -13,6 +13,7 @@ POSTGRES_STORE = ROOT / "runtime_service" / "postgres_store.py"
 POSTGRES_SCHEMA = ROOT / "runtime_service" / "postgres_schema.py"
 POSTGRES_MEMORY_STORE = ROOT / "runtime_service" / "postgres_memory_store.py"
 RUNTIME_MANAGER = ROOT / "runtime_service" / "manager.py"
+RUN_STORE = ROOT / "runtime_service" / "run_store.py"
 P5_WORKER = ROOT / "examples" / "p5_proof_worker.py"
 P5_CONTROLLER = ROOT / "examples" / "p5_multi_worker_proof.py"
 
@@ -250,6 +251,22 @@ def p5_mutants() -> tuple[Mutant, ...]:
                 ),
             ),
         ),
+        Mutant(
+            9,
+            "drop the terminated-connection SQLSTATE from the store retry allowlist",
+            "S7",
+            (
+                "p5-worker-a failed with AdminShutdown",
+                "p5-worker-a did not reach run.claimed",
+            ),
+            (
+                Replacement(
+                    RUN_STORE,
+                    '"57014", "57P01"',
+                    '"57014"',
+                ),
+            ),
+        ),
     )
 
 
@@ -274,7 +291,8 @@ def main() -> int:
     if failures:
         print("P5 MUTATION PROOF: FAILED")
         return 1
-    print("P5 MUTATION PROOF: 8/8 KILLED")
+    killed = len(mutants)
+    print(f"P5 MUTATION PROOF: {killed}/{killed} KILLED")
     return 0
 
 

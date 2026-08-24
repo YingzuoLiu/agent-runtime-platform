@@ -64,7 +64,7 @@ def test_committed_report_fixture_matches_the_versioned_contract() -> None:
 def test_every_p5_mutant_has_one_exact_source_target() -> None:
     mutants = p5_mutants()
 
-    assert [mutant.number for mutant in mutants] == list(range(1, 9))
+    assert [mutant.number for mutant in mutants] == list(range(1, 10))
     for mutant in mutants:
         for replacement in mutant.replacements:
             source = replacement.path.read_text(encoding="utf-8")
@@ -175,7 +175,7 @@ def test_process_pause_hook_flushes_metadata_before_sigstop() -> None:
 
 def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:
     class AdminShutdown(RuntimeError):
-        pass
+        sqlstate = "57P01"
 
     class BrokenConnection:
         def execute(self, _query, _params=None):
@@ -211,6 +211,7 @@ def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:
         "point": "db.connection.failed",
         "worker": "p5-worker-a",
         "error_type": "AdminShutdown",
+        "sqlstate": "57P01",
     }
     failure_hook.release.set()
     thread.join(timeout=2)

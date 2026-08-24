@@ -1141,10 +1141,12 @@ def _scenario_s7(controller: ProofController) -> dict[str, Any]:
     _require(terminate_backend(controller.dsn, backend_pid), "S7 backend was not terminated")
     worker_a.release("db.connection.open")
     failed = worker_a.wait_hook("db.connection.failed")
+    # Assert the SQLSTATE rather than the driver class name. A class-name set
+    # wide enough to tolerate Psycopg naming changes would also pass while the
+    # 57P01 allowlist entry went unexercised, silently losing this coverage.
     _require(
-        failed.get("error_type")
-        in {"AdminShutdown", "OperationalError", "InterfaceError"},
-        "S7 connection failure was not classified as a driver connectivity error",
+        failed.get("sqlstate") == "57P01",
+        "S7 did not observe the 57P01 AdminShutdown that the retry allowlist admits",
     )
     worker_a.release("db.connection.failed")
     claimed = worker_a.wait_hook("run.claimed")
@@ -1190,6 +1192,7 @@ def _scenario_s7(controller: ProofController) -> dict[str, Any]:
             "expiry_takeover_once": True,
         },
         "failure_type": failed.get("error_type"),
+        "failure_sqlstate": failed.get("sqlstate"),
         "live_after_restart": live_after_restart.public_dict(),
         "terminal": _terminal_summary(terminal),
         "claims": _claim_counts(final),

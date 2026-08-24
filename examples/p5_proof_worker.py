@@ -205,11 +205,17 @@ class _TerminatedConnection:
             return self._connection.execute(query, params)
         except Exception as exc:
             if self._failure_hook is not None:
+                # The SQLSTATE, not the driver class name, is what the store's
+                # retry allowlist keys on. Publish it so the proof can assert
+                # the exact state it admits instead of a family of class names.
+                # The message body is never published.
+                sqlstate = getattr(exc, "sqlstate", None)
                 self._failure_hook.hit(
                     {
                         "point": "db.connection.failed",
                         "worker": self._worker_id,
                         "error_type": type(exc).__name__,
+                        "sqlstate": sqlstate if isinstance(sqlstate, str) else None,
                     }
                 )
             raise
