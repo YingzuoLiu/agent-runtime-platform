@@ -323,11 +323,27 @@ def is_run_store_contention_error(exc: BaseException) -> bool:
 
 
 def is_run_store_retryable_error(exc: BaseException) -> bool:
-    """Recognize bounded, side-effect-free store-loop failures only.
+    """Recognize bounded store-loop failures only.
 
     RuntimeManager uses this solely around queue/cancellation polling before
     Runtime or provider code is invoked. It is intentionally not a generic
-    transaction/provider retry policy.
+    transaction/provider retry policy. The claim statement itself does write,
+    but a claim that commits without returning its result only strands a lease
+    that expires on the server's own deadline; no provider effect is replayed.
+
+    Classification is SQLSTATE-first. ``57P01`` (``AdminShutdown``, observed
+    after ``pg_terminate_backend``) is listed because the server abandons the
+    terminated session's open transaction, so a retry faces either no claim at
+    all or the stranded lease described above -- both already tolerated here.
+    The neighboring ``57P02`` (``CrashShutdown``) is deliberately absent.
+
+    The driver-class fallback below applies only when no SQLSTATE is present.
+    Psycopg raises a bare ``OperationalError``/``InterfaceError`` for
+    client-side connectivity failures, which carry no SQLSTATE and are safe to
+    retry here. When the server did report a SQLSTATE, that code is the
+    authority: allowing a name match to override it would silently readmit
+    every operator-intervention and resource-limit state the allowlist above
+    excludes, making the narrow ``57P01`` decision unenforceable.
     """
 
     for current in _exception_chain(exc):
@@ -339,9 +355,11 @@ def is_run_store_retryable_error(exc: BaseException) -> bool:
             or state in {"40001", "40P01", "55P03", "57014", "57P01"}
         ):
             return True
-        if _is_psycopg_error(current) and current.__class__.__name__ in {
-            "OperationalError",
-            "InterfaceError",
-        }:
+        driver_class = current.__class__.__name__
+        if (
+            state is None
+            and _is_psycopg_error(current)
+            and driver_class in {"OperationalError", "InterfaceError"}
+        ):
             return True
     return False
