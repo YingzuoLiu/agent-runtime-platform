@@ -10,11 +10,14 @@ a fourth, independent process with its own SQLite effect ledger.
 Each reusable barrier has monotonic armed, consumed, reached, released, and completed
 generation counters. Events are wake-up hints only: a stale event cannot satisfy a
 different generation, and the controller cannot re-arm until the prior generation's
-consumer has acknowledged completion. Timeout diagnostics request locals-free worker
-thread stacks so a failed barrier identifies the exact blocking boundary without
-publishing credentials or payloads. The post-run PostgreSQL session check runs only
-after both polling workers have stopped; an in-flight polling transaction is not
-misclassified as a leaked session.
+consumer has acknowledged completion. Starting a new schedule first releases every
+prior named barrier, so a worker parked on one hook cannot prevent it from reaching a
+different hook in the next schedule. Timeout diagnostics request locals-free worker
+thread stacks and integer-only generation state so a failed barrier identifies the
+exact blocking boundary without publishing credentials or payloads. Failure cleanup
+resumes a stopped proof worker and has a bounded SIGKILL backstop. The post-run
+PostgreSQL session check runs only after both polling workers have stopped; an
+in-flight polling transaction is not misclassified as a leaked session.
 
 The proof adds no production scheduler, distributed queue, connection pool, or
 production control endpoint. `RuntimeManager._wake` remains a process-local latency

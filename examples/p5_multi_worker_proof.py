@@ -334,8 +334,19 @@ class WorkerProcess:
             self.shutdown_event.set()
         self.process.join(timeout=5)
         if self.process.is_alive():
+            # SIGTERM remains pending for a SIGSTOPed proof process. Resume it
+            # before bounded termination, then retain SIGKILL as the final
+            # proof-owned cleanup backstop.
+            try:
+                self.resume()
+            except ProcessLookupError:
+                pass
             self.process.terminate()
             self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=5)
+        _require(not self.process.is_alive(), f"{self.worker_id} did not stop")
 
     def raise_if_failed(self) -> None:
         if self.failures is not None:

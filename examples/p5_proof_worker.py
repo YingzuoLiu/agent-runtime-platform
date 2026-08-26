@@ -245,6 +245,11 @@ class P5ProofHooks:
         return cls({name: ProcessHook.create(context) for name in names})
 
     def arm(self, *names: str) -> None:
+        # Arming starts a new deterministic schedule. Drain any barrier left by
+        # the previous schedule first so a worker cannot remain parked on a
+        # different hook while the controller waits for the newly armed one.
+        for hook in self.hooks.values():
+            hook.release_current()
         for name in names:
             self.hooks[name].arm()
 

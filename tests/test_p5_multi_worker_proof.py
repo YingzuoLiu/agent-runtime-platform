@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _pause_hook_in_child(hooks: P5ProofHooks) -> None:
     hooks.pause_process("paused", {"point": "paused", "attempt": 1})
+
+
+def _repeat_hook_in_child(hook: ProcessHook, count: int) -> None:
+    for expected in range(1, count + 1):
+        deadline = time.monotonic() + 5
+        while not hook.hit({"generation": expected}):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"generation {expected} was never armed")
+            time.sleep(0.001)
+
+
+def _hit_hook_sequence_in_child(hooks: P5ProofHooks, names: tuple[str, ...]) -> None:
+    for name in names:
+        deadline = time.monotonic() + 5
+        while not hooks.hit(name, {"point": name}):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"hook {name} was never armed")
+            time.sleep(0.001)
 
 
 def _valid_report() -> dict:
@@ -250,6 +269,67 @@ def test_process_hook_stale_release_signal_cannot_release_new_generation() -> No
     hook.release_current()
     second.join(timeout=2)
     assert not second.is_alive()
+
+
+def test_process_hook_rearms_across_spawned_process_generations() -> None:
+    context = multiprocessing.get_context("spawn")
+    hook = ProcessHook.create(context)
+    count = 200
+    process = context.Process(target=_repeat_hook_in_child, args=(hook, count))
+    process.start()
+
+    try:
+        for expected in range(1, count + 1):
+            generation = hook.arm()
+            assert hook.reached.wait(5)
+            assert hook.reached_generation() == generation
+            assert hook.metadata.get(timeout=1) == (
+                generation,
+                {"generation": expected},
+            )
+            hook.release_current()
+        process.join(timeout=5)
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+    assert process.exitcode == 0
+
+
+def test_arming_new_schedule_drains_worker_blocked_on_different_hook() -> None:
+    context = multiprocessing.get_context("spawn")
+    hooks = P5ProofHooks.create(context, ("previous", "next"))
+    hooks.arm("previous")
+    process = context.Process(
+        target=_hit_hook_sequence_in_child,
+        args=(hooks, ("previous", "next")),
+    )
+    process.start()
+
+    try:
+        previous = hooks.hooks["previous"]
+        assert previous.reached.wait(5)
+        previous_generation, previous_payload = previous.metadata.get(timeout=1)
+        assert previous_generation == previous.current_generation()
+        assert previous_payload == {"point": "previous"}
+
+        hooks.arm("next")
+        following = hooks.hooks["next"]
+        assert following.reached.wait(5)
+        following_generation, following_payload = following.metadata.get(timeout=1)
+        assert following_generation == following.current_generation()
+        assert following_payload == {"point": "next"}
+        following.release_current()
+        process.join(timeout=5)
+    finally:
+        for hook in hooks.hooks.values():
+            hook.release_current()
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+    assert process.exitcode == 0
 
 
 def test_run_proof_measures_session_hygiene_after_worker_polling_stops(
