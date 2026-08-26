@@ -239,10 +239,14 @@ class ProcessHook:
 @dataclass
 class P5ProofHooks:
     hooks: dict[str, ProcessHook]
+    claim_cycle: Any = field(default_factory=threading.Lock)
 
     @classmethod
     def create(cls, context: Any, names: tuple[str, ...]) -> P5ProofHooks:
-        return cls({name: ProcessHook.create(context) for name in names})
+        return cls(
+            {name: ProcessHook.create(context) for name in names},
+            claim_cycle=context.Lock(),
+        )
 
     def arm(self, *names: str) -> None:
         # Arming starts a new deterministic schedule. Drain any barrier left by
@@ -250,8 +254,12 @@ class P5ProofHooks:
         # different hook while the controller waits for the newly armed one.
         for hook in self.hooks.values():
             hook.release_current()
-        for name in names:
-            self.hooks[name].arm()
+        # A worker already inside claim_next_run must finish that whole cycle
+        # before new before/result hooks become visible. Otherwise it can miss
+        # the new before hook and consume the new result hook from the same call.
+        with self.claim_cycle:
+            for name in names:
+                self.hooks[name].arm()
 
     def hit(self, name: str, payload: dict[str, Any]) -> bool:
         hook = self.hooks.get(name)
@@ -374,6 +382,20 @@ class P5ProofRunStore:
         return self._delegate.lease_operation_timeout_seconds
 
     def claim_next_run(
+        self,
+        *,
+        owner_id: str,
+        lease_duration_seconds: int,
+        reconciliation_pending_code: str | None = None,
+    ) -> RunLeaseClaim | None:
+        with self.hooks.claim_cycle:
+            return self._claim_next_run_in_cycle(
+                owner_id=owner_id,
+                lease_duration_seconds=lease_duration_seconds,
+                reconciliation_pending_code=reconciliation_pending_code,
+            )
+
+    def _claim_next_run_in_cycle(
         self,
         *,
         owner_id: str,

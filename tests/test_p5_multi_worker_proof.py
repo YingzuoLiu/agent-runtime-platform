@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -51,6 +52,26 @@ def _hit_hook_sequence_in_child(hooks: P5ProofHooks, names: tuple[str, ...]) -> 
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"hook {name} was never armed")
             time.sleep(0.001)
+
+
+def _straddle_claim_cycle_in_child(
+    hooks: P5ProofHooks,
+    between_hooks: Any,
+    continue_cycle: Any,
+    start_next_cycle: Any,
+) -> None:
+    with hooks.claim_cycle:
+        assert hooks.hit("claim.before", {"cycle": 1}) is False
+        between_hooks.set()
+        if not continue_cycle.wait(5):
+            raise TimeoutError("controller did not release the in-flight claim cycle")
+        assert hooks.hit("claim.result", {"cycle": 1}) is False
+
+    if not start_next_cycle.wait(5):
+        raise TimeoutError("controller did not arm the next claim cycle")
+    with hooks.claim_cycle:
+        assert hooks.hit("claim.before", {"cycle": 2}) is True
+        assert hooks.hit("claim.result", {"cycle": 2}) is True
 
 
 def _valid_report() -> dict:
@@ -325,6 +346,60 @@ def test_arming_new_schedule_drains_worker_blocked_on_different_hook() -> None:
     finally:
         for hook in hooks.hooks.values():
             hook.release_current()
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+    assert process.exitcode == 0
+
+
+def test_arming_claim_schedule_cannot_straddle_inflight_claim_cycle() -> None:
+    context = multiprocessing.get_context("spawn")
+    hooks = P5ProofHooks.create(context, ("claim.before", "claim.result"))
+    between_hooks = context.Event()
+    continue_cycle = context.Event()
+    start_next_cycle = context.Event()
+    process = context.Process(
+        target=_straddle_claim_cycle_in_child,
+        args=(hooks, between_hooks, continue_cycle, start_next_cycle),
+    )
+    process.start()
+    armed = threading.Event()
+
+    def arm_next_cycle() -> None:
+        hooks.arm("claim.before", "claim.result")
+        armed.set()
+
+    controller = threading.Thread(target=arm_next_cycle)
+    try:
+        assert between_hooks.wait(5)
+        controller.start()
+        assert not armed.wait(0.05)
+        continue_cycle.set()
+        controller.join(timeout=5)
+        assert armed.is_set()
+        start_next_cycle.set()
+
+        before = hooks.hooks["claim.before"]
+        assert before.reached.wait(5)
+        before_generation, before_payload = before.metadata.get(timeout=1)
+        assert before_generation == before.current_generation()
+        assert before_payload == {"cycle": 2}
+        before.release_current()
+
+        result = hooks.hooks["claim.result"]
+        assert result.reached.wait(5)
+        result_generation, result_payload = result.metadata.get(timeout=1)
+        assert result_generation == result.current_generation()
+        assert result_payload == {"cycle": 2}
+        result.release_current()
+        process.join(timeout=5)
+    finally:
+        continue_cycle.set()
+        start_next_cycle.set()
+        for hook in hooks.hooks.values():
+            hook.release_current()
+        controller.join(timeout=1)
         if process.is_alive():
             process.kill()
             process.join(timeout=2)

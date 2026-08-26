@@ -12,12 +12,16 @@ generation counters. Events are wake-up hints only: a stale event cannot satisfy
 different generation, and the controller cannot re-arm until the prior generation's
 consumer has acknowledged completion. Starting a new schedule first releases every
 prior named barrier, so a worker parked on one hook cannot prevent it from reaching a
-different hook in the next schedule. Timeout diagnostics request locals-free worker
-thread stacks and integer-only generation state so a failed barrier identifies the
-exact blocking boundary without publishing credentials or payloads. Failure cleanup
-resumes a stopped proof worker and has a bounded SIGKILL backstop. The post-run
-PostgreSQL session check runs only after both polling workers have stopped; an
-in-flight polling transaction is not misclassified as a leaked session.
+different hook in the next schedule. Arming the new schedule is also serialized with
+the proof adapter's whole `claim_next_run` cycle. A poll already between
+`claim.before` and `claim.result` must finish before either new hook becomes visible,
+so one call cannot miss the new before generation and consume its result generation.
+Timeout diagnostics request locals-free worker thread stacks and integer-only
+generation state so a failed barrier identifies the exact blocking boundary without
+publishing credentials or payloads. Failure cleanup resumes a stopped proof worker
+and has a bounded SIGKILL backstop. The post-run PostgreSQL session check runs only
+after both polling workers have stopped; an in-flight polling transaction is not
+misclassified as a leaked session.
 
 The proof adds no production scheduler, distributed queue, connection pool, or
 production control endpoint. `RuntimeManager._wake` remains a process-local latency
