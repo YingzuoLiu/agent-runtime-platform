@@ -13,6 +13,12 @@ prepare-before-dispatch durable external actions with explicit uncertain-outcome
 
 ## Architecture
 
+The runtime's cloud boundary is defined by the
+[`portable-substrate-contract.md`](portable-substrate-contract.md). Provider deployment adapters
+may supply infrastructure and configuration, but durable authority remains in the application and
+PostgreSQL. CI rejects cloud SDK imports, reverse imports from deployment code, and known
+provider-specific authority markers inside the portable application surface.
+
 ```mermaid
 flowchart TB
     C["Client"] --> A["Bearer auth and typed RBAC"]

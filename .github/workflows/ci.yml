@@ -19,8 +19,9 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements-dev.txt
-      - run: python -m compileall agent api demo_provider runtime_service domains examples
-      - run: ruff check agent api demo_provider runtime_service tests domains examples
+      - run: python -m compileall agent api demo_provider runtime_service domains examples scripts
+      - run: ruff check agent api demo_provider runtime_service tests domains examples scripts
+      - run: python scripts/check_substrate_contract.py
       - run: mypy
       - run: pytest -q
       - run: git diff --check
