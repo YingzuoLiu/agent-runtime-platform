@@ -7,11 +7,14 @@ controller process submits Runs, controls named one-shot barriers, injects exact
 store-time lease expiry, and rereads durable evidence. The synthetic HTTP provider is
 a fourth, independent process with its own SQLite effect ledger.
 
-Each reusable barrier has an explicit consumer-completed acknowledgement. The
-controller cannot clear and re-arm a barrier until the worker has observed the prior
-release, preventing one generation from consuming the next generation's signal. The
-post-run PostgreSQL session check runs only after both polling workers have stopped;
-an in-flight polling transaction is not misclassified as a leaked session.
+Each reusable barrier has monotonic armed, consumed, reached, released, and completed
+generation counters. Events are wake-up hints only: a stale event cannot satisfy a
+different generation, and the controller cannot re-arm until the prior generation's
+consumer has acknowledged completion. Timeout diagnostics request locals-free worker
+thread stacks so a failed barrier identifies the exact blocking boundary without
+publishing credentials or payloads. The post-run PostgreSQL session check runs only
+after both polling workers have stopped; an in-flight polling transaction is not
+misclassified as a leaked session.
 
 The proof adds no production scheduler, distributed queue, connection pool, or
 production control endpoint. `RuntimeManager._wake` remains a process-local latency

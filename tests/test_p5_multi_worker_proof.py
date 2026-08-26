@@ -3,7 +3,6 @@ from __future__ import annotations
 import multiprocessing
 import json
 import os
-import queue
 import signal
 import threading
 from pathlib import Path
@@ -163,7 +162,7 @@ def test_worker_timeout_diagnostic_requests_locals_free_stack_dump(
 def test_process_hook_is_one_shot_and_carries_only_controller_payload() -> None:
     context = multiprocessing.get_context("spawn")
     hooks = P5ProofHooks.create(context, ("point",))
-    hooks.arm("point")
+    generation = hooks.hooks["point"].arm()
     completed = threading.Event()
 
     def hit() -> None:
@@ -175,46 +174,38 @@ def test_process_hook_is_one_shot_and_carries_only_controller_payload() -> None:
     thread.start()
     hook = hooks.hooks["point"]
     assert hook.reached.wait(2)
-    assert hook.metadata.get(timeout=1) == {"point": "point", "attempt": 1}
-    hook.release.set()
+    assert hook.metadata.get(timeout=1) == (
+        generation,
+        {"point": "point", "attempt": 1},
+    )
+    hook.release_current()
     thread.join(timeout=2)
     assert completed.is_set()
 
 
-def test_process_hook_rearm_waits_for_previous_consumer_acknowledgement() -> None:
-    class DelayedRelease:
-        def __init__(self) -> None:
-            self._set = threading.Event()
-            self.allow_wait_to_return = threading.Event()
+def test_process_hook_rearm_waits_for_previous_consumer_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    hook = ProcessHook.create(context)
+    generation = hook.arm()
+    completion_entered = threading.Event()
+    allow_completion = threading.Event()
+    original_mark_completed = hook._mark_completed
 
-        def clear(self) -> None:
-            self._set.clear()
+    def delayed_completion(completed_generation: int) -> None:
+        completion_entered.set()
+        assert allow_completion.wait(2)
+        original_mark_completed(completed_generation)
 
-        def set(self) -> None:
-            self._set.set()
-
-        def wait(self, timeout: float) -> bool:
-            if not self._set.wait(timeout):
-                return False
-            return self.allow_wait_to_return.wait(timeout)
-
-    completed = threading.Event()
-    completed.set()
-    release = DelayedRelease()
-    hook = ProcessHook(
-        enabled=threading.Event(),
-        reached=threading.Event(),
-        release=release,
-        completed=completed,
-        metadata=queue.Queue(maxsize=1),
-    )
-    hook.arm()
+    monkeypatch.setattr(hook, "_mark_completed", delayed_completion)
     consumer = threading.Thread(target=hook.hit, args=({"generation": 1},))
     consumer.start()
     assert hook.reached.wait(2)
-    assert hook.metadata.get(timeout=1) == {"generation": 1}
+    assert hook.metadata.get(timeout=1) == (generation, {"generation": 1})
 
-    release.set()
+    hook.release_current()
+    assert completion_entered.wait(2)
     rearmed = threading.Event()
 
     def rearm() -> None:
@@ -226,11 +217,39 @@ def test_process_hook_rearm_waits_for_previous_consumer_acknowledgement() -> Non
     try:
         assert not rearmed.wait(0.05)
     finally:
-        release.allow_wait_to_return.set()
+        allow_completion.set()
         consumer.join(timeout=2)
         controller.join(timeout=2)
     assert not consumer.is_alive()
     assert rearmed.is_set()
+
+
+def test_process_hook_stale_release_signal_cannot_release_new_generation() -> None:
+    context = multiprocessing.get_context("spawn")
+    hook = ProcessHook.create(context)
+
+    first_generation = hook.arm()
+    first = threading.Thread(target=hook.hit, args=({"generation": 1},))
+    first.start()
+    assert hook.reached.wait(2)
+    assert hook.metadata.get(timeout=1) == (first_generation, {"generation": 1})
+    hook.release_current()
+    first.join(timeout=2)
+    assert not first.is_alive()
+
+    second_generation = hook.arm()
+    second = threading.Thread(target=hook.hit, args=({"generation": 2},))
+    second.start()
+    assert hook.reached.wait(2)
+    assert hook.metadata.get(timeout=1) == (second_generation, {"generation": 2})
+
+    hook.release.set()
+    second.join(timeout=0.05)
+    assert second.is_alive()
+
+    hook.release_current()
+    second.join(timeout=2)
+    assert not second.is_alive()
 
 
 def test_run_proof_measures_session_hygiene_after_worker_polling_stops(
@@ -325,7 +344,10 @@ def test_process_pause_hook_flushes_metadata_before_sigstop() -> None:
     try:
         hook = hooks.hooks["paused"]
         assert hook.reached.wait(5)
-        assert hook.metadata.get(timeout=1) == {"point": "paused", "attempt": 1}
+        assert hook.metadata.get(timeout=1) == (
+            hook.current_generation(),
+            {"point": "paused", "attempt": 1},
+        )
     finally:
         if process.is_alive() and process.pid is not None:
             os.kill(process.pid, signal.SIGCONT)
@@ -352,11 +374,14 @@ def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:
     )
     open_hook = hooks.hooks["db.connection.open"]
     failure_hook = hooks.hooks["db.connection.failed"]
-    open_hook.release.set()
-    failure_hook.enabled.set()
+    open_generation = open_hook.arm()
+    assert open_hook.consume() == open_generation
+    open_hook.release_current()
+    failure_generation = failure_hook.arm()
     proxy = _TerminatedConnection(
         BrokenConnection(),
         open_hook,
+        open_generation,
         failure_hook,
         worker_id="p5-worker-a",
         backend_pid=123,
@@ -371,12 +396,15 @@ def test_connection_proxy_reports_failure_for_any_polling_operation() -> None:
     thread = threading.Thread(target=execute)
     thread.start()
     assert failure_hook.reached.wait(2)
-    assert failure_hook.metadata.get(timeout=1) == {
-        "point": "db.connection.failed",
-        "worker": "p5-worker-a",
-        "error_type": "AdminShutdown",
-        "sqlstate": "57P01",
-    }
-    failure_hook.release.set()
+    assert failure_hook.metadata.get(timeout=1) == (
+        failure_generation,
+        {
+            "point": "db.connection.failed",
+            "worker": "p5-worker-a",
+            "error_type": "AdminShutdown",
+            "sqlstate": "57P01",
+        },
+    )
+    failure_hook.release_current()
     thread.join(timeout=2)
     assert observed.is_set()

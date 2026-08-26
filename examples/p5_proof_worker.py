@@ -87,6 +87,13 @@ class ProcessHook:
     release: Any
     completed: Any
     metadata: Any
+    generations: Any
+
+    _ARMED = 0
+    _CONSUMED = 1
+    _REACHED = 2
+    _RELEASED = 3
+    _COMPLETED = 4
 
     @classmethod
     def create(cls, context: Any) -> ProcessHook:
@@ -98,11 +105,30 @@ class ProcessHook:
             release=context.Event(),
             completed=completed,
             metadata=context.Queue(maxsize=1),
+            generations=context.Array("Q", 5, lock=True),
         )
 
-    def arm(self) -> None:
-        if not self.completed.wait(P5_HOOK_TIMEOUT_SECONDS):
-            raise TimeoutError("P5 previous proof hook consumer did not finish")
+    def _generation(self, index: int) -> int:
+        with self.generations.get_lock():
+            return int(self.generations[index])
+
+    def current_generation(self) -> int:
+        return self._generation(self._ARMED)
+
+    def reached_generation(self) -> int:
+        return self._generation(self._REACHED)
+
+    def arm(self) -> int:
+        deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
+        while True:
+            with self.generations.get_lock():
+                previous = int(self.generations[self._ARMED])
+                previous_completed = int(self.generations[self._COMPLETED])
+            if previous_completed >= previous:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.completed.wait(remaining):
+                raise TimeoutError("P5 previous proof hook consumer did not finish")
         self.completed.clear()
         self.reached.clear()
         self.release.clear()
@@ -111,45 +137,92 @@ class ProcessHook:
                 self.metadata.get_nowait()
             except queue.Empty:
                 break
+        with self.generations.get_lock():
+            generation = int(self.generations[self._ARMED]) + 1
+            self.generations[self._ARMED] = generation
         self.enabled.set()
+        return generation
 
-    def consume(self) -> bool:
+    def consume(self) -> int | None:
         if not self.enabled.is_set():
-            return False
+            return None
+        with self.generations.get_lock():
+            generation = int(self.generations[self._ARMED])
+            if int(self.generations[self._CONSUMED]) >= generation:
+                return None
+            self.generations[self._CONSUMED] = generation
         self.enabled.clear()
-        return True
+        return generation
 
-    def block_consumed(self, payload: dict[str, Any]) -> None:
+    def _mark_reached(self, generation: int, payload: dict[str, Any]) -> None:
+        self.metadata.put((generation, payload))
+        with self.generations.get_lock():
+            self.generations[self._REACHED] = max(
+                int(self.generations[self._REACHED]),
+                generation,
+            )
+        self.reached.set()
+
+    def _mark_completed(self, generation: int) -> None:
+        with self.generations.get_lock():
+            self.generations[self._COMPLETED] = max(
+                int(self.generations[self._COMPLETED]),
+                generation,
+            )
+        self.completed.set()
+
+    def release_current(self) -> None:
+        with self.generations.get_lock():
+            generation = int(self.generations[self._ARMED])
+            self.generations[self._RELEASED] = max(
+                int(self.generations[self._RELEASED]),
+                generation,
+            )
+        self.release.set()
+
+    def block_consumed(self, generation: int, payload: dict[str, Any]) -> None:
         try:
-            self.metadata.put(payload)
-            self.reached.set()
-            if not self.release.wait(P5_HOOK_TIMEOUT_SECONDS):
-                raise TimeoutError("P5 controller did not release a reached proof hook")
+            self._mark_reached(generation, payload)
+            deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
+            while self._generation(self._RELEASED) < generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("P5 controller did not release a reached proof hook")
+                self.release.wait(remaining)
+                if self._generation(self._RELEASED) < generation:
+                    self.release.clear()
         finally:
-            self.completed.set()
+            self._mark_completed(generation)
 
     def hit(self, payload: dict[str, Any]) -> bool:
-        if not self.consume():
+        generation = self.consume()
+        if generation is None:
             return False
-        self.block_consumed(payload)
+        self.block_consumed(generation, payload)
         return True
 
     def pause_process(self, payload: dict[str, Any]) -> bool:
         """Stop this proof process after publishing one bounded observation."""
 
-        if not self.consume():
+        generation = self.consume()
+        if generation is None:
             return False
         try:
-            self.metadata.put(payload)
+            self.metadata.put((generation, payload))
             # multiprocessing.Queue publishes through a feeder thread. Flush this
             # one-shot channel before SIGSTOP so the controller never observes the
             # reached event before its matching payload is readable.
             self.metadata.close()
             self.metadata.join_thread()
+            with self.generations.get_lock():
+                self.generations[self._REACHED] = max(
+                    int(self.generations[self._REACHED]),
+                    generation,
+                )
             self.reached.set()
             os.kill(os.getpid(), signal.SIGSTOP)
         finally:
-            self.completed.set()
+            self._mark_completed(generation)
         return True
 
 
@@ -192,6 +265,7 @@ class _TerminatedConnection:
         self,
         connection: Any,
         hook: ProcessHook,
+        hook_generation: int,
         failure_hook: ProcessHook | None,
         *,
         worker_id: str,
@@ -199,6 +273,7 @@ class _TerminatedConnection:
     ) -> None:
         self._connection = connection
         self._hook = hook
+        self._hook_generation = hook_generation
         self._failure_hook = failure_hook
         self._worker_id = worker_id
         self._backend_pid = backend_pid
@@ -208,6 +283,7 @@ class _TerminatedConnection:
         if self._first_execute:
             self._first_execute = False
             self._hook.block_consumed(
+                self._hook_generation,
                 {
                     "point": "db.connection.open",
                     "worker": self._worker_id,
@@ -260,7 +336,8 @@ class P5ProofRunStore:
         def connect_with_optional_fault() -> Any:
             connection = original()
             hook = self.hooks.hooks.get("db.connection.open")
-            if hook is None or not hook.consume():
+            generation = hook.consume() if hook is not None else None
+            if hook is None or generation is None:
                 return connection
             row = connection.execute("SELECT pg_backend_pid() AS pid").fetchone()
             if row is None:
@@ -269,6 +346,7 @@ class P5ProofRunStore:
             return _TerminatedConnection(
                 connection,
                 hook,
+                generation,
                 self.hooks.hooks.get("db.connection.failed"),
                 worker_id=self.worker_id,
                 backend_pid=int(row["pid"]),

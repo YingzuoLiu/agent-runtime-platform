@@ -254,17 +254,23 @@ class WorkerProcess:
 
     def wait_hook(self, name: str, *, timeout: float = WAIT_SECONDS) -> dict[str, Any]:
         hook = self.hooks.hooks[name]
+        generation = hook.current_generation()
         deadline = time.monotonic() + timeout
-        while not hook.reached.wait(0.05):
+        while hook.reached_generation() < generation:
+            hook.reached.wait(0.05)
             self.raise_if_failed()
             if time.monotonic() >= deadline:
                 self.dump_thread_stacks(reason=f"timeout waiting for {name}")
                 raise P5ProofFailure(f"{self.worker_id} did not reach {name}")
         self.raise_if_failed()
         try:
-            payload = hook.metadata.get(timeout=1)
+            payload_generation, payload = hook.metadata.get(timeout=1)
         except queue.Empty:
             raise P5ProofFailure(f"{self.worker_id} {name} metadata is missing") from None
+        _require(
+            payload_generation == generation,
+            f"{self.worker_id} {name} metadata generation is invalid",
+        )
         _require(isinstance(payload, dict), f"{self.worker_id} {name} metadata is invalid")
         return payload
 
@@ -289,11 +295,11 @@ class WorkerProcess:
         time.sleep(0.1)
 
     def release(self, name: str) -> None:
-        self.hooks.hooks[name].release.set()
+        self.hooks.hooks[name].release_current()
 
     def release_all(self) -> None:
         for hook in self.hooks.hooks.values():
-            hook.release.set()
+            hook.release_current()
 
     def suspend(self) -> None:
         os.kill(self.pid, signal.SIGSTOP)
