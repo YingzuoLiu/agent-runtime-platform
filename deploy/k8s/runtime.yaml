@@ -13,8 +13,9 @@ kind: Deployment
 metadata:
   name: travel-agent-runtime
 spec:
-  # SQLite + an in-process queue intentionally run as one replica in this demo.
-  # Move runs/checkpoints to PostgreSQL and the queue to Redis/Pub/Sub before scaling out.
+  # This legacy SQLite example intentionally stays at one replica. A multi-task
+  # deployment must select PostgreSQL; bounded database polling already supplies
+  # cross-process progress and does not require a distributed queue.
   replicas: 1
   strategy:
     type: Recreate

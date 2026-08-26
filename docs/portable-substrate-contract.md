@@ -40,9 +40,10 @@ not as a claim that every cloud has been certified.
 provider deployment adapter -> portable application contract -> runtime authority
 ```
 
-Provider deployment code may configure and run the application. Application packages must not
-import provider deployment code or require a provider SDK. No speculative `CloudProvider`
-abstraction is introduced: the boundary consists of standard protocols and observable behavior.
+Provider deployment code and repository operational scripts may configure and run the application.
+Application packages must not import either boundary or require a provider SDK. No speculative
+`CloudProvider` abstraction is introduced: the boundary consists of standard protocols and
+observable behavior.
 
 The portable application surface is currently:
 
@@ -102,6 +103,9 @@ This static tripwire is necessary but not sufficient. P6 application hardening m
 exact production OCI image against ordinary PostgreSQL without cloud credentials or metadata and
 prove bootstrap, readiness, a durable semantic transition, JSON logs, and `SIGTERM` behavior. AWS
 acceptance must reuse that exact image digest.
+
+The process and image half of this boundary is specified in
+[`production-runtime-contract.md`](production-runtime-contract.md).
 
 ## What this does not claim
 

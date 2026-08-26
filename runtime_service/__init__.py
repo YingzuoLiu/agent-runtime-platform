@@ -22,6 +22,7 @@ from .dynamic_loop import (
 from .external_actions import (
     AmbiguousExternalActionError,
     DefinitiveExternalActionError,
+    DisabledExternalActionProvider,
     ExternalActionDispatcher,
     ExternalActionProvider,
     ExternalActionProviderRegistry,
@@ -151,6 +152,7 @@ __all__ = [
     "ExternalActionRequest",
     "AmbiguousExternalActionError",
     "DefinitiveExternalActionError",
+    "DisabledExternalActionProvider",
     "FinishDecision",
     "FinishEvaluation",
     "GovernedMemory",

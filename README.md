@@ -101,6 +101,12 @@ offline Planner, and enables an ephemeral demo Operator session. Do not publish 
 `RUNTIME_DEMO_MODE=true`, `/demo` and its browser session endpoint do not exist, and protected API
 routes remain fail-closed.
 
+The production image selects PostgreSQL and fails startup when its DSN is absent. Compose
+explicitly overrides that authority to SQLite and supplies the local database path;
+production-shaped containers use the bounded entrypoint, JSON stdout logs, optional release
+identity, and explicit external-write mode documented in
+[`docs/production-runtime-contract.md`](docs/production-runtime-contract.md).
+
 ### Prove Action recovery across a real restart
 
 The Console demonstrates the governed Agent loop. A separate one-command proof exercises the

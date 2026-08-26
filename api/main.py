@@ -51,6 +51,7 @@ from runtime_service import (
     Authenticator,
     AuthorizationError,
     Authorizer,
+    DisabledExternalActionProvider,
     DynamicToolLoop,
     GovernedMemory,
     HttpExternalActionProvider,
@@ -93,6 +94,12 @@ from runtime_service.external_actions import (
     ExternalActionProviderRegistry,
 )
 from runtime_service.run_store import is_run_store_contention_error, is_run_store_error
+from runtime_service.deployment import (
+    RuntimeDeploymentConfig,
+    resolve_runtime_deployment_config,
+    validate_manager_shutdown_grace_seconds,
+    validate_runtime_worker_count,
+)
 from runtime_service.storage import (
     build_runtime_store_bundle,
     resolve_runtime_storage_config,
@@ -188,6 +195,8 @@ def create_app(
     postgres_idle_in_transaction_session_timeout_seconds: float | None = None,
     postgres_lease_operation_timeout_seconds: float | None = None,
     worker_count: int | None = None,
+    shutdown_grace_seconds: float | None = None,
+    deployment_config: RuntimeDeploymentConfig | None = None,
     authenticator: Authenticator | None = None,
     authorizer: Authorizer | None = None,
     travel_planner: Planner | None = None,
@@ -199,6 +208,11 @@ def create_app(
     demo_api_key: str | None = None,
     runtime_extensions: Sequence[RuntimeExtension] = (),
 ) -> FastAPI:
+    resolved_deployment_config = (
+        deployment_config
+        if deployment_config is not None
+        else resolve_runtime_deployment_config()
+    )
     storage_config = resolve_runtime_storage_config(
         backend=store_backend,
         database_path=database_path,
@@ -215,7 +229,16 @@ def create_app(
         ),
     )
     resolved_database_path = storage_config.sqlite_path
-    resolved_worker_count = worker_count or int(os.getenv("RUNTIME_WORKER_COUNT", "1"))
+    resolved_worker_count = validate_runtime_worker_count(
+        resolved_deployment_config.worker_count
+        if worker_count is None
+        else worker_count
+    )
+    resolved_shutdown_grace_seconds = validate_manager_shutdown_grace_seconds(
+        resolved_deployment_config.manager_shutdown_grace_seconds
+        if shutdown_grace_seconds is None
+        else shutdown_grace_seconds
+    )
     resolved_action_waiter_limit = (
         int(os.getenv("RUNTIME_ACTION_WAITER_LIMIT", "16"))
         if action_waiter_limit is None
@@ -235,6 +258,25 @@ def create_app(
         if alias in configured_action_providers:
             raise ValueError(f"Duplicate Action destination alias: {alias}")
         configured_action_providers[alias] = provider
+    travel_provider_environment_names = (
+        "RUNTIME_TRAVEL_ACTION_PROVIDER_URL",
+        "RUNTIME_TRAVEL_ACTION_PROVIDER_IDENTITY",
+        "RUNTIME_TRAVEL_ACTION_PROVIDER_BEARER_TOKEN",
+        "RUNTIME_TRAVEL_ACTION_PROVIDER_ALLOW_INSECURE_LOCALHOST",
+        "RUNTIME_TRAVEL_ACTION_PROVIDER_SUPPORTS_IDEMPOTENCY",
+    )
+    has_travel_provider_configuration = any(
+        os.getenv(name, "").strip() for name in travel_provider_environment_names
+    )
+    if resolved_deployment_config.external_action_mode == "disabled" and (
+        travel_action_provider is not None
+        or has_travel_provider_configuration
+        or configured_action_providers
+    ):
+        raise ValueError(
+            "disabled external actions cannot be combined with an injected "
+            "or configured provider"
+        )
     resolved_runtime_extensions = tuple(runtime_extensions)
     resolved_demo_mode = resolve_demo_mode(demo_mode)
     demo_session: DemoSession | None = None
@@ -283,7 +325,11 @@ def create_app(
             ToolSandbox(build_release_validation_tool_registry()),
         )
         travel_provider_registry = ExternalActionProviderRegistry()
-        if travel_action_provider is not None:
+        if resolved_deployment_config.external_action_mode == "disabled":
+            resolved_action_provider = DisabledExternalActionProvider(
+                "travel-external-actions-disabled"
+            )
+        elif travel_action_provider is not None:
             resolved_action_provider = travel_action_provider
         elif action_provider_url := os.getenv("RUNTIME_TRAVEL_ACTION_PROVIDER_URL"):
             action_provider_identity = os.getenv(
@@ -413,6 +459,7 @@ def create_app(
             store=store,
             registry=registry,
             worker_count=resolved_worker_count,
+            shutdown_grace_seconds=resolved_shutdown_grace_seconds,
             recovery_reconciliation_required=(
                 workflow_store.has_external_action_requiring_reconciliation
             ),
@@ -431,6 +478,7 @@ def create_app(
         app.state.run_store = store
         app.state.memory_store = memory_store
         app.state.storage_metadata = stores.metadata
+        app.state.release_identity = resolved_deployment_config.release_identity
         app.state.runtime_manager = manager
         app.state.agent_registry = registry
         # Preserve the published direct-sandbox catalog: external writes are
@@ -560,10 +608,13 @@ def create_app(
         request.app.state.run_store.ping()
         request.app.state.memory_store.ping()
         request.app.state.workflow_store.ping()
-        return {
+        result: dict[str, object] = {
             "status": "ready",
             "storage": request.app.state.storage_metadata.public_dict(),
         }
+        if request.app.state.release_identity is not None:
+            result["release"] = request.app.state.release_identity.public_dict()
+        return result
 
     if demo_session is not None:
         assets_path = demo_assets_path()
