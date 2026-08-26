@@ -3,12 +3,15 @@ from __future__ import annotations
 import multiprocessing
 import json
 import os
+import queue
 import signal
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import examples.p5_multi_worker_proof as p5_proof
 from examples.p5_multi_worker_proof import (
     REPORT_VERSION,
     P5ProofFailure,
@@ -19,6 +22,7 @@ from examples.p5_postgres_probe import P5RunSnapshot
 from examples.p5_proof_worker import (
     P5ProofHooks,
     P5WorkerConfig,
+    ProcessHook,
     _TerminatedConnection,
 )
 from tests.conformance.p5_mutation_proof import p5_mutants
@@ -141,6 +145,132 @@ def test_process_hook_is_one_shot_and_carries_only_controller_payload() -> None:
     hook.release.set()
     thread.join(timeout=2)
     assert completed.is_set()
+
+
+def test_process_hook_rearm_waits_for_previous_consumer_acknowledgement() -> None:
+    class DelayedRelease:
+        def __init__(self) -> None:
+            self._set = threading.Event()
+            self.allow_wait_to_return = threading.Event()
+
+        def clear(self) -> None:
+            self._set.clear()
+
+        def set(self) -> None:
+            self._set.set()
+
+        def wait(self, timeout: float) -> bool:
+            if not self._set.wait(timeout):
+                return False
+            return self.allow_wait_to_return.wait(timeout)
+
+    completed = threading.Event()
+    completed.set()
+    release = DelayedRelease()
+    hook = ProcessHook(
+        enabled=threading.Event(),
+        reached=threading.Event(),
+        release=release,
+        completed=completed,
+        metadata=queue.Queue(maxsize=1),
+    )
+    hook.arm()
+    consumer = threading.Thread(target=hook.hit, args=({"generation": 1},))
+    consumer.start()
+    assert hook.reached.wait(2)
+    assert hook.metadata.get(timeout=1) == {"generation": 1}
+
+    release.set()
+    rearmed = threading.Event()
+
+    def rearm() -> None:
+        hook.arm()
+        rearmed.set()
+
+    controller = threading.Thread(target=rearm)
+    controller.start()
+    try:
+        assert not rearmed.wait(0.05)
+    finally:
+        release.allow_wait_to_return.set()
+        consumer.join(timeout=2)
+        controller.join(timeout=2)
+    assert not consumer.is_alive()
+    assert rearmed.is_set()
+
+
+def test_run_proof_measures_session_hygiene_after_worker_polling_stops(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Worker:
+        def __init__(self, worker_id: str) -> None:
+            self.worker_id = worker_id
+
+        def start_claiming(self) -> None:
+            events.append(f"{self.worker_id}-started")
+
+    class Controller:
+        def __init__(self, **_kwargs: object) -> None:
+            self.workers = (Worker("worker-a"), Worker("worker-b"))
+            self.bundle = SimpleNamespace(
+                metadata=SimpleNamespace(schema_versions={"run": "test"})
+            )
+
+        @property
+        def worker_a(self) -> Worker:
+            return self.workers[0]
+
+        @property
+        def worker_b(self) -> Worker:
+            return self.workers[1]
+
+        def start_workers(self) -> None:
+            events.append("workers-started")
+
+        def stop_workers(self) -> None:
+            events.append("workers-stopped")
+
+    class Provider:
+        url = "http://127.0.0.1:1"
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("provider-started")
+
+        def stop(self) -> None:
+            events.append("provider-stopped")
+
+    def count_idle_sessions(dsn: str) -> int:
+        assert dsn == "sanitized-dsn"
+        assert events[-1] == "workers-stopped"
+        events.append("sessions-measured")
+        return 0
+
+    monkeypatch.setattr(p5_proof, "ARTIFACT_PATH", tmp_path / "proof.json")
+    monkeypatch.setattr(p5_proof, "make_conninfo", lambda dsn, **_kwargs: dsn)
+    monkeypatch.setattr(p5_proof, "ProviderProcess", Provider)
+    monkeypatch.setattr(p5_proof, "ProofController", Controller)
+    monkeypatch.setattr(
+        p5_proof,
+        "bootstrap_postgres_application_schema",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(p5_proof, "idle_in_transaction_count", count_idle_sessions)
+    monkeypatch.setattr(p5_proof, "postgres_version", lambda _dsn: "test")
+    monkeypatch.setattr(p5_proof, "drop_schema", lambda _dsn, _schema: None)
+    monkeypatch.setattr(p5_proof, "_git_value", lambda *_args: "test")
+    monkeypatch.setattr(p5_proof, "assert_secret_safe", lambda *_args, **_kwargs: None)
+
+    artifact = p5_proof.run_proof("sanitized-dsn", scenario_ids=())
+
+    assert artifact == tmp_path / "proof.json"
+    assert events.index("workers-stopped") < events.index("sessions-measured")
+    assert events.count("workers-stopped") == 1
 
 
 def test_process_pause_hook_is_inert_until_explicitly_armed() -> None:

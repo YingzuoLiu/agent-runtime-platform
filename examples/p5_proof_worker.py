@@ -83,18 +83,25 @@ class ProcessHook:
     enabled: Any
     reached: Any
     release: Any
+    completed: Any
     metadata: Any
 
     @classmethod
     def create(cls, context: Any) -> ProcessHook:
+        completed = context.Event()
+        completed.set()
         return cls(
             enabled=context.Event(),
             reached=context.Event(),
             release=context.Event(),
+            completed=completed,
             metadata=context.Queue(maxsize=1),
         )
 
     def arm(self) -> None:
+        if not self.completed.wait(P5_HOOK_TIMEOUT_SECONDS):
+            raise TimeoutError("P5 previous proof hook consumer did not finish")
+        self.completed.clear()
         self.reached.clear()
         self.release.clear()
         while True:
@@ -111,10 +118,13 @@ class ProcessHook:
         return True
 
     def block_consumed(self, payload: dict[str, Any]) -> None:
-        self.metadata.put(payload)
-        self.reached.set()
-        if not self.release.wait(P5_HOOK_TIMEOUT_SECONDS):
-            raise TimeoutError("P5 controller did not release a reached proof hook")
+        try:
+            self.metadata.put(payload)
+            self.reached.set()
+            if not self.release.wait(P5_HOOK_TIMEOUT_SECONDS):
+                raise TimeoutError("P5 controller did not release a reached proof hook")
+        finally:
+            self.completed.set()
 
     def hit(self, payload: dict[str, Any]) -> bool:
         if not self.consume():
@@ -127,14 +137,17 @@ class ProcessHook:
 
         if not self.consume():
             return False
-        self.metadata.put(payload)
-        # multiprocessing.Queue publishes through a feeder thread. Flush this
-        # one-shot channel before SIGSTOP so the controller never observes the
-        # reached event before its matching payload is readable.
-        self.metadata.close()
-        self.metadata.join_thread()
-        self.reached.set()
-        os.kill(os.getpid(), signal.SIGSTOP)
+        try:
+            self.metadata.put(payload)
+            # multiprocessing.Queue publishes through a feeder thread. Flush this
+            # one-shot channel before SIGSTOP so the controller never observes the
+            # reached event before its matching payload is readable.
+            self.metadata.close()
+            self.metadata.join_thread()
+            self.reached.set()
+            os.kill(os.getpid(), signal.SIGSTOP)
+        finally:
+            self.completed.set()
         return True
 
 

@@ -1328,6 +1328,7 @@ def run_proof(
         port=_free_loopback_port(),
     )
     controller: ProofController | None = None
+    workers_stopped = False
     scenarios: list[dict[str, Any]] = []
     cleanup_error: Exception | None = None
     try:
@@ -1352,6 +1353,8 @@ def run_proof(
             result = scenario(controller)
             scenarios.append(result)
             _log_scenario(result)
+        controller.stop_workers()
+        workers_stopped = True
         idle_sessions = idle_in_transaction_count(proof_dsn)
         _require(idle_sessions == 0, "P5 left an idle-in-transaction PostgreSQL session")
         schedule_result = next(
@@ -1396,7 +1399,7 @@ def run_proof(
             encoding="utf-8",
         )
     finally:
-        if controller is not None:
+        if controller is not None and not workers_stopped:
             controller.stop_workers()
         provider.stop()
         provider_temp.cleanup()
