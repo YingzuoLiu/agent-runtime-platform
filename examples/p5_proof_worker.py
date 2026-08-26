@@ -118,6 +118,16 @@ class ProcessHook:
     def reached_generation(self) -> int:
         return self._generation(self._REACHED)
 
+    def generation_state(self) -> dict[str, int]:
+        with self.generations.get_lock():
+            return {
+                "armed": int(self.generations[self._ARMED]),
+                "consumed": int(self.generations[self._CONSUMED]),
+                "reached": int(self.generations[self._REACHED]),
+                "released": int(self.generations[self._RELEASED]),
+                "completed": int(self.generations[self._COMPLETED]),
+            }
+
     def arm(self) -> int:
         deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
         while True:

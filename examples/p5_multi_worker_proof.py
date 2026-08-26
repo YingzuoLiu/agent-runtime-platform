@@ -260,7 +260,13 @@ class WorkerProcess:
             hook.reached.wait(0.05)
             self.raise_if_failed()
             if time.monotonic() >= deadline:
-                self.dump_thread_stacks(reason=f"timeout waiting for {name}")
+                self.dump_thread_stacks(
+                    reason=f"timeout waiting for {name}",
+                    hook_states={
+                        hook_name: candidate.generation_state()
+                        for hook_name, candidate in self.hooks.hooks.items()
+                    },
+                )
                 raise P5ProofFailure(f"{self.worker_id} did not reach {name}")
         self.raise_if_failed()
         try:
@@ -274,7 +280,12 @@ class WorkerProcess:
         _require(isinstance(payload, dict), f"{self.worker_id} {name} metadata is invalid")
         return payload
 
-    def dump_thread_stacks(self, *, reason: str) -> None:
+    def dump_thread_stacks(
+        self,
+        *,
+        reason: str,
+        hook_states: dict[str, dict[str, int]] | None = None,
+    ) -> None:
         """Ask a live proof worker for bounded, locals-free stack diagnostics."""
 
         if self.process is None or not self.process.is_alive():
@@ -283,6 +294,7 @@ class WorkerProcess:
             json.dumps(
                 {
                     "diagnostic": "p5-worker-thread-stacks",
+                    "hook_states": hook_states or {},
                     "reason": reason,
                     "worker": self.worker_id,
                 },
