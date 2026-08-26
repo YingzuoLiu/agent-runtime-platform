@@ -26,11 +26,12 @@ FORBIDDEN_IMPORT_PREFIXES = (
     "google.cloud",
     "kubernetes",
     "opentelemetry.instrumentation.botocore",
-    "opentelemetry.resource.detector.aws",
+    "opentelemetry.propagators.aws",
+    "opentelemetry.sdk.extension.aws",
     "s3fs",
     "sagemaker",
 )
-FORBIDDEN_DEPLOYMENT_IMPORT_PREFIXES = ("deploy",)
+FORBIDDEN_DEPLOYMENT_IMPORT_PREFIXES = ("deploy", "scripts")
 FORBIDDEN_DEPENDENCY_PREFIXES = (
     "aioboto3",
     "aiobotocore",
@@ -45,6 +46,8 @@ FORBIDDEN_DEPENDENCY_PREFIXES = (
     "google-auth",
     "google-cloud-",
     "kubernetes",
+    "opentelemetry-propagator-aws-xray",
+    "opentelemetry-sdk-extension-aws",
     "s3fs",
     "sagemaker",
 )
@@ -96,7 +99,17 @@ def _import_names(tree: ast.AST) -> list[tuple[int, str]]:
                 if alias.name == "importlib":
                     importlib_module_names.add(alias.asname or alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            names.append((node.lineno, node.module))
+            names.extend(
+                (
+                    node.lineno,
+                    (
+                        node.module
+                        if alias.name == "*"
+                        else f"{node.module}.{alias.name}"
+                    ),
+                )
+                for alias in node.names
+            )
             if node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
@@ -271,8 +284,8 @@ def scan_repository(root: Path = ROOT) -> tuple[list[ContractViolation], int]:
     return sorted(set(violations)), scanned_python_files
 
 
-def main() -> int:
-    violations, scanned_python_files = scan_repository()
+def main(root: Path = ROOT) -> int:
+    violations, scanned_python_files = scan_repository(root)
     if violations:
         print("portable substrate contract: FAIL", file=sys.stderr)
         for violation in violations:
