@@ -105,12 +105,15 @@ class ProcessHook:
             release=context.Event(),
             completed=completed,
             metadata=context.Queue(maxsize=1),
-            generations=context.Array("Q", 5, lock=True),
+            # Every slot has exactly one writer: the controller writes armed /
+            # released, and the worker writes consumed / reached / completed.
+            # A mutex is both unnecessary and unsafe here because SIGSTOP is a
+            # deliberate proof action and would freeze any lock held in-process.
+            generations=context.Array("Q", 5, lock=False),
         )
 
     def _generation(self, index: int) -> int:
-        with self.generations.get_lock():
-            return int(self.generations[index])
+        return int(self.generations[index])
 
     def current_generation(self) -> int:
         return self._generation(self._ARMED)
@@ -119,21 +122,19 @@ class ProcessHook:
         return self._generation(self._REACHED)
 
     def generation_state(self) -> dict[str, int]:
-        with self.generations.get_lock():
-            return {
-                "armed": int(self.generations[self._ARMED]),
-                "consumed": int(self.generations[self._CONSUMED]),
-                "reached": int(self.generations[self._REACHED]),
-                "released": int(self.generations[self._RELEASED]),
-                "completed": int(self.generations[self._COMPLETED]),
-            }
+        return {
+            "armed": int(self.generations[self._ARMED]),
+            "consumed": int(self.generations[self._CONSUMED]),
+            "reached": int(self.generations[self._REACHED]),
+            "released": int(self.generations[self._RELEASED]),
+            "completed": int(self.generations[self._COMPLETED]),
+        }
 
     def arm(self) -> int:
         deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
         while True:
-            with self.generations.get_lock():
-                previous = int(self.generations[self._ARMED])
-                previous_completed = int(self.generations[self._COMPLETED])
+            previous = int(self.generations[self._ARMED])
+            previous_completed = int(self.generations[self._COMPLETED])
             if previous_completed >= previous:
                 break
             remaining = deadline - time.monotonic()
@@ -147,47 +148,33 @@ class ProcessHook:
                 self.metadata.get_nowait()
             except queue.Empty:
                 break
-        with self.generations.get_lock():
-            generation = int(self.generations[self._ARMED]) + 1
-            self.generations[self._ARMED] = generation
+        generation = int(self.generations[self._ARMED]) + 1
+        self.generations[self._ARMED] = generation
         self.enabled.set()
         return generation
 
     def consume(self) -> int | None:
         if not self.enabled.is_set():
             return None
-        with self.generations.get_lock():
-            generation = int(self.generations[self._ARMED])
-            if int(self.generations[self._CONSUMED]) >= generation:
-                return None
-            self.generations[self._CONSUMED] = generation
+        generation = int(self.generations[self._ARMED])
+        if int(self.generations[self._CONSUMED]) >= generation:
+            return None
+        self.generations[self._CONSUMED] = generation
         self.enabled.clear()
         return generation
 
     def _mark_reached(self, generation: int, payload: dict[str, Any]) -> None:
         self.metadata.put((generation, payload))
-        with self.generations.get_lock():
-            self.generations[self._REACHED] = max(
-                int(self.generations[self._REACHED]),
-                generation,
-            )
+        self.generations[self._REACHED] = generation
         self.reached.set()
 
     def _mark_completed(self, generation: int) -> None:
-        with self.generations.get_lock():
-            self.generations[self._COMPLETED] = max(
-                int(self.generations[self._COMPLETED]),
-                generation,
-            )
+        self.generations[self._COMPLETED] = generation
         self.completed.set()
 
     def release_current(self) -> None:
-        with self.generations.get_lock():
-            generation = int(self.generations[self._ARMED])
-            self.generations[self._RELEASED] = max(
-                int(self.generations[self._RELEASED]),
-                generation,
-            )
+        generation = int(self.generations[self._ARMED])
+        self.generations[self._RELEASED] = generation
         self.release.set()
 
     def block_consumed(self, generation: int, payload: dict[str, Any]) -> None:
@@ -224,11 +211,7 @@ class ProcessHook:
             # reached event before its matching payload is readable.
             self.metadata.close()
             self.metadata.join_thread()
-            with self.generations.get_lock():
-                self.generations[self._REACHED] = max(
-                    int(self.generations[self._REACHED]),
-                    generation,
-                )
+            self.generations[self._REACHED] = generation
             self.reached.set()
             os.kill(os.getpid(), signal.SIGSTOP)
         finally:

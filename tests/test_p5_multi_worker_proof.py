@@ -515,6 +515,8 @@ def test_process_pause_hook_flushes_metadata_before_sigstop() -> None:
             hook.current_generation(),
             {"point": "paused", "attempt": 1},
         )
+        assert not hasattr(hook.generations, "get_lock")
+        assert hook.reached_generation() == hook.current_generation()
     finally:
         if process.is_alive() and process.pid is not None:
             os.kill(process.pid, signal.SIGCONT)

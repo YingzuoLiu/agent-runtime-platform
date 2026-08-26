@@ -7,10 +7,12 @@ controller process submits Runs, controls named one-shot barriers, injects exact
 store-time lease expiry, and rereads durable evidence. The synthetic HTTP provider is
 a fourth, independent process with its own SQLite effect ledger.
 
-Each reusable barrier has monotonic armed, consumed, reached, released, and completed
-generation counters. Events are wake-up hints only: a stale event cannot satisfy a
-different generation, and the controller cannot re-arm until the prior generation's
-consumer has acknowledged completion. Starting a new schedule first releases every
+Each reusable barrier has monotonic, lock-free armed, consumed, reached, released,
+and completed generation counters. Every counter has one writer, so the deliberate
+SIGSTOP schedule cannot freeze a process-shared generation mutex. Events are wake-up
+hints only: a stale event cannot satisfy a different generation, and the controller
+cannot re-arm until the prior generation's consumer has acknowledged completion.
+Starting a new schedule first releases every
 prior named barrier, so a worker parked on one hook cannot prevent it from reaching a
 different hook in the next schedule. Arming the new schedule is also serialized with
 the proof adapter's whole `claim_next_run` cycle. A poll already between
