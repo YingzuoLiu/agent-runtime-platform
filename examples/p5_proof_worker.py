@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import faulthandler
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -695,6 +697,7 @@ def run_p5_worker(
 
     manager: RuntimeManager | None = None
     previous_thread_excepthook = threading.excepthook
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
     def report_thread_failure(args: threading.ExceptHookArgs) -> None:
         failures.put(
@@ -765,5 +768,6 @@ def run_p5_worker(
     finally:
         if manager is not None:
             manager.stop()
+        faulthandler.unregister(signal.SIGUSR1)
         threading.excepthook = previous_thread_excepthook
         time.sleep(0.01)

@@ -126,6 +126,40 @@ def test_worker_config_repr_redacts_postgres_dsn() -> None:
     assert "dsn=" not in repr(config)
 
 
+def test_worker_timeout_diagnostic_requests_locals_free_stack_dump(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class LiveProcess:
+        pid = 4242
+
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    worker = p5_proof.WorkerProcess(
+        context=None,
+        config=P5WorkerConfig(
+            worker_id="p5-worker-a",
+            schema="p5_test",
+            dsn="postgresql://proof:canary-password@localhost/proof",
+        ),
+        hooks=P5ProofHooks({}),
+        process=LiveProcess(),
+    )
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(p5_proof.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(p5_proof.time, "sleep", lambda _seconds: None)
+
+    worker.dump_thread_stacks(reason="timeout waiting for claim.before")
+
+    diagnostic = capsys.readouterr().err
+    assert signals == [(4242, signal.SIGUSR1)]
+    assert '"worker": "p5-worker-a"' in diagnostic
+    assert '"reason": "timeout waiting for claim.before"' in diagnostic
+    assert "canary-password" not in diagnostic
+
+
 def test_process_hook_is_one_shot_and_carries_only_controller_payload() -> None:
     context = multiprocessing.get_context("spawn")
     hooks = P5ProofHooks.create(context, ("point",))
