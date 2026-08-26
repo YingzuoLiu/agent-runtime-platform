@@ -398,12 +398,24 @@ def test_run_proof_measures_session_hygiene_after_worker_polling_stops(
     monkeypatch.setattr(p5_proof, "drop_schema", lambda _dsn, _schema: None)
     monkeypatch.setattr(p5_proof, "_git_value", lambda *_args: "test")
     monkeypatch.setattr(p5_proof, "assert_secret_safe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        p5_proof.faulthandler,
+        "dump_traceback_later",
+        lambda *_args, **_kwargs: events.append("watchdog-armed"),
+    )
+    monkeypatch.setattr(
+        p5_proof.faulthandler,
+        "cancel_dump_traceback_later",
+        lambda: events.append("watchdog-cancelled"),
+    )
 
     artifact = p5_proof.run_proof("sanitized-dsn", scenario_ids=())
 
     assert artifact == tmp_path / "proof.json"
     assert events.index("workers-stopped") < events.index("sessions-measured")
     assert events.count("workers-stopped") == 1
+    assert events.index("watchdog-armed") < events.index("provider-started")
+    assert events.index("sessions-measured") < events.index("watchdog-cancelled")
 
 
 def test_process_pause_hook_is_inert_until_explicitly_armed() -> None:

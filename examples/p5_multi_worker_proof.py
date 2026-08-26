@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import multiprocessing
 import os
@@ -1369,6 +1370,7 @@ def run_proof(
     *,
     scenario_ids: tuple[str, ...] = ALL_SCENARIO_IDS,
 ) -> Path:
+    faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
     ARTIFACT_PATH.unlink(missing_ok=True)
     schema = f"p5_{uuid.uuid4().hex[:20]}"
     proof_dsn = make_conninfo(dsn, application_name="p5_multi_worker_proof")
@@ -1449,6 +1451,7 @@ def run_proof(
             encoding="utf-8",
         )
     finally:
+        faulthandler.cancel_dump_traceback_later()
         if controller is not None and not workers_stopped:
             controller.stop_workers()
         provider.stop()
