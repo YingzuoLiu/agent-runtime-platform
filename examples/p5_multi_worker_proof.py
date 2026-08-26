@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import multiprocessing
 import os
@@ -254,25 +255,64 @@ class WorkerProcess:
 
     def wait_hook(self, name: str, *, timeout: float = WAIT_SECONDS) -> dict[str, Any]:
         hook = self.hooks.hooks[name]
+        generation = hook.current_generation()
         deadline = time.monotonic() + timeout
-        while not hook.reached.wait(0.05):
+        while hook.reached_generation() < generation:
+            hook.reached.wait(0.05)
             self.raise_if_failed()
             if time.monotonic() >= deadline:
+                self.dump_thread_stacks(
+                    reason=f"timeout waiting for {name}",
+                    hook_states={
+                        hook_name: candidate.generation_state()
+                        for hook_name, candidate in self.hooks.hooks.items()
+                    },
+                )
                 raise P5ProofFailure(f"{self.worker_id} did not reach {name}")
         self.raise_if_failed()
         try:
-            payload = hook.metadata.get(timeout=1)
+            payload_generation, payload = hook.metadata.get(timeout=1)
         except queue.Empty:
             raise P5ProofFailure(f"{self.worker_id} {name} metadata is missing") from None
+        _require(
+            payload_generation == generation,
+            f"{self.worker_id} {name} metadata generation is invalid",
+        )
         _require(isinstance(payload, dict), f"{self.worker_id} {name} metadata is invalid")
         return payload
 
+    def dump_thread_stacks(
+        self,
+        *,
+        reason: str,
+        hook_states: dict[str, dict[str, int]] | None = None,
+    ) -> None:
+        """Ask a live proof worker for bounded, locals-free stack diagnostics."""
+
+        if self.process is None or not self.process.is_alive():
+            return
+        print(
+            json.dumps(
+                {
+                    "diagnostic": "p5-worker-thread-stacks",
+                    "hook_states": hook_states or {},
+                    "reason": reason,
+                    "worker": self.worker_id,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        os.kill(self.pid, signal.SIGUSR1)
+        time.sleep(0.1)
+
     def release(self, name: str) -> None:
-        self.hooks.hooks[name].release.set()
+        self.hooks.hooks[name].release_current()
 
     def release_all(self) -> None:
         for hook in self.hooks.hooks.values():
-            hook.release.set()
+            hook.release_current()
 
     def suspend(self) -> None:
         os.kill(self.pid, signal.SIGSTOP)
@@ -295,8 +335,19 @@ class WorkerProcess:
             self.shutdown_event.set()
         self.process.join(timeout=5)
         if self.process.is_alive():
+            # SIGTERM remains pending for a SIGSTOPed proof process. Resume it
+            # before bounded termination, then retain SIGKILL as the final
+            # proof-owned cleanup backstop.
+            try:
+                self.resume()
+            except ProcessLookupError:
+                pass
             self.process.terminate()
             self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=5)
+        _require(not self.process.is_alive(), f"{self.worker_id} did not stop")
 
     def raise_if_failed(self) -> None:
         if self.failures is not None:
@@ -1319,6 +1370,7 @@ def run_proof(
     *,
     scenario_ids: tuple[str, ...] = ALL_SCENARIO_IDS,
 ) -> Path:
+    faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
     ARTIFACT_PATH.unlink(missing_ok=True)
     schema = f"p5_{uuid.uuid4().hex[:20]}"
     proof_dsn = make_conninfo(dsn, application_name="p5_multi_worker_proof")
@@ -1328,6 +1380,7 @@ def run_proof(
         port=_free_loopback_port(),
     )
     controller: ProofController | None = None
+    workers_stopped = False
     scenarios: list[dict[str, Any]] = []
     cleanup_error: Exception | None = None
     try:
@@ -1352,6 +1405,8 @@ def run_proof(
             result = scenario(controller)
             scenarios.append(result)
             _log_scenario(result)
+        controller.stop_workers()
+        workers_stopped = True
         idle_sessions = idle_in_transaction_count(proof_dsn)
         _require(idle_sessions == 0, "P5 left an idle-in-transaction PostgreSQL session")
         schedule_result = next(
@@ -1396,7 +1451,8 @@ def run_proof(
             encoding="utf-8",
         )
     finally:
-        if controller is not None:
+        faulthandler.cancel_dump_traceback_later()
+        if controller is not None and not workers_stopped:
             controller.stop_workers()
         provider.stop()
         provider_temp.cleanup()
