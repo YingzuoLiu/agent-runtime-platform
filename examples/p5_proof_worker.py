@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import faulthandler
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -83,18 +85,62 @@ class ProcessHook:
     enabled: Any
     reached: Any
     release: Any
+    completed: Any
     metadata: Any
+    generations: Any
+
+    _ARMED = 0
+    _CONSUMED = 1
+    _REACHED = 2
+    _RELEASED = 3
+    _COMPLETED = 4
 
     @classmethod
     def create(cls, context: Any) -> ProcessHook:
+        completed = context.Event()
+        completed.set()
         return cls(
             enabled=context.Event(),
             reached=context.Event(),
             release=context.Event(),
+            completed=completed,
             metadata=context.Queue(maxsize=1),
+            # Every slot has exactly one writer: the controller writes armed /
+            # released, and the worker writes consumed / reached / completed.
+            # A mutex is both unnecessary and unsafe here because SIGSTOP is a
+            # deliberate proof action and would freeze any lock held in-process.
+            generations=context.Array("Q", 5, lock=False),
         )
 
-    def arm(self) -> None:
+    def _generation(self, index: int) -> int:
+        return int(self.generations[index])
+
+    def current_generation(self) -> int:
+        return self._generation(self._ARMED)
+
+    def reached_generation(self) -> int:
+        return self._generation(self._REACHED)
+
+    def generation_state(self) -> dict[str, int]:
+        return {
+            "armed": int(self.generations[self._ARMED]),
+            "consumed": int(self.generations[self._CONSUMED]),
+            "reached": int(self.generations[self._REACHED]),
+            "released": int(self.generations[self._RELEASED]),
+            "completed": int(self.generations[self._COMPLETED]),
+        }
+
+    def arm(self) -> int:
+        deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
+        while True:
+            previous = int(self.generations[self._ARMED])
+            previous_completed = int(self.generations[self._COMPLETED])
+            if previous_completed >= previous:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.completed.wait(remaining):
+                raise TimeoutError("P5 previous proof hook consumer did not finish")
+        self.completed.clear()
         self.reached.clear()
         self.release.clear()
         while True:
@@ -102,53 +148,101 @@ class ProcessHook:
                 self.metadata.get_nowait()
             except queue.Empty:
                 break
+        generation = int(self.generations[self._ARMED]) + 1
+        self.generations[self._ARMED] = generation
         self.enabled.set()
+        return generation
 
-    def consume(self) -> bool:
+    def consume(self) -> int | None:
         if not self.enabled.is_set():
-            return False
+            return None
+        generation = int(self.generations[self._ARMED])
+        if int(self.generations[self._CONSUMED]) >= generation:
+            return None
+        self.generations[self._CONSUMED] = generation
         self.enabled.clear()
-        return True
+        return generation
 
-    def block_consumed(self, payload: dict[str, Any]) -> None:
-        self.metadata.put(payload)
+    def _mark_reached(self, generation: int, payload: dict[str, Any]) -> None:
+        self.metadata.put((generation, payload))
+        self.generations[self._REACHED] = generation
         self.reached.set()
-        if not self.release.wait(P5_HOOK_TIMEOUT_SECONDS):
-            raise TimeoutError("P5 controller did not release a reached proof hook")
+
+    def _mark_completed(self, generation: int) -> None:
+        self.generations[self._COMPLETED] = generation
+        self.completed.set()
+
+    def release_current(self) -> None:
+        generation = int(self.generations[self._ARMED])
+        self.generations[self._RELEASED] = generation
+        self.release.set()
+
+    def block_consumed(self, generation: int, payload: dict[str, Any]) -> None:
+        try:
+            self._mark_reached(generation, payload)
+            deadline = time.monotonic() + P5_HOOK_TIMEOUT_SECONDS
+            while self._generation(self._RELEASED) < generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("P5 controller did not release a reached proof hook")
+                self.release.wait(remaining)
+                if self._generation(self._RELEASED) < generation:
+                    self.release.clear()
+        finally:
+            self._mark_completed(generation)
 
     def hit(self, payload: dict[str, Any]) -> bool:
-        if not self.consume():
+        generation = self.consume()
+        if generation is None:
             return False
-        self.block_consumed(payload)
+        self.block_consumed(generation, payload)
         return True
 
     def pause_process(self, payload: dict[str, Any]) -> bool:
         """Stop this proof process after publishing one bounded observation."""
 
-        if not self.consume():
+        generation = self.consume()
+        if generation is None:
             return False
-        self.metadata.put(payload)
-        # multiprocessing.Queue publishes through a feeder thread. Flush this
-        # one-shot channel before SIGSTOP so the controller never observes the
-        # reached event before its matching payload is readable.
-        self.metadata.close()
-        self.metadata.join_thread()
-        self.reached.set()
-        os.kill(os.getpid(), signal.SIGSTOP)
+        try:
+            self.metadata.put((generation, payload))
+            # multiprocessing.Queue publishes through a feeder thread. Flush this
+            # one-shot channel before SIGSTOP so the controller never observes the
+            # reached event before its matching payload is readable.
+            self.metadata.close()
+            self.metadata.join_thread()
+            self.generations[self._REACHED] = generation
+            self.reached.set()
+            os.kill(os.getpid(), signal.SIGSTOP)
+        finally:
+            self._mark_completed(generation)
         return True
 
 
 @dataclass
 class P5ProofHooks:
     hooks: dict[str, ProcessHook]
+    claim_cycle: Any = field(default_factory=threading.Lock)
 
     @classmethod
     def create(cls, context: Any, names: tuple[str, ...]) -> P5ProofHooks:
-        return cls({name: ProcessHook.create(context) for name in names})
+        return cls(
+            {name: ProcessHook.create(context) for name in names},
+            claim_cycle=context.Lock(),
+        )
 
     def arm(self, *names: str) -> None:
-        for name in names:
-            self.hooks[name].arm()
+        # Arming starts a new deterministic schedule. Drain any barrier left by
+        # the previous schedule first so a worker cannot remain parked on a
+        # different hook while the controller waits for the newly armed one.
+        for hook in self.hooks.values():
+            hook.release_current()
+        # A worker already inside claim_next_run must finish that whole cycle
+        # before new before/result hooks become visible. Otherwise it can miss
+        # the new before hook and consume the new result hook from the same call.
+        with self.claim_cycle:
+            for name in names:
+                self.hooks[name].arm()
 
     def hit(self, name: str, payload: dict[str, Any]) -> bool:
         hook = self.hooks.get(name)
@@ -177,6 +271,7 @@ class _TerminatedConnection:
         self,
         connection: Any,
         hook: ProcessHook,
+        hook_generation: int,
         failure_hook: ProcessHook | None,
         *,
         worker_id: str,
@@ -184,6 +279,7 @@ class _TerminatedConnection:
     ) -> None:
         self._connection = connection
         self._hook = hook
+        self._hook_generation = hook_generation
         self._failure_hook = failure_hook
         self._worker_id = worker_id
         self._backend_pid = backend_pid
@@ -193,6 +289,7 @@ class _TerminatedConnection:
         if self._first_execute:
             self._first_execute = False
             self._hook.block_consumed(
+                self._hook_generation,
                 {
                     "point": "db.connection.open",
                     "worker": self._worker_id,
@@ -245,7 +342,8 @@ class P5ProofRunStore:
         def connect_with_optional_fault() -> Any:
             connection = original()
             hook = self.hooks.hooks.get("db.connection.open")
-            if hook is None or not hook.consume():
+            generation = hook.consume() if hook is not None else None
+            if hook is None or generation is None:
                 return connection
             row = connection.execute("SELECT pg_backend_pid() AS pid").fetchone()
             if row is None:
@@ -254,6 +352,7 @@ class P5ProofRunStore:
             return _TerminatedConnection(
                 connection,
                 hook,
+                generation,
                 self.hooks.hooks.get("db.connection.failed"),
                 worker_id=self.worker_id,
                 backend_pid=int(row["pid"]),
@@ -266,6 +365,20 @@ class P5ProofRunStore:
         return self._delegate.lease_operation_timeout_seconds
 
     def claim_next_run(
+        self,
+        *,
+        owner_id: str,
+        lease_duration_seconds: int,
+        reconciliation_pending_code: str | None = None,
+    ) -> RunLeaseClaim | None:
+        with self.hooks.claim_cycle:
+            return self._claim_next_run_in_cycle(
+                owner_id=owner_id,
+                lease_duration_seconds=lease_duration_seconds,
+                reconciliation_pending_code=reconciliation_pending_code,
+            )
+
+    def _claim_next_run_in_cycle(
         self,
         *,
         owner_id: str,
@@ -682,6 +795,7 @@ def run_p5_worker(
 
     manager: RuntimeManager | None = None
     previous_thread_excepthook = threading.excepthook
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
     def report_thread_failure(args: threading.ExceptHookArgs) -> None:
         failures.put(
@@ -752,5 +866,6 @@ def run_p5_worker(
     finally:
         if manager is not None:
             manager.stop()
+        faulthandler.unregister(signal.SIGUSR1)
         threading.excepthook = previous_thread_excepthook
         time.sleep(0.01)
