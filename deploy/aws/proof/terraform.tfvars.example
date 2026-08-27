@@ -14,6 +14,7 @@ budget_alert_email = "owner@example.com"
 
 # These are consequential lifecycle choices, not environment defaults.
 skip_final_snapshot                 = true
+final_snapshot_identifier           = null
 runtime_secret_recovery_window_days = 7
 
 # Safe until the DSN is seeded and bootstrap/readiness gates have passed.

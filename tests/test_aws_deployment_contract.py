@@ -47,7 +47,9 @@ def test_offline_plan_uses_mock_provider_and_fail_closed_controls() -> None:
     assert 'command = plan' in proof
     assert "unseeded_secret_blocks_runtime_start" in proof
     assert "short_ecs_stop_budget_is_rejected" in proof
+    assert "retained_rds_snapshot_requires_unique_name" in proof
     assert proof.count("expect_failures = [aws_ecs_service.runtime]") == 2
+    assert proof.count("expect_failures = [aws_db_instance.runtime]") == 1
 
 
 def test_application_and_bootstrap_tasks_keep_separate_roles() -> None:

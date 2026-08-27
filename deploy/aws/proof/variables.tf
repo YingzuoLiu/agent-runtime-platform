@@ -173,6 +173,21 @@ variable "skip_final_snapshot" {
   type        = bool
 }
 
+variable "final_snapshot_identifier" {
+  description = "Explicit unique RDS final-snapshot name when skip_final_snapshot is false."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.final_snapshot_identifier == null ||
+      can(regex("^[a-z][a-z0-9-]{2,62}$", var.final_snapshot_identifier))
+    )
+    error_message = "final_snapshot_identifier must be null or a 3-63 character lowercase RDS identifier."
+  }
+}
+
 variable "runtime_secret_recovery_window_days" {
   description = "Explicit Secrets Manager deletion recovery window; use 0 only when immediate proof teardown is approved."
   type        = number

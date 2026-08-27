@@ -56,6 +56,7 @@ output "p6c_authorization_gate" {
     monthly_budget_usd                  = var.monthly_budget_usd
     service_desired_count               = var.service_desired_count
     skip_final_snapshot                 = var.skip_final_snapshot
+    final_snapshot_identifier           = var.final_snapshot_identifier
     rds_deletion_protection             = var.rds_deletion_protection
     runtime_secret_recovery_window_days = var.runtime_secret_recovery_window_days
   }

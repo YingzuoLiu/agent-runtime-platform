@@ -37,7 +37,7 @@ resource "aws_db_instance" "runtime" {
   copy_tags_to_snapshot      = true
   deletion_protection        = var.rds_deletion_protection
   skip_final_snapshot        = var.skip_final_snapshot
-  final_snapshot_identifier  = var.skip_final_snapshot ? null : "${local.name}-final"
+  final_snapshot_identifier  = var.skip_final_snapshot ? null : var.final_snapshot_identifier
 
   enabled_cloudwatch_logs_exports = ["postgresql"]
   performance_insights_enabled    = false
@@ -47,6 +47,11 @@ resource "aws_db_instance" "runtime" {
     precondition {
       condition     = var.db_allocated_storage_gib == 20
       error_message = "The first P6 proof remains capped at 20 GiB; broaden only with a reviewed cost change."
+    }
+
+    precondition {
+      condition     = var.skip_final_snapshot || var.final_snapshot_identifier != null
+      error_message = "A unique final_snapshot_identifier is required when the final RDS snapshot is retained."
     }
   }
 }

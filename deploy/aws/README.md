@@ -36,7 +36,8 @@ The two Runtime subnets route to an Internet Gateway so Fargate can obtain an eg
 a NAT Gateway. `map_public_ip_on_launch=false` remains set at the subnet; the ECS service opts in per
 task. The Runtime security group has no ingress and only DNS, HTTPS, and PostgreSQL egress. The two
 database subnets have no Internet route, and RDS is not publicly accessible. There is no ALB or DNS
-record in this proof slice.
+record in this proof slice. Public IPv4 is still billable per running task; P6C must reread the
+[current VPC price](https://aws.amazon.com/vpc/pricing/) and include it in the time-bounded estimate.
 
 Two database subnets are required across distinct AZs, but the DB instance is deliberately
 `multi_az=false`. This is a cost-controlled correctness proof, not an HA claim.
@@ -109,7 +110,7 @@ set of inputs and consequences:
 | Image | Source commit, registry digest, scan result, and task-definition identity |
 | Cost | Current regional estimate, account-wide monthly budget, maximum environment lifetime |
 | Database | Exact PostgreSQL minor/class/storage, single-AZ limitation, backup days, deletion protection |
-| RDS deletion | Whether to skip or name/retain the final snapshot |
+| RDS deletion | Whether to skip or provide a unique name and retain the final snapshot |
 | Secret deletion | Immediate deletion or a 7–30 day recovery window |
 | State | Backend bucket/key, retention, evidence archive, and final version cleanup |
 | Teardown | Ordered command/plan, resources expected to remain, and residual-cost reread |

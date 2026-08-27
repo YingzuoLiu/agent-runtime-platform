@@ -211,3 +211,23 @@ run "short_ecs_stop_budget_is_rejected" {
 
   expect_failures = [aws_ecs_service.runtime]
 }
+
+run "retained_rds_snapshot_requires_unique_name" {
+  command = plan
+
+  variables {
+    aws_account_id                      = "123456789012"
+    aws_region                          = "us-east-1"
+    availability_zones                  = ["us-east-1a", "us-east-1b"]
+    owner                               = "offline-proof"
+    source_revision                     = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
+    image_digest                        = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+    postgres_engine_version             = "16.10"
+    skip_final_snapshot                 = false
+    runtime_secret_recovery_window_days = 7
+    monthly_budget_usd                  = 25
+    budget_alert_email                  = "owner@example.com"
+  }
+
+  expect_failures = [aws_db_instance.runtime]
+}

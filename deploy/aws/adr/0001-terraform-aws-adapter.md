@@ -48,7 +48,8 @@ a live AWS plan.
   proof explicitly non-HA.
 - RDS has no public route or address. Only the Runtime security group may reach TCP 5432.
 - Runtime tasks have no inbound rule. They use public IPv4 egress with bounded security-group
-  ports so the first proof avoids NAT Gateway, interface-endpoint, and ALB fixed charges.
+  ports so the first proof avoids NAT Gateway, interface-endpoint, and ALB fixed charges. Public
+  IPv4 remains a per-task hourly cost and is included in the P6C estimate.
 - The RDS parameter group forces TLS transport. CA and hostname verification remain a separate
   P6B.2 exact-image gate; `rds.force_ssl=1` alone is not claimed as `verify-full` evidence.
 - RDS manages its master password in Secrets Manager. Terraform creates the Runtime DSN secret
