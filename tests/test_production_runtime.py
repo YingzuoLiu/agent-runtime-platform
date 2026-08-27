@@ -510,6 +510,7 @@ def test_production_image_has_postgres_and_no_image_level_sqlite_authority() -> 
     assert 'CMD ["python", "-m", "runtime_service.serve"]' in dockerfile
     assert "RUNTIME_STORE_BACKEND: sqlite" in compose
     assert "RUNTIME_DB_PATH: /app/runtime_data/runtime.db" in compose
+    assert "RUNTIME_EXTERNAL_ACTION_MODE: enabled" in compose
 
 
 def test_production_image_default_environment_starts_postgres_app_without_provider(

@@ -133,8 +133,9 @@ database. ECS deployment health alone remains insufficient; the release gate mus
 then complete the authoritative PostgreSQL smoke transition.
 
 The local Compose demo remains unchanged at the product boundary: it explicitly overrides
-`RUNTIME_STORE_BACKEND=sqlite` and supplies `RUNTIME_DB_PATH=/app/runtime_data/runtime.db` plus
-`RUNTIME_DEMO_MODE=true` itself. Those values are not inherited by a proof deployment.
+`RUNTIME_STORE_BACKEND=sqlite` and `RUNTIME_EXTERNAL_ACTION_MODE=enabled`, then supplies
+`RUNTIME_DB_PATH=/app/runtime_data/runtime.db`, `RUNTIME_DEMO_MODE=true`, and its synthetic provider
+itself. Those values are not inherited by a proof deployment.
 
 ## Remaining P6B work
 
