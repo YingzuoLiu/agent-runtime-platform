@@ -23,6 +23,43 @@ jobs:
       - name: Credential-free Terraform format, validation, and mock plans
         run: bash deploy/aws/scripts/offline-check.sh
 
+  p6b2-exact-image-proof:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Exact-image PostgreSQL TLS and lifecycle proof
+        env:
+          P6B2_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python -u examples/p6b2_exact_image_proof.py
+      - name: Recheck bounded proof artifact
+        run: >-
+          python -c "import json, pathlib;
+          p=pathlib.Path('artifacts/p6b2-exact-image-proof.json');
+          data=json.loads(p.read_text());
+          assert data['proof']=='p6b2-exact-image-lifecycle:1';
+          assert data['summary']=={'failed': 0, 'passed': 8};
+          assert data['tls']['mode']=='verify-full';
+          assert data['tls']['wrong_hostname_rejected'] is True;
+          assert data['logs']['secret_canary_occurrences']==0"
+      - run: git diff --exit-code
+      - if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p6b2-exact-image-proof-${{ github.run_attempt }}
+          path: artifacts/p6b2-exact-image-proof.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Bounded container diagnostics
+        if: failure()
+        run: >-
+          docker ps -a
+          --format '{{.ID}} {{.Image}} {{.Status}} {{.Names}}'
+
   test:
     runs-on: ubuntu-latest
     strategy:
