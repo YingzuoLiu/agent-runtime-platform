@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 lockfile_mode="${TF_LOCKFILE_MODE:-update}"
+format_mode="${TF_FORMAT_MODE:-check}"
 
 unset AWS_ACCESS_KEY_ID
 unset AWS_SECRET_ACCESS_KEY
@@ -13,7 +14,11 @@ unset AWS_ROLE_ARN
 export AWS_EC2_METADATA_DISABLED=true
 export TF_IN_AUTOMATION=true
 
-terraform fmt -check -recursive "${repository_root}/deploy/aws"
+if [[ "${format_mode}" == "write" ]]; then
+  terraform fmt -recursive "${repository_root}/deploy/aws"
+else
+  terraform fmt -check -recursive "${repository_root}/deploy/aws"
+fi
 
 for stack in bootstrap proof; do
   stack_path="${repository_root}/deploy/aws/${stack}"

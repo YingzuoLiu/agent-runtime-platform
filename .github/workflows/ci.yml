@@ -12,6 +12,7 @@ jobs:
     env:
       AWS_EC2_METADATA_DISABLED: "true"
       TF_IN_AUTOMATION: "true"
+      TF_FORMAT_MODE: write
       TF_LOCKFILE_MODE: update
     steps:
       - uses: actions/checkout@v4
@@ -21,14 +22,19 @@ jobs:
           terraform_wrapper: false
       - name: Credential-free Terraform format, validation, and mock plans
         run: bash deploy/aws/scripts/offline-check.sh
-      - name: Capture provider locks for the first P6A review
+      - name: Capture formatted Terraform and provider locks for P6A review
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-provider-locks-${{ github.run_attempt }}
+          name: terraform-offline-worktree-${{ github.run_attempt }}
           path: |
-            deploy/aws/bootstrap/.terraform.lock.hcl
-            deploy/aws/proof/.terraform.lock.hcl
-          if-no-files-found: error
+            deploy/aws/**/*.tf
+            deploy/aws/**/*.tftest.hcl
+            deploy/aws/**/*.tfvars.example
+            deploy/aws/**/*.md
+            deploy/aws/**/*.sh
+            deploy/aws/**/.terraform.lock.hcl
+          if-no-files-found: warn
           retention-days: 7
 
   test:
