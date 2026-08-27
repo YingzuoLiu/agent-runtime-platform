@@ -1,14 +1,14 @@
 locals {
   runtime_subnets = {
     for index, az in var.availability_zones : az => {
-      cidr = var.runtime_subnet_cidrs[index]
+      cidr  = var.runtime_subnet_cidrs[index]
       index = index
     }
   }
 
   database_subnets = {
     for index, az in var.availability_zones : az => {
-      cidr = var.database_subnet_cidrs[index]
+      cidr  = var.database_subnet_cidrs[index]
       index = index
     }
   }

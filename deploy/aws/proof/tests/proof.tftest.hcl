@@ -32,14 +32,14 @@ run "offline_proof_topology" {
   command = plan
 
   variables {
-    aws_account_id                    = "123456789012"
-    aws_region                        = "us-east-1"
-    availability_zones                = ["us-east-1a", "us-east-1b"]
-    owner                              = "offline-proof"
-    source_revision                    = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
-    image_digest                       = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-    postgres_engine_version            = "16.10"
-    skip_final_snapshot                = true
+    aws_account_id                      = "123456789012"
+    aws_region                          = "us-east-1"
+    availability_zones                  = ["us-east-1a", "us-east-1b"]
+    owner                               = "offline-proof"
+    source_revision                     = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
+    image_digest                        = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    postgres_engine_version             = "16.10"
+    skip_final_snapshot                 = true
     runtime_secret_recovery_window_days = 7
     monthly_budget_usd                  = 25
     budget_alert_email                  = "owner@example.com"
@@ -159,14 +159,14 @@ run "unseeded_secret_blocks_runtime_start" {
   command = plan
 
   variables {
-    aws_account_id                    = "123456789012"
-    aws_region                        = "us-east-1"
-    availability_zones                = ["us-east-1a", "us-east-1b"]
-    owner                              = "offline-proof"
-    source_revision                    = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
-    image_digest                       = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    postgres_engine_version            = "16.10"
-    skip_final_snapshot                = true
+    aws_account_id                      = "123456789012"
+    aws_region                          = "us-east-1"
+    availability_zones                  = ["us-east-1a", "us-east-1b"]
+    owner                               = "offline-proof"
+    source_revision                     = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
+    image_digest                        = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    postgres_engine_version             = "16.10"
+    skip_final_snapshot                 = true
     runtime_secret_recovery_window_days = 7
     monthly_budget_usd                  = 25
     budget_alert_email                  = "owner@example.com"
@@ -181,14 +181,14 @@ run "short_ecs_stop_budget_is_rejected" {
   command = plan
 
   variables {
-    aws_account_id                    = "123456789012"
-    aws_region                        = "us-east-1"
-    availability_zones                = ["us-east-1a", "us-east-1b"]
-    owner                              = "offline-proof"
-    source_revision                    = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
-    image_digest                       = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
-    postgres_engine_version            = "16.10"
-    skip_final_snapshot                = true
+    aws_account_id                      = "123456789012"
+    aws_region                          = "us-east-1"
+    availability_zones                  = ["us-east-1a", "us-east-1b"]
+    owner                               = "offline-proof"
+    source_revision                     = "c9202b6b5bd1f98430b3a93e6945ba9d8bc51032"
+    image_digest                        = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    postgres_engine_version             = "16.10"
+    skip_final_snapshot                 = true
     runtime_secret_recovery_window_days = 7
     monthly_budget_usd                  = 25
     budget_alert_email                  = "owner@example.com"

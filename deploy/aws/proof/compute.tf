@@ -1,17 +1,17 @@
 locals {
   runtime_environment = [
     for name, value in {
-      RUNTIME_EXTERNAL_ACTION_MODE                 = "disabled"
-      RUNTIME_HTTP_CONCURRENCY_LIMIT               = tostring(var.runtime_http_concurrency_limit)
-      RUNTIME_IMAGE_DIGEST                         = var.image_digest
-      RUNTIME_LOG_LEVEL                            = "info"
-      RUNTIME_MANAGER_SHUTDOWN_GRACE_SECONDS       = tostring(var.manager_shutdown_grace_seconds)
-      RUNTIME_RELEASE_IDENTITY_REQUIRED             = "true"
-      RUNTIME_SERVER_GRACEFUL_SHUTDOWN_SECONDS     = tostring(var.server_shutdown_grace_seconds)
-      RUNTIME_SOURCE_REVISION                       = var.source_revision
-      RUNTIME_STORE_BACKEND                         = "postgres"
-      RUNTIME_WORKER_COUNT                          = tostring(var.runtime_worker_count)
-    } : {
+      RUNTIME_EXTERNAL_ACTION_MODE             = "disabled"
+      RUNTIME_HTTP_CONCURRENCY_LIMIT           = tostring(var.runtime_http_concurrency_limit)
+      RUNTIME_IMAGE_DIGEST                     = var.image_digest
+      RUNTIME_LOG_LEVEL                        = "info"
+      RUNTIME_MANAGER_SHUTDOWN_GRACE_SECONDS   = tostring(var.manager_shutdown_grace_seconds)
+      RUNTIME_RELEASE_IDENTITY_REQUIRED        = "true"
+      RUNTIME_SERVER_GRACEFUL_SHUTDOWN_SECONDS = tostring(var.server_shutdown_grace_seconds)
+      RUNTIME_SOURCE_REVISION                  = var.source_revision
+      RUNTIME_STORE_BACKEND                    = "postgres"
+      RUNTIME_WORKER_COUNT                     = tostring(var.runtime_worker_count)
+      } : {
       name  = name
       value = value
     }
@@ -127,8 +127,8 @@ resource "aws_ecs_task_definition" "bootstrap" {
         "--apply",
       ]
 
-      environment      = local.runtime_environment
-      secrets          = local.runtime_secrets
+      environment = local.runtime_environment
+      secrets     = local.runtime_secrets
       logConfiguration = merge(local.log_configuration, {
         options = merge(local.log_configuration.options, {
           awslogs-stream-prefix = "bootstrap"
@@ -139,11 +139,11 @@ resource "aws_ecs_task_definition" "bootstrap" {
 }
 
 resource "aws_ecs_service" "runtime" {
-  name            = local.name
-  cluster         = aws_ecs_cluster.runtime.id
-  task_definition = aws_ecs_task_definition.runtime.arn
-  desired_count   = var.service_desired_count
-  launch_type     = "FARGATE"
+  name             = local.name
+  cluster          = aws_ecs_cluster.runtime.id
+  task_definition  = aws_ecs_task_definition.runtime.arn
+  desired_count    = var.service_desired_count
+  launch_type      = "FARGATE"
   platform_version = var.fargate_platform_version
 
   enable_execute_command             = false

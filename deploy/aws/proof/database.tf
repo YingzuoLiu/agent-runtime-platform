@@ -33,11 +33,11 @@ resource "aws_db_instance" "runtime" {
   multi_az               = false
 
   auto_minor_version_upgrade = false
-  backup_retention_period   = var.db_backup_retention_days
-  copy_tags_to_snapshot     = true
-  deletion_protection      = var.rds_deletion_protection
-  skip_final_snapshot      = var.skip_final_snapshot
-  final_snapshot_identifier = var.skip_final_snapshot ? null : "${local.name}-final"
+  backup_retention_period    = var.db_backup_retention_days
+  copy_tags_to_snapshot      = true
+  deletion_protection        = var.rds_deletion_protection
+  skip_final_snapshot        = var.skip_final_snapshot
+  final_snapshot_identifier  = var.skip_final_snapshot ? null : "${local.name}-final"
 
   enabled_cloudwatch_logs_exports = ["postgresql"]
   performance_insights_enabled    = false
