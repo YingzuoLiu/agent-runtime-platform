@@ -136,9 +136,13 @@ identity/region reread
 ## Current limitations
 
 - No AWS API has been called and no price or regional engine availability has been asserted.
-- `rds.force_ssl=1` requires encrypted transport but is not proof of CA and hostname verification.
-- The example digest is a placeholder; P6B.2 must build and reread the exact image digest.
-- The empty service has no public ingress. P6B.2/P6C own ECS-local readiness and semantic probes.
+- `rds.force_ssl=1` requires encrypted transport but is not AWS evidence of CA and hostname
+  verification. P6B.2 qualifies the reusable `verify-full` negative-control harness; P6C must run
+  it against the selected ECR digest and RDS endpoint.
+- The example digest is a placeholder. P6C must build, push, and authoritatively reread the exact
+  ECR image digest before the proof plan may use it.
+- The empty service has no public ingress. P6C owns ECS-local readiness and semantic probes, using
+  the P6B.2 exact-image harness rather than a rebuilt or tag-only image.
 - Baseline JSON logs are routed to CloudWatch; W3C/OTLP export remains pending before P7 traffic.
 - GitHub OIDC and a bounded release role are described, but no CI release/apply workflow is enabled.
 - Heartbeat-renewal availability risk R14 is unchanged.

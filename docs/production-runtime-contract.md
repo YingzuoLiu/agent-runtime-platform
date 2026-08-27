@@ -139,7 +139,7 @@ itself. Those values are not inherited by a proof deployment.
 
 ## P6B.2 exact-image evidence
 
-[`p6b2-exact-image-proof.md`](p6b2-exact-image-proof.md) defines the next portable-image gate. It
+[`p6b2-exact-image-proof.md`](p6b2-exact-image-proof.md) defines the portable-image gate. It
 builds one candidate image, or consumes an already published digest-pinned image, and exercises it
 against PostgreSQL with CA/hostname verification, explicit bootstrap, two independent containers,
 cross-container durable transitions, JSON-log secret canaries, and bounded `SIGTERM` shutdown.

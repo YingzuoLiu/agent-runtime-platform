@@ -50,8 +50,9 @@ a live AWS plan.
 - Runtime tasks have no inbound rule. They use public IPv4 egress with bounded security-group
   ports so the first proof avoids NAT Gateway, interface-endpoint, and ALB fixed charges. Public
   IPv4 remains a per-task hourly cost and is included in the P6C estimate.
-- The RDS parameter group forces TLS transport. CA and hostname verification remain a separate
-  P6B.2 exact-image gate; `rds.force_ssl=1` alone is not claimed as `verify-full` evidence.
+- The RDS parameter group forces TLS transport. P6B.2 separately proves CA and hostname
+  verification with the exact-image harness; P6C must rerun that harness against the selected ECR
+  digest and RDS CA/hostname. `rds.force_ssl=1` alone is not claimed as `verify-full` evidence.
 - RDS manages its master password in Secrets Manager. Terraform creates the Runtime DSN secret
   container but never a secret version, because Terraform would otherwise retain plaintext in
   state. A versioned P6C bootstrap action seeds it before any Runtime task may start.
@@ -80,5 +81,7 @@ duplication.
   semantic smoke run as ECS-local proof actions until a later workload demonstrates an ingress need.
 - The bootstrap state bucket intentionally refuses recursive deletion. It is removed only after
   the proof stack, evidence, state versions, and retention choices are reconciled.
-- P6B.2 still owns exact-image PostgreSQL CA/hostname verification, independent container lifecycle,
-  JSON-log canaries, semantic smoke, and bounded SIGTERM evidence.
+- P6B.2 supplies the reusable exact-image PostgreSQL CA/hostname, independent-container,
+  JSON-canary, semantic-smoke, and bounded-SIGTERM harness. P6C must rerun it against the exact ECR
+  digest and AWS endpoints; the credential-free candidate-image result cannot substitute for that
+  provider acceptance.
