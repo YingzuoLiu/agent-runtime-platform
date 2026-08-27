@@ -12,6 +12,10 @@ from .deployment import (
     RuntimeDeploymentConfigurationError,
     resolve_runtime_deployment_config,
 )
+from .storage import (
+    RuntimeStorageConfigurationError,
+    resolve_runtime_storage_config,
+)
 from .structured_logging import uvicorn_json_log_config
 
 
@@ -36,7 +40,12 @@ def main(
     values = os.environ if environment is None else environment
     try:
         config = resolve_runtime_deployment_config(values)
-    except RuntimeDeploymentConfigurationError as exc:
+        if args.check:
+            resolve_runtime_storage_config(environment=values)
+    except (
+        RuntimeDeploymentConfigurationError,
+        RuntimeStorageConfigurationError,
+    ) as exc:
         print(
             json.dumps(
                 {"status": "failed", "error": str(exc)},

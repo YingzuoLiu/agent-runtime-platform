@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +28,11 @@ from runtime_service.external_actions import (
     ExternalActionRequest,
 )
 from runtime_service.serve import main as serve
+from runtime_service.storage import (
+    RuntimeStorageConfig,
+    build_runtime_store_bundle,
+    resolve_runtime_storage_config,
+)
 from runtime_service.structured_logging import (
     JsonLogFormatter,
     runtime_secret_redactions,
@@ -36,6 +43,23 @@ from runtime_service.workflow_store import SQLiteWorkflowStore
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_REVISION = "a" * 40
 IMAGE_DIGEST = f"sha256:{'b' * 64}"
+
+
+def _dockerfile_environment_defaults() -> dict[str, str]:
+    logical_lines = (ROOT / "Dockerfile").read_text(encoding="utf-8").replace(
+        "\\\n", " "
+    )
+    defaults: dict[str, str] = {}
+    for line in logical_lines.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("ENV "):
+            continue
+        for assignment in shlex.split(stripped.removeprefix("ENV ")):
+            name, separator, value = assignment.partition("=")
+            if not separator:
+                raise AssertionError(f"unsupported Dockerfile ENV syntax: {line}")
+            defaults[name] = value
+    return defaults
 
 
 def test_default_deployment_config_is_bounded_and_cloud_neutral() -> None:
@@ -405,6 +429,7 @@ def test_server_check_is_non_mutating_json_and_credential_clean(
         serve(
             ["--check"],
             environment={
+                "RUNTIME_STORE_BACKEND": "postgres",
                 "RUNTIME_POSTGRES_DSN": postgres_dsn,
                 "RUNTIME_EXTERNAL_ACTION_MODE": "disabled",
                 "RUNTIME_SOURCE_REVISION": SOURCE_REVISION,
@@ -424,6 +449,28 @@ def test_server_check_is_non_mutating_json_and_credential_clean(
     }
     assert postgres_dsn not in output
     assert "check-secret" not in output
+
+
+def test_server_check_rejects_postgres_without_dsn_without_connecting(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        serve(
+            ["--check"],
+            environment={
+                "RUNTIME_STORE_BACKEND": "postgres",
+                "RUNTIME_EXTERNAL_ACTION_MODE": "disabled",
+            },
+        )
+        == 2
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "failed",
+        "error": "RUNTIME_POSTGRES_DSN is required when PostgreSQL storage is selected",
+    }
 
 
 def test_server_check_reports_value_free_json_on_invalid_configuration(
@@ -456,9 +503,48 @@ def test_production_image_has_postgres_and_no_image_level_sqlite_authority() -> 
     assert "requirements.txt requirements-postgres.txt" in dockerfile
     assert "-r requirements.txt -r requirements-postgres.txt" in dockerfile
     assert "RUNTIME_STORE_BACKEND=postgres" in dockerfile
+    assert "RUNTIME_EXTERNAL_ACTION_MODE=disabled" in dockerfile
     assert "RUNTIME_DB_PATH=" not in dockerfile
     assert "STOPSIGNAL SIGTERM" in dockerfile
     assert "http://127.0.0.1:8000/health" in dockerfile
     assert 'CMD ["python", "-m", "runtime_service.serve"]' in dockerfile
     assert "RUNTIME_STORE_BACKEND: sqlite" in compose
     assert "RUNTIME_DB_PATH: /app/runtime_data/runtime.db" in compose
+
+
+def test_production_image_default_environment_starts_postgres_app_without_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in tuple(os.environ):
+        if name.startswith("RUNTIME_"):
+            monkeypatch.delenv(name)
+    image_environment = _dockerfile_environment_defaults()
+    for name, value in image_environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(
+        "RUNTIME_POSTGRES_DSN",
+        "postgresql://runtime:image-default-proof@database.example/runtime",
+    )
+
+    sqlite_bundle = build_runtime_store_bundle(
+        resolve_runtime_storage_config(
+            backend="sqlite",
+            database_path=tmp_path / "runtime.db",
+            environment={},
+        )
+    )
+    observed_storage: list[RuntimeStorageConfig] = []
+
+    def fake_store_bundle(config: RuntimeStorageConfig):
+        observed_storage.append(config)
+        return sqlite_bundle
+
+    monkeypatch.setattr("api.main.build_runtime_store_bundle", fake_store_bundle)
+
+    app = create_app()
+    with TestClient(app) as client:
+        assert client.get("/health").json() == {"status": "ok"}
+
+    assert [config.backend for config in observed_storage] == ["postgres"]
+    assert isinstance(app.state.travel_action_provider, DisabledExternalActionProvider)

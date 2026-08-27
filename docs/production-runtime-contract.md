@@ -43,17 +43,23 @@ The portable entrypoint also enforces:
 | `RUNTIME_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error`, or `critical` |
 | `RUNTIME_EXTERNAL_ACTION_MODE` | `enabled` | `enabled` or `disabled` |
 
-Validate this process configuration without binding a port or starting application work:
+These are resolver defaults. The production image deliberately overrides the external-action mode
+to `disabled`; deployments that intentionally configure a real provider must opt back into
+`enabled`.
+
+Validate this process and storage configuration without binding a port, connecting to the
+database, or starting application work:
 
 ```bash
 python -m runtime_service.serve --check
 ```
 
-The command emits one credential-clean JSON object containing only these bounded values and the
-optional release identity. PostgreSQL catalog inspection remains the separate, read-only
-`python -m runtime_service.postgres_bootstrap --dry-run` authority.
-Invalid process configuration emits one value-free JSON failure on stderr and exits `2` before
-binding a port or importing the application.
+The command emits one credential-clean JSON object containing only the bounded process values and
+the optional release identity. It resolves the selected storage backend and rejects missing or
+mixed settings without rendering the DSN. PostgreSQL catalog inspection remains the separate,
+read-only `python -m runtime_service.postgres_bootstrap --dry-run` authority.
+Invalid process or storage configuration emits one value-free JSON failure on stderr and exits `2`
+before binding a port or importing the application.
 
 The eventual ECS `stopTimeout` must exceed the configured server graceful-shutdown budget. P6 uses
 an explicit `SIGTERM` stop signal; `tini` forwards it, Uvicorn stops HTTP admission, and the
@@ -112,8 +118,10 @@ the application contract.
 The production image:
 
 - installs both base and PostgreSQL requirements;
-- selects `RUNTIME_STORE_BACKEND=postgres` and has no image-level `RUNTIME_DB_PATH`, so a missing
-  PostgreSQL DSN fails startup instead of silently creating container-local SQLite authority;
+- selects `RUNTIME_STORE_BACKEND=postgres`, defaults
+  `RUNTIME_EXTERNAL_ACTION_MODE=disabled`, and has no image-level `RUNTIME_DB_PATH`, so a missing
+  PostgreSQL DSN fails startup instead of silently creating container-local SQLite authority and
+  a provider-free proof deployment starts with external writes fail-closed;
 - runs as UID `10001` behind `tini`;
 - declares `SIGTERM` explicitly;
 - uses `/health` for container liveness while deployment and semantic gates call `/ready`;
