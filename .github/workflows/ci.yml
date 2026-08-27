@@ -6,6 +6,31 @@ on:
   pull_request:
 
 jobs:
+  terraform-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      TF_IN_AUTOMATION: "true"
+      TF_LOCKFILE_MODE: update
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.1
+          terraform_wrapper: false
+      - name: Credential-free Terraform format, validation, and mock plans
+        run: bash deploy/aws/scripts/offline-check.sh
+      - name: Capture provider locks for the first P6A review
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-provider-locks-${{ github.run_attempt }}
+          path: |
+            deploy/aws/bootstrap/.terraform.lock.hcl
+            deploy/aws/proof/.terraform.lock.hcl
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     runs-on: ubuntu-latest
     strategy:
