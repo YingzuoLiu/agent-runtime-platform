@@ -98,6 +98,30 @@ class ExternalActionProvider(Protocol):
         ...
 
 
+class DisabledExternalActionProvider:
+    """Explicit fail-closed adapter for deployments that permit no external writes."""
+
+    supports_idempotency = False
+
+    def __init__(self, provider_identity: str = "external-actions-disabled") -> None:
+        if (
+            not provider_identity
+            or len(provider_identity) > 200
+            or provider_identity != provider_identity.strip()
+        ):
+            raise ValueError(
+                "provider_identity must be a non-empty string of at most 200 characters"
+            )
+        self._provider_identity = provider_identity
+
+    @property
+    def provider_identity(self) -> str:
+        return self._provider_identity
+
+    def execute(self, _request: ExternalActionRequest) -> ExternalActionProviderResult:
+        raise DefinitiveExternalActionError()
+
+
 class ExternalActionProviderRegistry:
     """Explicit allowlist of server-owned external action providers."""
 

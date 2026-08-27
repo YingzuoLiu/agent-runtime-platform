@@ -40,7 +40,9 @@ services:
         condition: service_healthy
     network_mode: service:demo-provider
     environment:
+      RUNTIME_STORE_BACKEND: sqlite
       RUNTIME_DB_PATH: /app/runtime_data/runtime.db
+      RUNTIME_EXTERNAL_ACTION_MODE: enabled
       RUNTIME_WORKER_COUNT: "1"
       RUNTIME_PLANNER_PROVIDER: scripted
       RUNTIME_DEMO_MODE: "true"
