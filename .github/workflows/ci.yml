@@ -12,8 +12,8 @@ jobs:
     env:
       AWS_EC2_METADATA_DISABLED: "true"
       TF_IN_AUTOMATION: "true"
-      TF_FORMAT_MODE: write
-      TF_LOCKFILE_MODE: update
+      TF_FORMAT_MODE: check
+      TF_LOCKFILE_MODE: readonly
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -22,21 +22,6 @@ jobs:
           terraform_wrapper: false
       - name: Credential-free Terraform format, validation, and mock plans
         run: bash deploy/aws/scripts/offline-check.sh
-      - name: Capture formatted Terraform and provider locks for P6A review
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-offline-worktree-${{ github.run_attempt }}
-          path: |
-            deploy/aws/**/*.tf
-            deploy/aws/**/*.tftest.hcl
-            deploy/aws/**/*.tfvars.example
-            deploy/aws/**/*.md
-            deploy/aws/**/*.sh
-            deploy/aws/**/.terraform.lock.hcl
-          if-no-files-found: warn
-          include-hidden-files: true
-          retention-days: 7
 
   test:
     runs-on: ubuntu-latest

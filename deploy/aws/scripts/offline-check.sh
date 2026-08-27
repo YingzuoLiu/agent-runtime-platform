@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-lockfile_mode="${TF_LOCKFILE_MODE:-update}"
+lockfile_mode="${TF_LOCKFILE_MODE:-readonly}"
 format_mode="${TF_FORMAT_MODE:-check}"
 
 unset AWS_ACCESS_KEY_ID
@@ -29,3 +29,5 @@ for stack in bootstrap proof; do
   terraform -chdir="${stack_path}" validate -no-color
   terraform -chdir="${stack_path}" test -no-color
 done
+
+git -C "${repository_root}" diff --exit-code -- deploy/aws
