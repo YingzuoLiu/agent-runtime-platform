@@ -26,6 +26,20 @@ mock_provider "aws" {
       arn = "arn:aws:iam::123456789012:role/offline-proof-role"
     }
   }
+
+  override_resource {
+    target = aws_security_group.runtime
+    values = {
+      id = "sg-11111111111111111"
+    }
+  }
+
+  override_resource {
+    target = aws_security_group.database
+    values = {
+      id = "sg-22222222222222222"
+    }
+  }
 }
 
 run "offline_proof_topology" {
