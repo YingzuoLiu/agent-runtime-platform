@@ -628,11 +628,14 @@ def run_proof(environment: Mapping[str, str] | None = None) -> dict[str, Any]:
                 check=False,
             )
             negative_text = negative.stdout + negative.stderr
-            _require(negative.returncode != 0, "wrong TLS hostname was accepted")
+            negative_result = _json_object(negative.stdout)
             _require(
-                "certificate" in negative_text.lower()
-                or "host name" in negative_text.lower(),
-                "wrong-host control failed without certificate evidence",
+                negative.returncode == 0
+                and negative_result.get("status") == "ok"
+                and negative_result.get("result") == "tls_hostname_rejected"
+                and negative_result.get("sslmode") == "verify-full"
+                and negative_result.get("target") == "postgres-wrong-host",
+                "wrong-host control did not prove a TLS hostname rejection",
             )
 
             _run(

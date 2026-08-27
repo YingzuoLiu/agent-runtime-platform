@@ -48,8 +48,7 @@ services:
     command:
       - python
       - -m
-      - runtime_service.postgres_bootstrap
-      - --dry-run
+      - examples.p6b2_tls_negative_control
     environment:
       RUNTIME_STORE_BACKEND: postgres
       RUNTIME_POSTGRES_DSN: >-

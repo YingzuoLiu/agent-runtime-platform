@@ -31,7 +31,9 @@ build a local candidate image, or consume a registry image already pinned as
 - A private proof CA and a server certificate with only `DNS:postgres-tls` make hostname
   authentication observable.
 - A second DNS alias, `postgres-wrong-host`, is the negative control. The same CA trusts the
-  certificate, but `sslmode=verify-full` must reject the wrong name before schema work.
+  certificate, but `sslmode=verify-full` must reject the wrong name before schema work. A helper
+  inside the exact image classifies the libpq failure and emits only bounded JSON; raw connection
+  errors and the DSN are never retained as evidence.
 - The one-shot bootstrap container uses the production image and must finish successfully before
   either Runtime starts.
 - Runtime A and Runtime B are distinct containers with no shared application volume. Both use the

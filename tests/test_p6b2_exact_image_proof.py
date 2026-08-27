@@ -16,6 +16,7 @@ from examples.p6b2_exact_image_proof import (
     shutdown_evidence,
     validate_readiness,
 )
+from examples.p6b2_tls_negative_control import classify_tls_failure
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,19 @@ def test_proof_environment_removes_ambient_aws_credentials() -> None:
         "PATH": "/proof/bin",
         "AWS_EC2_METADATA_DISABLED": "true",
     }
+
+
+def test_tls_negative_control_reduces_only_hostname_mismatch_to_safe_evidence() -> None:
+    message = (
+        'connection failed: server certificate for "postgres-tls" '
+        'does not match host name "postgres-wrong-host"'
+    )
+
+    assert classify_tls_failure(message) == "tls_hostname_rejected"
+    assert (
+        classify_tls_failure("connection refused before certificate negotiation")
+        == "unexpected_connection_failure"
+    )
 
 
 def test_readiness_binds_postgres_schema_and_exact_release_identity() -> None:
@@ -138,6 +152,7 @@ def test_compose_proves_verify_full_bootstrap_and_two_independent_runtimes() -> 
 
     assert compose.count("sslmode=verify-full") == 4
     assert "postgres-wrong-host" in compose
+    assert "examples.p6b2_tls_negative_control" in compose
     assert "condition: service_healthy" in compose
     assert "condition: service_completed_successfully" in compose
     assert "runtime-a:" in compose
