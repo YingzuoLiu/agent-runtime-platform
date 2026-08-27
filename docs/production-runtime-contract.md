@@ -137,12 +137,16 @@ The local Compose demo remains unchanged at the product boundary: it explicitly 
 `RUNTIME_DB_PATH=/app/runtime_data/runtime.db`, `RUNTIME_DEMO_MODE=true`, and its synthetic provider
 itself. Those values are not inherited by a proof deployment.
 
-## Remaining P6B work
+## P6B.2 exact-image evidence
 
-This slice does not claim the complete P6 deployment gate. The next portable-image proof must still
-exercise the exact image against PostgreSQL with CA/hostname verification, explicit bootstrap,
-two independent containers, a durable semantic transition, JSON-log secret canaries, and bounded
-`SIGTERM` shutdown. Optional W3C/OTLP telemetry is also still required before real P7 traffic.
+[`p6b2-exact-image-proof.md`](p6b2-exact-image-proof.md) defines the portable-image gate. It
+builds one candidate image, or consumes an already published digest-pinned image, and exercises it
+against PostgreSQL with CA/hostname verification, explicit bootstrap, two independent containers,
+cross-container durable transitions, JSON-log secret canaries, and bounded `SIGTERM` shutdown.
+
+The credential-free CI run qualifies the harness and its candidate digest. P6C must run the same
+harness against the exact ECR `repository@digest` selected for ECS; rebuilding something similar is
+not equivalent evidence. Optional W3C/OTLP telemetry is still required before real P7 traffic.
 
 Heartbeat renewal risk R14 remains unchanged. A transient renewal exception is fail-safe but can
 abandon an attempt until its lease expires. Any retry policy needs a dedicated remaining-window

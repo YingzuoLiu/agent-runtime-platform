@@ -99,10 +99,11 @@ reverse imports from deployment code, and provider-specific authority markers. U
 the scanner rejects representative static, dynamic-import, metadata, queue-authority, and
 provider-only authentication examples.
 
-This static tripwire is necessary but not sufficient. P6 application hardening must also run the
-exact production OCI image against ordinary PostgreSQL without cloud credentials or metadata and
-prove bootstrap, readiness, a durable semantic transition, JSON logs, and `SIGTERM` behavior. AWS
-acceptance must reuse that exact image digest.
+This static tripwire is necessary but not sufficient. The
+[`P6B.2 exact-image proof`](p6b2-exact-image-proof.md) runs the production OCI image against ordinary
+PostgreSQL without cloud credentials or metadata and proves bootstrap, readiness, durable
+cross-container transitions, JSON logs, and `SIGTERM` behavior. AWS acceptance must rerun that
+harness against the exact digest-pinned ECR image selected for ECS.
 
 The process and image half of this boundary is specified in
 [`production-runtime-contract.md`](production-runtime-contract.md).

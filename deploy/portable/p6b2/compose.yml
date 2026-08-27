@@ -1,0 +1,165 @@
+services:
+  postgres-tls:
+    image: postgres:16
+    user: "0:0"
+    entrypoint:
+      - /bin/bash
+      - -euc
+      - |
+        install -o postgres -g postgres -m 0600 /proof-tls/server.key /tmp/p6b2-server.key
+        install -o postgres -g postgres -m 0644 /proof-tls/server.crt /tmp/p6b2-server.crt
+        exec gosu postgres docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/tmp/p6b2-server.crt \
+          -c ssl_key_file=/tmp/p6b2-server.key \
+          -c log_connections=on \
+          -c log_disconnections=on \
+          -c "log_line_prefix=%m [%p] %q%u@%d app=%a "
+    environment:
+      POSTGRES_DB: runtime
+      POSTGRES_USER: runtime
+      POSTGRES_PASSWORD: ${P6B2_DB_PASSWORD:?P6B2_DB_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - ${P6B2_TLS_DIR:?P6B2_TLS_DIR is required}:/proof-tls:ro
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      proof:
+        aliases:
+          - postgres-tls
+          - postgres-wrong-host
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U runtime -d runtime
+      interval: 2s
+      timeout: 3s
+      start_period: 3s
+      retries: 30
+
+  tls-negative-control:
+    profiles: [negative-control]
+    image: ${P6B2_IMAGE_REF:?P6B2_IMAGE_REF is required}
+    pull_policy: never
+    depends_on:
+      postgres-tls:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - examples.p6b2_tls_negative_control
+    environment:
+      RUNTIME_STORE_BACKEND: postgres
+      RUNTIME_POSTGRES_DSN: >-
+        postgresql://runtime:${P6B2_DB_PASSWORD}@postgres-wrong-host:5432/runtime?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt&application_name=p6b2-negative-control
+      RUNTIME_EXTERNAL_ACTION_MODE: disabled
+    volumes:
+      - ${P6B2_TLS_DIR}/ca.crt:/run/secrets/postgres-ca.crt:ro
+    networks: [proof]
+    restart: "no"
+
+  bootstrap:
+    image: ${P6B2_IMAGE_REF:?P6B2_IMAGE_REF is required}
+    pull_policy: never
+    depends_on:
+      postgres-tls:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - runtime_service.postgres_bootstrap
+      - --apply
+    environment:
+      RUNTIME_STORE_BACKEND: postgres
+      RUNTIME_POSTGRES_DSN: >-
+        postgresql://runtime:${P6B2_DB_PASSWORD}@postgres-tls:5432/runtime?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt&application_name=p6b2-bootstrap
+      RUNTIME_EXTERNAL_ACTION_MODE: disabled
+    volumes:
+      - ${P6B2_TLS_DIR}/ca.crt:/run/secrets/postgres-ca.crt:ro
+    networks: [proof]
+    restart: "no"
+
+  runtime-a:
+    image: ${P6B2_IMAGE_REF:?P6B2_IMAGE_REF is required}
+    pull_policy: never
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      RUNTIME_STORE_BACKEND: postgres
+      RUNTIME_POSTGRES_DSN: >-
+        postgresql://runtime:${P6B2_DB_PASSWORD}@postgres-tls:5432/runtime?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt&application_name=p6b2-runtime-a
+      RUNTIME_EXTERNAL_ACTION_MODE: disabled
+      RUNTIME_API_KEYS_JSON: >-
+        [{"credential_id":"p6b2-proof","api_key":"${P6B2_API_KEY}","tenant_id":"p6b2-tenant","subject_id":"p6b2-operator","role":"operator"}]
+      RUNTIME_WORKER_COUNT: "1"
+      RUNTIME_HTTP_CONCURRENCY_LIMIT: "32"
+      RUNTIME_MANAGER_SHUTDOWN_GRACE_SECONDS: "5"
+      RUNTIME_SERVER_GRACEFUL_SHUTDOWN_SECONDS: "15"
+      RUNTIME_RELEASE_IDENTITY_REQUIRED: "true"
+      RUNTIME_SOURCE_REVISION: ${P6B2_SOURCE_REVISION:?P6B2_SOURCE_REVISION is required}
+      RUNTIME_IMAGE_DIGEST: ${P6B2_IMAGE_DIGEST:?P6B2_IMAGE_DIGEST is required}
+    volumes:
+      - ${P6B2_TLS_DIR}/ca.crt:/run/secrets/postgres-ca.crt:ro
+    networks: [proof]
+    ports:
+      - 127.0.0.1::8000
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      start_period: 5s
+      retries: 30
+
+  runtime-b:
+    image: ${P6B2_IMAGE_REF:?P6B2_IMAGE_REF is required}
+    pull_policy: never
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      RUNTIME_STORE_BACKEND: postgres
+      RUNTIME_POSTGRES_DSN: >-
+        postgresql://runtime:${P6B2_DB_PASSWORD}@postgres-tls:5432/runtime?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt&application_name=p6b2-runtime-b
+      RUNTIME_EXTERNAL_ACTION_MODE: disabled
+      RUNTIME_API_KEYS_JSON: >-
+        [{"credential_id":"p6b2-proof","api_key":"${P6B2_API_KEY}","tenant_id":"p6b2-tenant","subject_id":"p6b2-operator","role":"operator"}]
+      RUNTIME_WORKER_COUNT: "1"
+      RUNTIME_HTTP_CONCURRENCY_LIMIT: "32"
+      RUNTIME_MANAGER_SHUTDOWN_GRACE_SECONDS: "5"
+      RUNTIME_SERVER_GRACEFUL_SHUTDOWN_SECONDS: "15"
+      RUNTIME_RELEASE_IDENTITY_REQUIRED: "true"
+      RUNTIME_SOURCE_REVISION: ${P6B2_SOURCE_REVISION:?P6B2_SOURCE_REVISION is required}
+      RUNTIME_IMAGE_DIGEST: ${P6B2_IMAGE_DIGEST:?P6B2_IMAGE_DIGEST is required}
+    volumes:
+      - ${P6B2_TLS_DIR}/ca.crt:/run/secrets/postgres-ca.crt:ro
+    networks: [proof]
+    ports:
+      - 127.0.0.1::8000
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      start_period: 5s
+      retries: 30
+
+networks:
+  proof:
+
+volumes:
+  postgres-data:
