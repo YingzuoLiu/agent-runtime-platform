@@ -1,0 +1,22 @@
+aws_account_id    = "123456789012"
+aws_region        = "us-east-1"
+availability_zones = ["us-east-1a", "us-east-1b"]
+owner             = "repository-owner"
+
+source_revision = "0000000000000000000000000000000000000000"
+image_digest    = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Recheck the exact version in the selected region immediately before P6C plan.
+postgres_engine_version = "16.10"
+
+monthly_budget_usd = 25
+budget_alert_email = "owner@example.com"
+
+# These are consequential lifecycle choices, not environment defaults.
+skip_final_snapshot                 = true
+final_snapshot_identifier           = null
+runtime_secret_recovery_window_days = 7
+
+# Safe until the DSN is seeded and bootstrap/readiness gates have passed.
+runtime_secret_is_seeded = false
+service_desired_count    = 0

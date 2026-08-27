@@ -6,3 +6,15 @@ __pycache__/
 .DS_Store
 traces/*.tmp
 artifacts/
+
+# Terraform provider caches, local state, and reviewed binary plans are never
+# source artifacts. Dependency lock files remain committed beside each root.
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+deploy/aws/proof/backend.hcl
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example

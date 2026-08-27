@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  terraform-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      TF_IN_AUTOMATION: "true"
+      TF_FORMAT_MODE: check
+      TF_LOCKFILE_MODE: readonly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.1
+          terraform_wrapper: false
+      - name: Credential-free Terraform format, validation, and mock plans
+        run: bash deploy/aws/scripts/offline-check.sh
+
   test:
     runs-on: ubuntu-latest
     strategy:
