@@ -1,5 +1,10 @@
 # Cloud Runtime Upgrade
 
+> **Capability-milestone record:** this document describes the earlier Phase 3-7D evolution and
+> remains useful for architecture and API history. It is not the current deployment authority.
+> Start with the [documentation index](README.md), the
+> [production runtime contract](production-runtime-contract.md), and the P5/P6 proof documents.
+
 Version `0.3.0` adds a self-hosted execution-management layer around the Travel application
 runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version
 `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains.
@@ -425,15 +430,17 @@ security, post-dispatch drift, and unrecoverable evidence-mirror gaps.
 
 ## Deliberate limitations
 
-SQLite, durable polling, and an in-process wake signal keep the repository runnable without external services. The
-supplied Compose configuration is the loopback-only local demo. A normal container invocation
-remains fail-closed and requires configured credentials. The Kubernetes Deployment reads
-`RUNTIME_API_KEYS_JSON` from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and
-rotation of that Secret are intentionally outside this slice. Therefore:
+At this capability milestone, SQLite, durable polling, and an in-process wake signal kept the
+repository runnable without external services. The supplied Compose configuration remains the
+loopback-only local demo, and a normal container invocation remains fail-closed without configured
+credentials. An earlier single-replica Kubernetes example has since been withdrawn because it
+conflicted with the PostgreSQL-authoritative production image. See the
+[current deployment boundary](current-scope-and-limitations.md#deployment-support).
 
-- deploy one runtime replica only;
-- Run leasing and fencing are proven only for Managers sharing one local SQLite database, not for
-  multi-host workers or a distributed database;
+Subsequent P4/P5 work extended lease and fencing evidence to independent workers sharing one
+PostgreSQL authority. It still does not certify a deployed multi-host or highly available service.
+The remaining capability limitations include:
+
 - cancellation occurs at cooperative execution boundaries;
 - authentication and two-role authorization use local static API-key configuration; there is no
   custom role model, per-tool grant, quota, key rotation, or external secret-manager integration;
@@ -441,16 +448,16 @@ rotation of that Secret are intentionally outside this slice. Therefore:
   no live booking, payment, or inventory integration and no claim of an official vendor sandbox;
 - there is no exactly-once guarantee, compensation/rollback workflow, human approval, or
   automated reconciliation for `outcome_unknown` actions;
-- external dispatch has no distributed queue and remains single-replica SQLite coordination;
+- external dispatch has no distributed queue; cross-process progress comes from bounded polling
+  and leases;
 - the subprocess sandbox does not isolate host networking or the complete host filesystem;
 - POSIX rlimits are not available on Windows, where timeout and process separation remain but resource enforcement is weaker;
 - there is no arbitrary user-code execution endpoint;
 - descendant reaping depends on `tini` in the provided container image or an equivalent host init/service manager.
 
-A production-oriented next step is PostgreSQL for runs/checkpoints/events/memories/actions while
-preserving the existing lease-token predicates, Redis or Pub/Sub as a wake channel,
-provider-specific reconciliation and compensation, OpenTelemetry traces, and a container-backed
-sandbox implementation.
+PostgreSQL authority and independent-worker recovery were added later; provider-specific
+reconciliation, production telemetry, stronger sandbox isolation, and deployed HA evidence remain
+outside the accepted boundary.
 
 The first lease-aware rollout must stop and verify all pre-leasing Runtime processes before the
 additive migration, then start only lease-aware binaries. Mixed old/new execution and mixed-version

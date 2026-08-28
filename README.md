@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/YingzuoLiu/agent-runtime-platform/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)
-![Status](https://img.shields.io/badge/status-Phase%207D%20complete-2ea44f)
+![Status](https://img.shields.io/badge/status-P6B.2%20verified-2ea44f)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Many Agent projects focus on deciding what the Agent should do next. This project focuses on what
@@ -15,10 +15,40 @@ validation, and evidence of what actually happened.
 Travel is the main reference application, not the product boundary. A separate
 `release-validation` domain exercises the same runtime through a deterministic DAG and selective
 replay. Trusted deployment-time extensions can register additional typed domains without editing
-Runtime Core; Phase 7C includes an opt-in synthetic incident-triage proof.
-Phase 7D adds a narrow durable Action gateway so existing Agents and scripts can delegate an
-allowlisted side effect without moving their Planner, memory, session, or main loop into this
-runtime.
+Runtime Core, and a narrow durable Action gateway lets existing Agents delegate one allowlisted
+side effect without moving their Planner, memory, session, or main loop into this runtime.
+
+## Evidence at the accepted baseline
+
+The current accepted capability baseline is commit `75740b4` (P6B.2). These are point-in-time
+verified results, not claims about live customer traffic or a deployed AWS environment:
+
+| Property | Executable evidence |
+| --- | --- |
+| Portable durable authority | One shared SQLite/PostgreSQL 16 Run, Workflow, checkpoint, quarantine, and Memory semantic contract |
+| Independent recovery | P5 runs two independently killable workers through S1-S8 and kills 9/9 representative source mutants |
+| External-effect uncertainty | Action recovery proves one provider effect for safe retry and an explicit `outcome_unknown` when replay is unsafe |
+| Production image | P6B.2 runs one digest-identified image against PostgreSQL `verify-full`, rejects a wrong hostname, scans logs for secret canaries, and exercises bounded `SIGTERM` shutdown |
+| AWS foundation | Terraform models ECS Fargate, RDS, ECR, IAM/OIDC, Secrets Manager, budgets, and teardown; CI validates it with credential-free mock-provider plans only |
+| Regression gates | The default suite runs on Python 3.11/3.12, plus required PostgreSQL, mutation, Action-recovery, P5, Terraform, and exact-image CI jobs; use the CI badge for the current tree |
+
+If you inspect only three deeper artifacts, start with the
+[`P5 multi-worker proof`](docs/p5-multi-worker-recovery-proof.md), the
+[`P6B.2 exact-image proof`](docs/p6b2-exact-image-proof.md), and the
+[`AWS adapter and lifecycle boundary`](deploy/aws/README.md).
+
+### Milestone names
+
+This repository has two deliberately distinct histories:
+
+- `Phase 1` through `Phase 7D` are the earlier product-capability milestones: multi-domain
+  execution, DAG replay, security, memory, external actions, the Console, extensions, and the
+  Action gateway.
+- `P4` onward names the later operational-lifecycle program. The current accepted point is P6B.2;
+  the [detailed scope](docs/current-scope-and-limitations.md#operational-milestone-map) maps P4-P11
+  without implying that the later milestones are complete.
+
+P6C, the first authorization-gated live AWS plan/apply/validate/destroy exercise, has not run yet.
 
 ## Why an Agent Runtime?
 
@@ -186,7 +216,9 @@ writes, recovers pinned work, and exposes the same evidence through REST and SSE
 | Domains | Five Travel versions, two release-validation versions, and an opt-in trusted extension seam | [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md) |
 | Evidence | Workflow-first projection for Planner, policy, tool, action, and loop-outcome evidence; manager recovery events remain direct | [`runtime_service/evidence.py`](runtime_service/evidence.py), [`tests/test_durable_external_action_api.py`](tests/test_durable_external_action_api.py) |
 | Product surface | Local Runtime Console over the same authenticated Run and Event APIs | [`api/demo_assets`](api/demo_assets), [`tests/test_demo_console.py`](tests/test_demo_console.py) |
-| Verification | Full suite on Python 3.11/3.12 plus PostgreSQL 16 Run/Workflow/Memory conformance and sampled mutation gates | [CI workflow](.github/workflows/ci.yml) |
+| Portable deployment contract | PostgreSQL-authoritative OCI image plus provider-neutral process, configuration, log, signal, health, and release-identity boundaries | [`docs/production-runtime-contract.md`](docs/production-runtime-contract.md), [`docs/portable-substrate-contract.md`](docs/portable-substrate-contract.md) |
+| AWS proof adapter | Credential-free Terraform validation for a bounded ECS/RDS/ECR/IAM/secrets/budget/teardown design; no live AWS claim yet | [`deploy/aws/README.md`](deploy/aws/README.md), [`deploy/aws/adr/0001-terraform-aws-adapter.md`](deploy/aws/adr/0001-terraform-aws-adapter.md) |
+| Verification | Eight CI job definitions expand to ten jobs: Python 3.11/3.12, PostgreSQL 16 conformance, mutation gates, restart recovery, P5, Terraform offline, and P6B.2 | [CI workflow](.github/workflows/ci.yml) |
 
 ## API development setup
 
@@ -798,107 +830,57 @@ input signatures still match; the source run is never mutated.
 
 ## Documentation map
 
-- [`docs/dynamic-tool-loop.md`](docs/dynamic-tool-loop.md): Planner contracts, policy order,
-  failure codes, recovery boundaries, and model adapter;
-- [`docs/durable-external-actions.md`](docs/durable-external-actions.md): action ledger,
-  idempotency, provider boundary, cancellation arbitration, and uncertain outcomes;
-- [`docs/durable-action-gateway.md`](docs/durable-action-gateway.md): external-Agent Action API,
-  destination configuration, HTTP envelope, bounded wait, and public evidence contract;
-- [`docs/durable-run-leasing.md`](docs/durable-run-leasing.md): Run ownership, heartbeat,
-  exact-expiry takeover, fencing tokens, and deployment migration boundary;
-- [`docs/thread-execution-serialization.md`](docs/thread-execution-serialization.md):
-  tenant-qualified execution ordering, checkpoint revision CAS, and state-seed rules;
-- [`docs/operator-quarantine-resolution.md`](docs/operator-quarantine-resolution.md): controlled
-  quarantine eligibility, dry-run/apply, stale plans, exact replay, evidence preservation, and SOP;
-- [`docs/store-semantic-conformance.md`](docs/store-semantic-conformance.md): shared SQLite/PostgreSQL
-  executable store contracts and the invariant-to-test matrix;
-- [`docs/postgresql-store-backend.md`](docs/postgresql-store-backend.md): PostgreSQL schema,
-  transaction/lease model, conformance boundary, application composition, and non-goals;
-- [`docs/postgresql-memory-store.md`](docs/postgresql-memory-store.md): PostgreSQL Memory schema
-  component, same-authority fencing, concurrency/version order, shared contract, mutation proof,
-  and cross-PR scan;
-- [`docs/postgresql-application-composition.md`](docs/postgresql-application-composition.md):
-  coherent backend selection, schema bootstrap/startup authority, connection budgets, readiness,
-  application integration proof, and rollback limits;
-- [`docs/state-boundaries.md`](docs/state-boundaries.md): persisted state ownership,
-  cross-turn dependencies, governed-memory authority, and checkpoint-growth characterization;
-- [`docs/governed-memory.md`](docs/governed-memory.md): subject isolation, versioning, sealed
-  retrieval, forgetting, RBAC, and audit evidence;
-- [`docs/cloud-runtime.md`](docs/cloud-runtime.md): durable lifecycle, API, sandbox, deployment,
-  and security model;
-- [`docs/release-validation-workflow.md`](docs/release-validation-workflow.md): DAG validation,
-  selective replay, identity hashing, retry, and interrupted recovery;
-- [`docs/evidence-review-workflow.md`](docs/evidence-review-workflow.md): review contracts,
-  partial results, local replanning, and semantic-analyzer boundary;
-- [`docs/bring-your-own-domain.md`](docs/bring-your-own-domain.md): trusted extension seam,
-  executable incident-triage reference, API walkthrough, and version/recovery rules;
-- [`docs/action-recovery-proof.md`](docs/action-recovery-proof.md): one-command Action Gateway
-  restart proof, evidence assertions, and interview walkthrough;
-- [`FINDINGS.md`](FINDINGS.md): evaluation methodology and behavioral findings;
-- [`docs/sample_trace.md`](docs/sample_trace.md): an annotated application-runtime trace.
+Start with the [`documentation index`](docs/README.md). It separates current operational contracts
+and executable proofs from capability-milestone records that remain useful background but are not
+the deployment authority.
 
-Historical evaluation and reinforcement-learning artifacts remain under `eval/` and `rl/`; they
-are not on the cloud-runtime request path.
+The active deterministic evaluation harness is under [`eval/`](eval/). [`rl/`](rl/) is a retained
+historical research artifact: its optional training dependencies are not installed by this
+repository, it is not exercised by CI, and it is not a supported or reproducible product path.
 
 ## Tests and CI
 
 Run the same static and behavioral gates used by GitHub Actions:
 
 ```bash
-python -m compileall agent api demo_provider runtime_service domains examples
-ruff check agent api demo_provider runtime_service tests domains examples
+python -m compileall agent api demo_provider runtime_service domains examples scripts
+ruff check agent api demo_provider runtime_service tests domains examples scripts
+python scripts/check_substrate_contract.py
 mypy
 pytest -q
+git diff --check
 docker compose config --quiet
 ```
 
-The full suite covers typed reduction and validation, golden traces, review evidence, multi-turn
-continuation, run lifecycle, cancellation races, restart recovery, idempotency, tenant isolation,
-RBAC, schema migration, DAG validation, selective replay, tool sandboxing, all eight Phase 5A
-failure codes, policy-order precedence, decision replay, cached tool results, execution authority,
-REST/SSE evidence equality, and the fake OpenAI Responses boundary.
-Phase 6A additionally covers cross-thread restart continuity, same-tenant subject isolation,
-version conflicts, empty-snapshot sealing, memory RBAC, and deletion without checkpoint
-resurrection.
-Phase 7A covers version/schema isolation, explicit action intent, prepare-before-dispatch
-durability, provider-side deduplication and conflicts, bounded provider-idempotent recovery,
-unsafe unknown outcomes, cancellation/dispatch arbitration, direct-endpoint blocking, provider
-references, post-dispatch drift reconciliation, unrecoverable run-evidence gaps,
-provider-identity continuity, strict output filtering, HTTPS/loopback policy,
-HTTP-boundary sanitization, and action-event REST/SSE parity.
-Phase 7B covers demo-route isolation, ephemeral local credentials, direct submission through the
-existing Run API, validated result rendering inputs, and equality between API-visible and persisted
-Runtime evidence.
-Phase 7C covers opt-in registration without Core edits, strict custom input/state contracts, a
-second dynamic non-Travel domain through the existing API, exact API/persisted event equality,
-private-tool allowlisting, evidence-gated finish, unknown-tool zero execution, checkpoint schema
-round-trip, missing-extension recovery preflight, and fail-closed Runtime state/thread validation
-before persistence.
-Phase 7D covers canonical Action idempotency, a private single-step domain, server-owned destination
-routing, provider-capability recovery, terminal uncertainty, cancellation precedence, safe status
-and event projection, tenant/RBAC isolation, bounded asynchronous waiting, multi-manager SQLite
-races, threadpool-pressure behavior, and the ten-line external-Agent example.
-The local recovery proof additionally covers provider-side commit-before-response injection,
-independent Runtime restart, live-lease non-stealing, exact-expiry takeover, one-effect receipt
-replay, unsafe no-retry, and sanitized cross-ledger evidence.
-The durable execution plane additionally covers two-Manager Run leasing and stale-attempt fencing,
-one active Run per tenant-qualified thread, recovery-before-successor ordering, cross-thread
-parallel execution, monotonic checkpoint revisions, conflict terminalization, and managed
-compatibility-path execution.
+The AWS adapter has a separate credential-free gate. CI pins Terraform 1.13.1; the configurations
+accept `>= 1.13.0, < 2.0.0`. The script deliberately unsets AWS credentials before format checks,
+validation, and mock-provider plans:
 
-GitHub Actions runs compile checks, Ruff, scoped Mypy, pytest, `git diff --check`, and Compose
-configuration on Python 3.11 and 3.12. Separate PostgreSQL 16 jobs run the same shared Run,
-Workflow, composite execution-plane, quarantine, and Memory conformance scenarios against SQLite
-and PostgreSQL on both Python versions, followed by PostgreSQL-specific mechanics and sampled
-Run/Workflow/Memory mutation proofs. After the normal test matrix passes, one Python 3.12 job runs
-the Docker Action-recovery proof and uploads only its sanitized artifact.
+```bash
+bash deploy/aws/scripts/offline-check.sh
+```
+
+The workflow has eight job definitions that expand to ten jobs: the default Python 3.11/3.12
+matrix, SQLite/PostgreSQL 16 shared conformance on both Python versions, PostgreSQL mutation proofs,
+the Docker Action-recovery proof, the required P5 two-process recovery and mutation gates, the
+credential-free Terraform gate, and the P6B.2 exact-image lifecycle proof. See
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the authoritative commands and service
+configuration.
 
 ## Deployment boundary
 
-Docker, Docker Compose, and a deliberately single-replica Kubernetes manifest are included. The
-default local demo remains SQLite plus durable polling and an in-process wake signal. A configured
-application may instead select one complete PostgreSQL authority, but this is not yet a multi-host
-or horizontally scalable deployment claim.
+The repository currently supports three deliberately different deployment paths:
+
+| Path | Supported claim |
+| --- | --- |
+| Local Docker Compose | Loopback-only demonstration using SQLite, scripted planning, and one local process |
+| Portable production image | PostgreSQL-authoritative OCI process contract verified by P6B.2 against the exact built image |
+| AWS adapter | Credential-free Terraform validation and mock-provider plans for ECS/RDS/ECR; no live plan/apply/validate/destroy claim yet |
+
+Kubernetes is not a certified deployment target in the current operational program. The old
+single-replica example conflicted with the PostgreSQL-authoritative production image and has been
+removed rather than advertised as support. Adding Kubernetes would require its own adapter,
+configuration contract, exact-image proof, and lifecycle evidence.
 
 Durable Run consumers target `RunStore`, workflow consumers target `WorkflowStore`, governed
 execution targets `MemoryStore`, and subject-scoped admin routes target `MemoryAdminStore`.
@@ -918,67 +900,32 @@ no durable record of the checkpoint revision it originally read, so the new Runt
 guess and fails startup closed. Mixed old/new binaries and direct rollback remain unsupported: old
 state-only writes do not increment the revision and cannot be detected by the new CAS.
 
-Before increasing replicas, the architecture would still need:
-
-```text
-Redis, Pub/Sub, or another distributed queue/wake mechanism
-+ a measured connection-pooling policy if short-lived connections become a bottleneck
-+ production release orchestration around the existing bootstrap authority
-+ provider-specific reconciliation and compensation
-+ OpenTelemetry traces and metrics
-+ container-backed sandbox workers
-+ deployment validation for multi-replica and HA behavior
-```
-
-The default Docker Compose path is the loopback-only local demo described above. Running the image
-without `RUNTIME_DEMO_MODE=true` preserves the normal fail-closed credential behavior. The
-Kubernetes manifest expects `RUNTIME_API_KEYS_JSON` in Secret `travel-agent-runtime-auth`, key
-`api-keys.json`; the repository does not contain or generate deployment credential material.
+P5 proves independent PostgreSQL workers, lease expiry, stale-attempt fencing, thread ordering, and
+one-effect external-action recovery under a bounded test topology. It does not by itself certify a
+deployed multi-host, horizontally scaled, or highly available service. The default Compose path
+remains the loopback-only demo; running the production image without `RUNTIME_DEMO_MODE=true`
+preserves normal fail-closed credential behavior.
 
 ## Deliberate limitations
 
-This is a completed portfolio/reference milestone, not a claim of a complete production Agent
-platform.
+This is a portfolio/reference system with executable evidence, not a complete production Agent
+platform. In particular:
 
-- the default application still uses SQLite; PostgreSQL selection requires an explicitly prepared
-  schema and does not migrate existing SQLite data;
-- PostgreSQL uses bounded short-lived per-operation connections; no pool sizing or saturation claim
-  is made without process-level measurements;
-- PostgreSQL lease/fencing behavior is tested with independent server connections, but the
-  repository still makes no multi-host Runtime, horizontal-scaling, or HA deployment claim;
-- durable polling plus a local wake signal remains the application scheduling mechanism rather than
-  a distributed worker queue;
-- no quota, token accounting, key rotation, or external secret manager;
-- only two static roles, with no custom or per-Agent/per-tool grants;
-- process isolation rather than a container, gVisor, or microVM sandbox;
-- no arbitrary user-code or untrusted third-party MCP execution;
-- the Action façade supports only `webhook.send` to server-registered destinations; it is not an
-  arbitrary URL/method/header forwarder and has no per-destination grants;
-- trusted extensions are explicit startup composition only, with no discovery, hot loading,
-  package marketplace, or plugin installation lifecycle;
-- serial DAG and dynamic-tool scheduling;
-- synthetic Travel, release-validation, and incident-triage data;
-- no real flight, hotel, booking, payment, or inventory integration and no official vendor
-  sandbox claim;
-- the optional HTTP provider is a configurable transport boundary, not a validated live Travel
-  provider;
-- no OpenTelemetry backend or evaluation dashboard;
-- the Runtime Console is a local demonstration surface, not an account, tenant, Agent, or memory
-  administration dashboard;
-- no prompt-injection detector beyond typed decisions, policy checks, and registered tools;
-- memory is limited to explicit allowlisted preferences, without embeddings, inferred facts, or
-  erasure of immutable historical run evidence;
-- no exactly-once guarantee, compensation/rollback workflow, human approval, or automated
-  reconciliation for unknown external-action outcomes.
+- AWS has only credential-free offline evidence; no live P6C environment has been created;
+- the repository makes no multi-host, horizontal-scaling, HA, load, or SLO claim;
+- PostgreSQL requires explicit bootstrap and does not migrate existing SQLite data;
+- Travel, release-validation, incident-triage, and external providers are synthetic or local test
+  doubles rather than vendor integrations;
+- external writes are at-least-once with bounded idempotent recovery, not exactly-once; unsafe
+  ambiguity terminates as `outcome_unknown`;
+- auth is static API-key Viewer/Operator RBAC, tool containment is subprocess-based, and the Console
+  is a local evidence surface rather than an administration product;
+- Kubernetes, untrusted plugin execution, human approval, automated compensation, and a production
+  OpenTelemetry/SLO backend are outside the current supported boundary;
+- `rl/` is historical optional research code, not a maintained training or reproducibility claim.
 
-Phase 7D remains the Agent-integration milestone. The subsequent durable execution-plane work
-hardens ownership, thread consistency, checkpoint integrity, and Run/Workflow storage portability
-without expanding the public Action surface. The project still does not add MCP, OpenClaw, Letta,
-or other framework-specific adapters, arbitrary webhooks, human approval, or active provider queries
-for a terminal unknown outcome. Those boundaries, semantic memory retrieval, bounded parallel
-read-only calls, a live read-only Travel adapter, multi-model fallback, and durable multi-Agent
-delegation remain possible follow-up slices rather than prerequisites for the runtime demonstrated
-here.
+See [`docs/current-scope-and-limitations.md`](docs/current-scope-and-limitations.md) for the precise
+boundary, evidence links, and what would be required to expand each claim.
 
 ## License
 
