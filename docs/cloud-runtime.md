@@ -430,15 +430,17 @@ security, post-dispatch drift, and unrecoverable evidence-mirror gaps.
 
 ## Deliberate limitations
 
-SQLite, durable polling, and an in-process wake signal keep the repository runnable without external services. The
-supplied Compose configuration is the loopback-only local demo. A normal container invocation
-remains fail-closed and requires configured credentials. The Kubernetes Deployment reads
-`RUNTIME_API_KEYS_JSON` from Secret `travel-agent-runtime-auth` / `api-keys.json`; provisioning and
-rotation of that Secret are intentionally outside this slice. Therefore:
+At this capability milestone, SQLite, durable polling, and an in-process wake signal kept the
+repository runnable without external services. The supplied Compose configuration remains the
+loopback-only local demo, and a normal container invocation remains fail-closed without configured
+credentials. An earlier single-replica Kubernetes example has since been withdrawn because it
+conflicted with the PostgreSQL-authoritative production image. See the
+[current deployment boundary](current-scope-and-limitations.md#deployment-support).
 
-- deploy one runtime replica only;
-- Run leasing and fencing are proven only for Managers sharing one local SQLite database, not for
-  multi-host workers or a distributed database;
+Subsequent P4/P5 work extended lease and fencing evidence to independent workers sharing one
+PostgreSQL authority. It still does not certify a deployed multi-host or highly available service.
+The remaining capability limitations include:
+
 - cancellation occurs at cooperative execution boundaries;
 - authentication and two-role authorization use local static API-key configuration; there is no
   custom role model, per-tool grant, quota, key rotation, or external secret-manager integration;
@@ -452,10 +454,9 @@ rotation of that Secret are intentionally outside this slice. Therefore:
 - there is no arbitrary user-code execution endpoint;
 - descendant reaping depends on `tini` in the provided container image or an equivalent host init/service manager.
 
-A production-oriented next step is PostgreSQL for runs/checkpoints/events/memories/actions while
-preserving the existing lease-token predicates, Redis or Pub/Sub as a wake channel,
-provider-specific reconciliation and compensation, OpenTelemetry traces, and a container-backed
-sandbox implementation.
+PostgreSQL authority and independent-worker recovery were added later; provider-specific
+reconciliation, production telemetry, stronger sandbox isolation, and deployed HA evidence remain
+outside the accepted boundary.
 
 The first lease-aware rollout must stop and verify all pre-leasing Runtime processes before the
 additive migration, then start only lease-aware binaries. Mixed old/new execution and mixed-version

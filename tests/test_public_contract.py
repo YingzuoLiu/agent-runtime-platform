@@ -25,7 +25,7 @@ def test_readme_presents_the_current_public_boundary() -> None:
         "status-P6B.2%20verified",
         "P6C, the first authorization-gated live AWS",
         "Phase 1` through `Phase 7D",
-        "P4` through `P11",
+        "P4` onward names the later operational-lifecycle program",
         "Kubernetes is not a certified deployment target",
         "is a retained historical research artifact",
         "bash deploy/aws/scripts/offline-check.sh",
@@ -39,6 +39,15 @@ def test_readme_presents_the_current_public_boundary() -> None:
 
     assert "single-replica Kubernetes manifest" not in readme
     assert not (ROOT / "deploy/k8s/runtime.yaml").exists()
+
+
+def test_withdrawn_kubernetes_coordinates_do_not_remain_in_public_docs() -> None:
+    forbidden = ("deploy/k8s", "travel-agent-runtime-auth", "api-keys.json")
+
+    for document in (ROOT / "docs").rglob("*.md"):
+        content = document.read_text(encoding="utf-8")
+        for marker in forbidden:
+            assert marker not in content, f"{document.relative_to(ROOT)}: {marker}"
 
 
 def test_readme_local_markdown_links_resolve() -> None:

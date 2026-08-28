@@ -1,8 +1,27 @@
 # Current scope and limitations
 
-This document is the detailed boundary behind the concise claims in the root README. It describes
-the accepted P6B.2 baseline (`75740b4`) and must not be read as evidence that P6C live AWS work has
-run.
+This document is the detailed boundary behind the concise claims in the root README. Its capability
+claims are anchored to the accepted P6B.2 baseline (`75740b4`) and must not be read as evidence that
+P6C live AWS work has run.
+
+## Operational milestone map
+
+The earlier `Phase 1`-`Phase 7D` names describe product capabilities. The later `P` names describe
+the operational-lifecycle program:
+
+| Milestone | Operational outcome |
+| --- | --- |
+| P4 | PostgreSQL semantic portability and coherent application authority |
+| P5 | Independent-worker concurrency, recovery, fencing, and mutation evidence |
+| P6 | Portable production runtime plus an authorization-gated AWS proof lifecycle |
+| P7 | One real, allowlisted, idempotent GitHub integration through the deployed service |
+| P8 | Workload-grounded observability, SLI, proposed SLO, alerts, and runbook |
+| P9 | Immutable release, compatible migration, rollback, and forward-fix evidence |
+| P10 | Bounded load and failure-injection evidence |
+| P11 | Reproducible end-to-end operational evidence bundle and system-property scan |
+
+Only P4, P5, and the offline/portable parts of P6 through P6B.2 are accepted. P6C and P7-P11 are
+future gates, not implemented claims.
 
 ## Evidence ladder
 

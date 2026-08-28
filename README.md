@@ -20,8 +20,8 @@ side effect without moving their Planner, memory, session, or main loop into thi
 
 ## Evidence at the accepted baseline
 
-The current accepted baseline is commit `75740b4` (P6B.2). These are point-in-time verified
-results, not claims about live customer traffic or a deployed AWS environment:
+The current accepted capability baseline is commit `75740b4` (P6B.2). These are point-in-time
+verified results, not claims about live customer traffic or a deployed AWS environment:
 
 | Property | Executable evidence |
 | --- | --- |
@@ -30,7 +30,7 @@ results, not claims about live customer traffic or a deployed AWS environment:
 | External-effect uncertainty | Action recovery proves one provider effect for safe retry and an explicit `outcome_unknown` when replay is unsafe |
 | Production image | P6B.2 runs one digest-identified image against PostgreSQL `verify-full`, rejects a wrong hostname, scans logs for secret canaries, and exercises bounded `SIGTERM` shutdown |
 | AWS foundation | Terraform models ECS Fargate, RDS, ECR, IAM/OIDC, Secrets Manager, budgets, and teardown; CI validates it with credential-free mock-provider plans only |
-| Regression baseline | `959 passed, 25 skipped` in the default suite at PR #42, plus required PostgreSQL, mutation, Action-recovery, P5, Terraform, and exact-image CI jobs |
+| Regression gates | The default suite runs on Python 3.11/3.12, plus required PostgreSQL, mutation, Action-recovery, P5, Terraform, and exact-image CI jobs; use the CI badge for the current tree |
 
 If you inspect only three deeper artifacts, start with the
 [`P5 multi-worker proof`](docs/p5-multi-worker-recovery-proof.md), the
@@ -44,12 +44,11 @@ This repository has two deliberately distinct histories:
 - `Phase 1` through `Phase 7D` are the earlier product-capability milestones: multi-domain
   execution, DAG replay, security, memory, external actions, the Console, extensions, and the
   Action gateway.
-- `P4` through `P11` are the later operational-lifecycle program: PostgreSQL portability,
-  independent workers, deployment, real integration, observability, release/rollback, and fault
-  evidence.
+- `P4` onward names the later operational-lifecycle program. The current accepted point is P6B.2;
+  the [detailed scope](docs/current-scope-and-limitations.md#operational-milestone-map) maps P4-P11
+  without implying that the later milestones are complete.
 
-The current accepted point is **P6B.2**. P6C, the first authorization-gated live AWS
-plan/apply/validate/destroy exercise, has not run yet.
+P6C, the first authorization-gated live AWS plan/apply/validate/destroy exercise, has not run yet.
 
 ## Why an Agent Runtime?
 
@@ -853,8 +852,9 @@ git diff --check
 docker compose config --quiet
 ```
 
-The AWS adapter has a separate credential-free gate. It requires Terraform 1.13.1 and deliberately
-unsets AWS credentials before format checks, validation, and mock-provider plans:
+The AWS adapter has a separate credential-free gate. CI pins Terraform 1.13.1; the configurations
+accept `>= 1.13.0, < 2.0.0`. The script deliberately unsets AWS credentials before format checks,
+validation, and mock-provider plans:
 
 ```bash
 bash deploy/aws/scripts/offline-check.sh
@@ -869,7 +869,7 @@ configuration.
 
 ## Deployment boundary
 
-The repository currently supports three deliberately different evidence levels:
+The repository currently supports three deliberately different deployment paths:
 
 | Path | Supported claim |
 | --- | --- |
