@@ -41,13 +41,17 @@ def test_readme_presents_the_current_public_boundary() -> None:
     assert not (ROOT / "deploy/k8s/runtime.yaml").exists()
 
 
-def test_withdrawn_kubernetes_coordinates_do_not_remain_in_public_docs() -> None:
+def test_withdrawn_kubernetes_coordinates_do_not_remain_in_public_markdown() -> None:
     forbidden = ("deploy/k8s", "travel-agent-runtime-auth", "api-keys.json")
+    excluded_roots = {".git", ".mypy_cache", ".pytest_cache", ".venv"}
 
-    for document in (ROOT / "docs").rglob("*.md"):
+    for document in ROOT.rglob("*.md"):
+        relative = document.relative_to(ROOT)
+        if relative.parts[0] in excluded_roots:
+            continue
         content = document.read_text(encoding="utf-8")
         for marker in forbidden:
-            assert marker not in content, f"{document.relative_to(ROOT)}: {marker}"
+            assert marker not in content, f"{relative}: {marker}"
 
 
 def test_readme_local_markdown_links_resolve() -> None:

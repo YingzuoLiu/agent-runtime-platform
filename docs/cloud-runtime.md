@@ -448,7 +448,8 @@ The remaining capability limitations include:
   no live booking, payment, or inventory integration and no claim of an official vendor sandbox;
 - there is no exactly-once guarantee, compensation/rollback workflow, human approval, or
   automated reconciliation for `outcome_unknown` actions;
-- external dispatch has no distributed queue and remains single-replica SQLite coordination;
+- external dispatch has no distributed queue; cross-process progress comes from bounded polling
+  and leases;
 - the subprocess sandbox does not isolate host networking or the complete host filesystem;
 - POSIX rlimits are not available on Windows, where timeout and process separation remain but resource enforcement is weaker;
 - there is no arbitrary user-code execution endpoint;
