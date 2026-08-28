@@ -1,5 +1,10 @@
 # Cloud Runtime Upgrade
 
+> **Capability-milestone record:** this document describes the earlier Phase 3-7D evolution and
+> remains useful for architecture and API history. It is not the current deployment authority.
+> Start with the [documentation index](README.md), the
+> [production runtime contract](production-runtime-contract.md), and the P5/P6 proof documents.
+
 Version `0.3.0` adds a self-hosted execution-management layer around the Travel application
 runtime. Version `0.4.0` adds a policy-enforced subprocess backend for registered tools. Version
 `0.6.0` generalizes the manager, registry, persistence, and `/runs` API across typed domains.
