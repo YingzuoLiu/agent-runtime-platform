@@ -84,6 +84,11 @@ no live-AWS claim.
 - Scheduling is serial within the current DAG/dynamic-tool paths. Bounded parallel reads,
   multi-Agent delegation, model fallback, and semantic Memory retrieval are future slices rather
   than current claims.
+- Workflow topology is deployment-defined. The validated DAG is a module-level constant, and
+  selective replay forks a new Run rather than editing one in place. There is no runtime graph
+  mutation, no durable graph version, and no Planner decision that changes topology;
+  [`governed-graph-mutation-feasibility.md`](governed-graph-mutation-feasibility.md) is a design review, not a
+  capability claim.
 - Governed Memory stores allowlisted explicit preferences; it has no embeddings or inferred-fact
   retrieval, and forgetting does not erase immutable historical Run evidence.
 - There is no production OpenTelemetry backend, evaluation dashboard, alert policy, or validated

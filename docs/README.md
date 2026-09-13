@@ -50,6 +50,16 @@ The provider-specific AWS adapter and its explicit no-live-AWS boundary are docu
 These records prove their bounded scenarios. They do not turn a local or CI topology into a live
 multi-host, HA, or AWS deployment claim.
 
+## Design reviews
+
+These documents evaluate proposed capabilities. They describe work that is **not implemented** and
+carry no capability claim; they exist so a design decision and its rejected alternatives stay
+reviewable.
+
+- [`governed-graph-mutation-feasibility.md`](governed-graph-mutation-feasibility.md) — feasibility
+  review of Agent-proposed workflow topology mutation: prior-art gap, the fork-versus-in-place
+  decision, side-effect and recovery boundaries, and a revised phase plan.
+
 ## Capability and milestone records
 
 These documents describe implemented behavior and remain valid within their stated scopes. Their
