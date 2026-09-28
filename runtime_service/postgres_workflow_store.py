@@ -1300,6 +1300,7 @@ class PostgresWorkflowStore:
         result_json: str,
         provider_reference: str,
         error_code: str | None = None,
+        verification_evidence: dict[str, Any] | None = None,
     ) -> ExternalActionRecord:
         return self._finalize_external_action(
             run_id,
@@ -1311,6 +1312,7 @@ class PostgresWorkflowStore:
             result_json=result_json,
             provider_reference=provider_reference,
             error_code=error_code,
+            verification_evidence=verification_evidence,
         )
 
     def finalize_external_action_failed(
@@ -1322,6 +1324,7 @@ class PostgresWorkflowStore:
         tool_attempt_token: str,
         error_code: str,
         provider_reference: str | None = None,
+        verification_evidence: dict[str, Any] | None = None,
     ) -> ExternalActionRecord:
         return self._finalize_external_action(
             run_id,
@@ -1333,6 +1336,7 @@ class PostgresWorkflowStore:
             result_json=None,
             provider_reference=provider_reference,
             error_code=error_code,
+            verification_evidence=verification_evidence,
         )
 
     def finalize_external_action_outcome_unknown(
@@ -1344,6 +1348,7 @@ class PostgresWorkflowStore:
         tool_attempt_token: str,
         error_code: str,
         provider_reference: str | None = None,
+        verification_evidence: dict[str, Any] | None = None,
     ) -> ExternalActionRecord:
         return self._finalize_external_action(
             run_id,
@@ -1355,6 +1360,7 @@ class PostgresWorkflowStore:
             result_json=None,
             provider_reference=provider_reference,
             error_code=error_code,
+            verification_evidence=verification_evidence,
         )
 
     def finalize_external_action_reconciliation_unknown(
@@ -1422,6 +1428,7 @@ class PostgresWorkflowStore:
         required_retry_mode: ToolRetryMode | None = None,
         lease_token: str | None = None,
         require_run_lease: bool = False,
+        verification_evidence: dict[str, Any] | None = None,
     ) -> ExternalActionRecord:
         if action_status not in {
             ExternalActionStatus.SUCCEEDED,
@@ -1577,6 +1584,11 @@ class PostgresWorkflowStore:
                         "dispatch_count": action.dispatch_count,
                         "provider_reference": provider_reference,
                         "error_code": error_code,
+                        **(
+                            {"effect_verification": verification_evidence}
+                            if verification_evidence is not None
+                            else {}
+                        ),
                     },
                 )
                 self._append_event_with_connection(
