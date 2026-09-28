@@ -45,6 +45,8 @@ class ExternalActionCoordinator:
     # narrower table cannot turn a post-dispatch failure path into a KeyError.
     DEFAULT_FAILURE_MESSAGES: ClassVar[Mapping[str, str]] = {
         "external_action_failed": "External action failed definitively.",
+        "external_action_effect_mismatch": "External effect did not match its postconditions.",
+        "external_action_readback_unavailable": "External effect readback is unavailable.",
         "external_action_outcome_unknown": (
             "External action outcome is unknown and was not retried again."
         ),
@@ -204,7 +206,7 @@ class ExternalActionCoordinator:
         elif action.status == ExternalActionStatus.SUCCEEDED:
             code = "external_action_evidence_incomplete"
         elif action.status == ExternalActionStatus.FAILED:
-            code = "external_action_failed"
+            code = action.error_code or "external_action_failed"
         else:
             # PREPARED with dispatch_count > 0 is corrupt and cannot prove that
             # a provider call did not happen.  It also cannot be fenced into a
@@ -702,6 +704,82 @@ class ExternalActionCoordinator:
                 action, dispatch_token = retry
                 continue
 
+            verification = None
+            if spec.expected_effect is not None:
+                expected = spec.expected_effect(
+                    normalized_arguments, provider_result.provider_reference
+                )
+                readback = getattr(provider, "readback", None)
+                try:
+                    observed = readback(request) if callable(readback) else None
+                    if observed is not None and (
+                        not isinstance(observed, dict)
+                        or self._contains_sensitive_text(observed, idempotency_key)
+                    ):
+                        raise ValueError("Invalid readback")
+                    if observed is not None:
+                        # Persist only the server-defined postcondition fields.
+                        # Arbitrary provider readback fields are not audit-safe.
+                        observed = {key: observed.get(key) for key in expected}
+                        if any(
+                            value is not None
+                            and (
+                                type(value) not in (str, int)
+                                or (isinstance(value, str) and len(value) > 500)
+                            )
+                            for value in observed.values()
+                        ):
+                            raise ValueError("Invalid readback fields")
+                except Exception:
+                    observed = None
+                if observed is None:
+                    verification_status = "READBACK_UNAVAILABLE"
+                    checks = {}
+                else:
+                    checks = {
+                        key: (type(observed.get(key)) is type(value) and observed.get(key) == value)
+                        for key, value in expected.items()
+                    }
+                    verification_status = (
+                        "VERIFIED" if all(checks.values()) else "EFFECT_MISMATCH"
+                    )
+                verification = {
+                    "expected": expected,
+                    "provider_receipt": trusted_result,
+                    "observed": observed,
+                    "postconditions": checks,
+                    "status": verification_status,
+                }
+                if verification_status != "VERIFIED":
+                    error_code = (
+                        "external_action_effect_mismatch"
+                        if verification_status == "EFFECT_MISMATCH"
+                        else "external_action_readback_unavailable"
+                    )
+                    try:
+                        self.workflow_store.finalize_external_action_failed(
+                            context.run_id,
+                            step.step_id,
+                            dispatch_token=dispatch_token,
+                            tool_attempt_token=attempt_token,
+                            error_code=error_code,
+                            provider_reference=provider_result.provider_reference,
+                            verification_evidence=verification,
+                        )
+                    except Exception:
+                        if not self._external_failure_was_committed(
+                            context=context,
+                            step=step,
+                            expected_action=action,
+                            dispatch_token=dispatch_token,
+                            error_code=error_code,
+                            provider_reference=provider_result.provider_reference,
+                        ):
+                            raise ExternalActionReconciliationPendingError() from None
+                    self._raise_external_terminal_failure(
+                        context=context, step=step, error_code=error_code
+                    )
+
             try:
                 self.workflow_store.finalize_external_action_succeeded(
                     context.run_id,
@@ -710,6 +788,7 @@ class ExternalActionCoordinator:
                     tool_attempt_token=attempt_token,
                     result_json=result_json,
                     provider_reference=provider_result.provider_reference,
+                    verification_evidence=verification,
                 )
             except Exception:
                 if not self._external_success_was_committed(
@@ -917,6 +996,8 @@ class ExternalActionCoordinator:
         step: ToolCallRecord,
         expected_action: ExternalActionRecord,
         dispatch_token: str,
+        error_code: str = "external_action_failed",
+        provider_reference: str | None = None,
     ) -> bool:
         """Resolve an exception raised after a definitive terminal commit."""
 
@@ -967,13 +1048,13 @@ class ExternalActionCoordinator:
             identity == expected_identity
             and action.status == ExternalActionStatus.FAILED
             and action.dispatch_token == dispatch_token
-            and action.provider_reference is None
+            and action.provider_reference == provider_reference
             and action.result_json is None
-            and action.error_code == "external_action_failed"
+            and action.error_code == error_code
             and current_step.status == ToolCallStatus.FAILED
             and current_step.attempt_token == step.attempt_token
             and current_step.result_json is None
-            and current_step.error_code == "external_action_failed"
+            and current_step.error_code == error_code
         )
 
     def _record_external_success_evidence(
@@ -1216,6 +1297,19 @@ class ExternalActionCoordinator:
                 code="invalid_planner_decision",
                 detail="Completed external-write step has an invalid action outcome.",
             )
+        if spec.expected_effect is not None:
+            verified = any(
+                event.event_type == "external_action.succeeded"
+                and event.payload.get("action_id") == action.action_id
+                and isinstance(event.payload.get("effect_verification"), dict)
+                and event.payload["effect_verification"].get("status") == "VERIFIED"
+                for event in self.workflow_store.list_events(context.run_id)
+            )
+            if not verified:
+                raise RuntimeExecutionError(
+                    "external_action_evidence_incomplete",
+                    self.failure_message("external_action_evidence_incomplete"),
+                )
         try:
             result = self._decode_tool_result(step)
         except RuntimeExecutionError as exc:
@@ -1315,7 +1409,16 @@ class ExternalActionCoordinator:
             idempotency_key=idempotency_key,
         )
         expected_code = {
-            ExternalActionStatus.FAILED: "external_action_failed",
+            ExternalActionStatus.FAILED: (
+                action.error_code
+                if action.error_code
+                in {
+                    "external_action_failed",
+                    "external_action_effect_mismatch",
+                    "external_action_readback_unavailable",
+                }
+                else None
+            ),
             ExternalActionStatus.OUTCOME_UNKNOWN: "external_action_outcome_unknown",
         }.get(action.status)
         if (

@@ -103,6 +103,7 @@ class ToolSpec:
     provider_name: str | None = None
     output_model: type[BaseModel] | None = None
     runtime_input_gate: Callable[[dict[str, Any]], bool] | None = None
+    expected_effect: Callable[[dict[str, Any], str], dict[str, Any]] | None = None
 
 
 class ToolRegistry:
@@ -114,6 +115,8 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {spec.name}")
 
         if spec.effect == ToolEffect.READ_ONLY:
+            if spec.expected_effect is not None:
+                raise ValueError("read-only tools cannot declare an external effect")
             if spec.retry_mode != ToolRetryMode.SAFE:
                 raise ValueError("read-only tools must use retry_mode='safe'")
             if spec.provider_name is not None:
@@ -126,6 +129,8 @@ class ToolRegistry:
                     "'module:function' format"
                 )
         elif spec.effect == ToolEffect.EXTERNAL_WRITE:
+            if spec.expected_effect is not None and not callable(spec.expected_effect):
+                raise ValueError("expected_effect must be server-owned and callable")
             if spec.handler_entrypoint is not None:
                 raise ValueError(
                     "external-write tools cannot declare a sandbox handler_entrypoint"

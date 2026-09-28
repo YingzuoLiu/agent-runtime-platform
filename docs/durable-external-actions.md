@@ -9,6 +9,28 @@ The implementation makes external intent, dispatch attempts, and outcomes durabl
 claim exactly-once execution, automatic compensation, human approval, or integration with live
 booking, payment, or inventory systems.
 
+## P7 synthetic effect verification
+
+The `create_trip_hold` registration now supplies a server-owned expected effect. After a
+sanitized provider receipt, the coordinator asks the configured provider to read back the
+committed hold by the same idempotency key. It compares the reference, status, destination,
+option, quoted total, and hold duration by value and type. The existing terminal action event
+atomically includes `effect_verification`: expected values, normalized provider receipt,
+allowlisted observed values, each postcondition result, and `VERIFIED`, `EFFECT_MISMATCH`, or
+`READBACK_UNAVAILABLE`. These events remain available in the existing workflow/Run evidence
+surfaces; no new UI or ledger schema is needed.
+
+Only a matching readback permits `external_action.succeeded`. A wrong committed effect ends
+the action and tool step as failed with `external_action_effect_mismatch`; an absent or failing
+readback ends them with `external_action_readback_unavailable`. Both preserve the provider
+reference and evidence without treating the action as verified. A configured HTTP adapter
+without a `readback(request)` method therefore cannot report a verified Travel hold; it must
+implement an independent readback before use with this action. Other external-write tool
+registrations retain their previous provider-receipt semantics. Response loss after a provider
+commit still uses the existing bounded idempotent recovery; the re-dispatch returns the same
+hold and then readback verifies its committed state. This is a synthetic provider proof, not
+a claim about any real external service.
+
 Phase 7D reuses this same coordinator and Run lifecycle behind a private single-step domain and the
 public `/actions` façade. See [`durable-action-gateway.md`](durable-action-gateway.md) for that
 external-Agent contract. The façade does not split the coordinator into a second lifecycle.

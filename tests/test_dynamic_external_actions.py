@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+
+from domains.travel.tools import SQLiteTripHoldProvider, build_travel_external_action_tool_registry
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.contracts import (
@@ -2123,3 +2127,131 @@ def test_read_only_loop_keeps_original_policy_payload_and_sandbox_path(
         "error_code": None,
     }
     assert workflow_store.list_external_actions(context.run_id) == []
+
+ARGS = {"destination": "Tokyo", "selected_option_name": "Tokyo value itinerary", "quoted_total": 500, "hold_minutes": 15}
+
+
+class ResponseLostProvider(SQLiteTripHoldProvider):
+    def __init__(self, database_path):
+        super().__init__(database_path)
+        self.calls = 0
+
+    def execute(self, request):
+        self.calls += 1
+        result = super().execute(request)
+        if self.calls == 1:
+            raise ProcessCrash()
+        return result
+
+
+class SilentWrongEffectProvider(SQLiteTripHoldProvider):
+    def execute(self, request):
+        receipt = super().execute(request)
+        with sqlite3.connect(self.database_path) as connection:
+            observed = {**receipt.result, "quoted_total": 650}
+            connection.execute(
+                "UPDATE synthetic_trip_holds SET result_json = ? WHERE idempotency_key = ?",
+                (json.dumps(observed), request.idempotency_key),
+            )
+        return receipt
+
+
+class UnavailableReadbackProvider(SQLiteTripHoldProvider):
+    def readback(self, request):
+        raise OSError("synthetic provider unavailable")
+
+
+def _prove(tmp_path: Path, provider_type):
+    context = execution_context("p7-proof")
+    run_store, workflow_store = initialize_stores(tmp_path / "runtime.db", context)
+    provider = provider_type(tmp_path / "provider.db")
+    spec = build_travel_external_action_tool_registry().resolve("create_trip_hold")
+    assert spec is not None and spec.expected_effect is not None
+    registry = ToolRegistry()
+    registry.register(replace(spec, runtime_input_gate=None))
+    providers = ExternalActionProviderRegistry()
+    providers.register("travel-trip-hold", provider)
+    loop = DynamicToolLoop(
+        planner=ScriptedPlanner(
+            CallToolDecision(tool_name="create_trip_hold", arguments=ARGS, reason="Synthetic proof"),
+            FinishDecision(message="Done", output={"status": "ready"}, reason="Complete"),
+        ),
+        tool_registry=registry,
+        tool_sandbox=RecordingSandbox(),  # type: ignore[arg-type]
+        workflow_store=workflow_store,
+        run_event_sink=run_store,
+        workflow_type="p7-synthetic-proof:1",
+        external_action_dispatcher=ExternalActionDispatcher(providers),
+    )
+    try:
+        outcome = loop.execute(runtime_input={"request": "hold"}, state={"selection": "Tokyo"}, context=context, finish_evaluator=finish_evaluator)
+        code = None
+    except ProcessCrash:
+        assert provider_type is ResponseLostProvider
+        # A new runtime instance reloads the same durable action and the same
+        # provider-side committed state after losing the first response.
+        recovered_store = SQLiteWorkflowStore(tmp_path / "runtime.db")
+        recovered_loop = DynamicToolLoop(
+            planner=ScriptedPlanner(FinishDecision(message="Done", output={"status": "ready"}, reason="Complete")),
+            tool_registry=registry,
+            tool_sandbox=RecordingSandbox(),  # type: ignore[arg-type]
+            workflow_store=recovered_store,
+            run_event_sink=SQLiteRunStore(tmp_path / "runtime.db"),
+            workflow_type="p7-synthetic-proof:1",
+            external_action_dispatcher=ExternalActionDispatcher(providers),
+        )
+        outcome = recovered_loop.execute(
+            runtime_input={"request": "hold"}, state={"selection": "Tokyo"},
+            context=context.model_copy(update={"recovered_after_restart": True}),
+            finish_evaluator=finish_evaluator,
+        )
+        code = None
+    except RuntimeExecutionError as exc:
+        outcome = None
+        code = exc.code
+    action = workflow_store.list_external_actions(context.run_id)[0]
+    events = workflow_store.list_events(context.run_id)
+    terminal = [e for e in events if e.event_type in {"external_action.succeeded", "external_action.failed"}]
+    assert len(terminal) == 1
+    return provider, action, terminal[0].payload["effect_verification"], outcome, code
+
+
+def test_p7_matching_committed_effect_is_verified(tmp_path):
+    provider, action, evidence, outcome, code = _prove(tmp_path, SQLiteTripHoldProvider)
+    assert code is None and outcome.outcome == DynamicLoopOutcome.FINISHED
+    assert action.status == ExternalActionStatus.SUCCEEDED
+    assert evidence["status"] == "VERIFIED"
+    assert all(evidence["postconditions"].values())
+    assert evidence["expected"]["quoted_total"] == evidence["observed"]["quoted_total"] == 500
+    assert provider.count_holds() == 1
+
+
+def test_p7_response_lost_after_commit_verifies_without_duplicate(tmp_path):
+    provider, action, evidence, outcome, code = _prove(tmp_path, ResponseLostProvider)
+    assert code is None and outcome.outcome == DynamicLoopOutcome.FINISHED
+    assert action.status == ExternalActionStatus.SUCCEEDED
+    assert action.dispatch_count == provider.calls == 2
+    assert provider.count_holds() == 1
+    assert evidence["status"] == "VERIFIED"
+
+
+def test_p7_silent_wrong_effect_fails_even_with_success_receipt(tmp_path):
+    provider, action, evidence, outcome, code = _prove(tmp_path, SilentWrongEffectProvider)
+    assert outcome is None and code == "external_action_effect_mismatch"
+    assert action.status == ExternalActionStatus.FAILED
+    assert action.error_code == "external_action_effect_mismatch"
+    assert evidence["status"] == "EFFECT_MISMATCH"
+    assert evidence["provider_receipt"]["quoted_total"] == 500
+    assert evidence["expected"]["quoted_total"] == 500
+    assert evidence["observed"]["quoted_total"] == 650
+    assert evidence["postconditions"]["quoted_total"] is False
+    assert provider.count_holds() == 1
+
+
+def test_p7_readback_unavailable_never_claims_verified(tmp_path):
+    provider, action, evidence, outcome, code = _prove(tmp_path, UnavailableReadbackProvider)
+    assert outcome is None and code == "external_action_readback_unavailable"
+    assert action.status == ExternalActionStatus.FAILED
+    assert evidence["status"] == "READBACK_UNAVAILABLE"
+    assert evidence["observed"] is None
+    assert provider.count_holds() == 1

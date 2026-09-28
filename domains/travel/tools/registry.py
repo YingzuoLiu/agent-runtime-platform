@@ -77,6 +77,11 @@ def build_travel_external_action_tool_registry() -> ToolRegistry:
             # configured HTTP adapter without changing Planner-visible tools.
             provider_name="travel-trip-hold",
             runtime_input_gate=_trip_hold_was_explicitly_requested,
+            expected_effect=lambda arguments, provider_reference: {
+                "status": "held",
+                "provider_reference": provider_reference,
+                **arguments,
+            },
         )
     )
     return registry
