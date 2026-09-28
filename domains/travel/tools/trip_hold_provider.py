@@ -124,7 +124,7 @@ class SQLiteTripHoldProvider:
 
     def readback(self, request: ExternalActionRequest) -> dict[str, object] | None:
         """Read committed provider state independently of the dispatch receipt."""
-        with self._connect() as connection:
+        with self._connect(timeout_seconds=2.0) as connection:
             row = connection.execute(
                 "SELECT provider_reference, result_json FROM synthetic_trip_holds "
                 "WHERE idempotency_key = ?",
@@ -137,11 +137,11 @@ class SQLiteTripHoldProvider:
             raise ValueError("Invalid provider readback")
         return {**result, "provider_reference": row["provider_reference"]}
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+    def _connect(self, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=timeout_seconds)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
-        deadline = time.monotonic() + 30
+        connection.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
+        deadline = time.monotonic() + timeout_seconds
         while True:
             try:
                 connection.execute("PRAGMA journal_mode=WAL")

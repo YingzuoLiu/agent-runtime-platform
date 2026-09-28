@@ -1348,6 +1348,7 @@ class PostgresWorkflowStore:
         tool_attempt_token: str,
         error_code: str,
         provider_reference: str | None = None,
+        verification_evidence: dict[str, Any] | None = None,
     ) -> ExternalActionRecord:
         return self._finalize_external_action(
             run_id,
@@ -1359,6 +1360,7 @@ class PostgresWorkflowStore:
             result_json=None,
             provider_reference=provider_reference,
             error_code=error_code,
+            verification_evidence=verification_evidence,
         )
 
     def finalize_external_action_reconciliation_unknown(

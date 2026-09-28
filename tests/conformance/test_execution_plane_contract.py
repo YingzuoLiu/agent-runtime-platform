@@ -41,7 +41,49 @@ from .scenarios import (
     complete_with_budget,
     create_action_quarantine,
     create_queued_run,
+    create_managed_workflow,
 )
+
+
+def test_verification_evidence_is_atomic_with_unknown_action_terminal(
+    store_backend: StoreConformanceBackend,
+) -> None:
+    _, store, run_claim, step_claim, action = create_managed_workflow(
+        store_backend, run_id="run-p7-readback-unknown"
+    )
+    dispatch = store.begin_external_action_dispatch(
+        action.run_id,
+        action.step_id,
+        tool_attempt_token=step_claim.attempt_token,
+        lease_token=run_claim.lease_token,
+    )
+    assert dispatch.dispatch_token is not None
+    evidence = {
+        "status": "EFFECT_NOT_FOUND",
+        "provider_receipt": {"provider_reference": "hold-reference"},
+        "observed": None,
+        "readback_reason": "not_found",
+        "readback_attempts": 2,
+    }
+    finalized = store.finalize_external_action_outcome_unknown(
+        action.run_id,
+        action.step_id,
+        dispatch_token=dispatch.dispatch_token,
+        tool_attempt_token=step_claim.attempt_token,
+        error_code="external_action_outcome_unknown",
+        provider_reference="hold-reference",
+        verification_evidence=evidence,
+    )
+    step = store.get_step(action.run_id, action.step_id)
+    events = [
+        event for event in store.list_events(action.run_id)
+        if event.event_type == "external_action.outcome_unknown"
+    ]
+    assert finalized.status == ExternalActionStatus.OUTCOME_UNKNOWN
+    assert finalized.provider_reference == "hold-reference"
+    assert step is not None and step.status == ToolCallStatus.FAILED
+    assert len(events) == 1
+    assert events[0].payload["effect_verification"] == evidence
 
 
 class ConformanceActionInput(BaseModel):

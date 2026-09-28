@@ -16,20 +16,27 @@ sanitized provider receipt, the coordinator asks the configured provider to read
 committed hold by the same idempotency key. It compares the reference, status, destination,
 option, quoted total, and hold duration by value and type. The existing terminal action event
 atomically includes `effect_verification`: expected values, normalized provider receipt,
-allowlisted observed values, each postcondition result, and `VERIFIED`, `EFFECT_MISMATCH`, or
-`READBACK_UNAVAILABLE`. These events remain available in the existing workflow/Run evidence
+allowlisted observed values, each postcondition result, a safe readback reason and attempt count,
+and `VERIFIED`, `EFFECT_MISMATCH`, `EFFECT_NOT_FOUND`, or `READBACK_UNAVAILABLE`.
+These events remain available in the existing workflow/Run evidence
 surfaces; no new UI or ledger schema is needed.
 
 Only a matching readback permits `external_action.succeeded`. A wrong committed effect ends
-the action and tool step as failed with `external_action_effect_mismatch`; an absent or failing
-readback ends them with `external_action_readback_unavailable`. Both preserve the provider
-reference and evidence without treating the action as verified. A configured HTTP adapter
+the action and tool step as failed with `external_action_effect_mismatch`. Readback is attempted
+at most twice without redispatch. If it still cannot be performed, or returns no effect despite
+a success receipt, the action ends as `outcome_unknown`, retains the provider reference, and
+records a distinct `READBACK_UNAVAILABLE` or `EFFECT_NOT_FOUND` verification status. Neither
+case proves the external effect was absent, and callers must not start a fresh action with a
+different idempotency key merely because verification was unavailable. A configured HTTP adapter
 without a `readback(request)` method therefore cannot report a verified Travel hold; it must
 implement an independent readback before use with this action. Other external-write tool
 registrations retain their previous provider-receipt semantics. Response loss after a provider
 commit still uses the existing bounded idempotent recovery; the re-dispatch returns the same
 hold and then readback verifies its committed state. This is a synthetic provider proof, not
-a claim about any real external service.
+a claim about any real external service. The SQLite reference readback bounds each database
+wait to two seconds; the coordinator does not forcibly interrupt arbitrary provider readback
+code. A future real adapter must implement its own request timeout before it can provide a
+bounded readback contract.
 
 Phase 7D reuses this same coordinator and Run lifecycle behind a private single-step domain and the
 public `/actions` façade. See [`durable-action-gateway.md`](durable-action-gateway.md) for that

@@ -78,9 +78,9 @@ def build_travel_external_action_tool_registry() -> ToolRegistry:
             provider_name="travel-trip-hold",
             runtime_input_gate=_trip_hold_was_explicitly_requested,
             expected_effect=lambda arguments, provider_reference: {
+                **arguments,
                 "status": "held",
                 "provider_reference": provider_reference,
-                **arguments,
             },
         )
     )

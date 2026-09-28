@@ -710,17 +710,30 @@ class ExternalActionCoordinator:
                     normalized_arguments, provider_result.provider_reference
                 )
                 readback = getattr(provider, "readback", None)
-                try:
-                    observed = readback(request) if callable(readback) else None
-                    if observed is not None and (
-                        not isinstance(observed, dict)
-                        or self._contains_sensitive_text(observed, idempotency_key)
-                    ):
-                        raise ValueError("Invalid readback")
-                    if observed is not None:
+                observed: dict[str, Any] | None = None
+                readback_reason: str | None = None
+                readback_attempts = 0
+                if not callable(readback):
+                    readback_reason = "not_supported"
+                else:
+                    for _ in range(2):
+                        readback_attempts += 1
+                        try:
+                            raw_observed = readback(request)
+                        except Exception:
+                            readback_reason = "provider_error"
+                            continue
+                        if raw_observed is None:
+                            readback_reason = "not_found"
+                            continue
+                        if not isinstance(raw_observed, dict):
+                            readback_reason = "invalid_response"
+                            continue
+                        if self._contains_sensitive_text(raw_observed, idempotency_key):
+                            readback_reason = "sensitive_response"
+                            continue
                         # Persist only the server-defined postcondition fields.
-                        # Arbitrary provider readback fields are not audit-safe.
-                        observed = {key: observed.get(key) for key in expected}
+                        observed = {key: raw_observed.get(key) for key in expected}
                         if any(
                             value is not None
                             and (
@@ -729,13 +742,12 @@ class ExternalActionCoordinator:
                             )
                             for value in observed.values()
                         ):
-                            raise ValueError("Invalid readback fields")
-                except Exception:
-                    observed = None
-                if observed is None:
-                    verification_status = "READBACK_UNAVAILABLE"
-                    checks = {}
-                else:
+                            observed = None
+                            readback_reason = "invalid_fields"
+                            continue
+                        readback_reason = None
+                        break
+                if observed is not None:
                     checks = {
                         key: (type(observed.get(key)) is type(value) and observed.get(key) == value)
                         for key, value in expected.items()
@@ -743,19 +755,41 @@ class ExternalActionCoordinator:
                     verification_status = (
                         "VERIFIED" if all(checks.values()) else "EFFECT_MISMATCH"
                     )
+                else:
+                    checks = {}
+                    verification_status = (
+                        "EFFECT_NOT_FOUND"
+                        if readback_reason == "not_found"
+                        else "READBACK_UNAVAILABLE"
+                    )
                 verification = {
                     "expected": expected,
                     "provider_receipt": trusted_result,
                     "observed": observed,
                     "postconditions": checks,
                     "status": verification_status,
+                    "readback_reason": readback_reason,
+                    "readback_attempts": readback_attempts,
                 }
                 if verification_status != "VERIFIED":
-                    error_code = (
-                        "external_action_effect_mismatch"
-                        if verification_status == "EFFECT_MISMATCH"
-                        else "external_action_readback_unavailable"
-                    )
+                    if verification_status in {"READBACK_UNAVAILABLE", "EFFECT_NOT_FOUND"}:
+                        self._raise_external_outcome_unknown(
+                            context=context,
+                            step=step,
+                            dispatch_token=dispatch_token,
+                            attempt_token=attempt_token,
+                            provider_reference=provider_result.provider_reference,
+                            finalizer=lambda: self.workflow_store.finalize_external_action_outcome_unknown(
+                                context.run_id,
+                                step.step_id,
+                                dispatch_token=dispatch_token,
+                                tool_attempt_token=attempt_token,
+                                error_code="external_action_outcome_unknown",
+                                provider_reference=provider_result.provider_reference,
+                                verification_evidence=verification,
+                            ),
+                        )
+                    error_code = "external_action_effect_mismatch"
                     try:
                         self.workflow_store.finalize_external_action_failed(
                             context.run_id,
@@ -1125,6 +1159,7 @@ class ExternalActionCoordinator:
         dispatch_token: str,
         attempt_token: str,
         finalizer: Callable[[], Any],
+        provider_reference: str | None = None,
     ) -> NoReturn:
         try:
             finalizer()
@@ -1140,6 +1175,7 @@ class ExternalActionCoordinator:
                 step=step,
                 dispatch_token=dispatch_token,
                 attempt_token=attempt_token,
+                provider_reference=provider_reference,
             ):
                 raise ExternalActionReconciliationPendingError() from None
         try:
@@ -1175,6 +1211,7 @@ class ExternalActionCoordinator:
         step: ToolCallRecord,
         dispatch_token: str,
         attempt_token: str,
+        provider_reference: str | None = None,
     ) -> bool:
         """Recognize an exception raised after the unknown terminal commit."""
 
@@ -1198,7 +1235,7 @@ class ExternalActionCoordinator:
             and action.input_hash == step.input_hash
             and action.status == ExternalActionStatus.OUTCOME_UNKNOWN
             and action.dispatch_token == dispatch_token
-            and action.provider_reference is None
+            and action.provider_reference == provider_reference
             and action.result_json is None
             and action.error_code == "external_action_outcome_unknown"
             and current_step.run_id == context.run_id
